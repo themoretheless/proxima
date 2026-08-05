@@ -168,9 +168,13 @@ tests/
 ## Development
 
 ```bash
-cargo test              # unit tests, plus tests/e2e.rs
-cargo clippy --all-targets -- -D warnings
+cargo test --features gui               # unit tests, tests/e2e.rs, and the window
+cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+Both use `gui` on purpose: it is a superset of the default build, and without it
+`src/gui.rs` is neither tested nor linted. Drop the flag to check what someone
+building only the CLI gets.
 
 `tests/e2e.rs` is the one worth reading. The unit tests cover the pieces in
 isolation, which says nothing about whether a phone pointed at this proxy
