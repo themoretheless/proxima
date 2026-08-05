@@ -116,12 +116,6 @@ impl FlowStore {
         self.events.subscribe()
     }
 
-    /// Publishes an event that did not originate from a flow change, such as
-    /// [`ProxyEvent::Status`].
-    pub fn publish(&self, event: ProxyEvent) {
-        let _ = self.events.send(event);
-    }
-
     pub fn create(&self, init: FlowInit) -> FlowId {
         let id = new_id();
         let flow = Flow {

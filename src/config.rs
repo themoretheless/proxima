@@ -1,6 +1,5 @@
 //! Runtime configuration and the rules deciding which connections get opened up.
 
-use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -144,12 +143,6 @@ pub fn should_decrypt(hostname: &str, rules: &DecryptRules) -> bool {
     }
 }
 
-/// True when the host is an IP literal, which needs an IP SAN rather than a
-/// DNS SAN in the certificate we mint for it.
-pub fn is_ip_literal(host: &str) -> bool {
-    strip_port(host).parse::<IpAddr>().is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,14 +195,5 @@ mod tests {
             deny: vec![],
         };
         assert!(!should_decrypt("api.example.com", &off));
-    }
-
-    #[test]
-    fn ip_literals_are_detected() {
-        assert!(is_ip_literal("127.0.0.1"));
-        assert!(is_ip_literal("127.0.0.1:8080"));
-        assert!(is_ip_literal("::1"));
-        assert!(is_ip_literal("[::1]:443"));
-        assert!(!is_ip_literal("example.com"));
     }
 }

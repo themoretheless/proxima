@@ -17,22 +17,14 @@ tokio = { version = "1.53", features = [
   "sync",
   "time",
   "signal",
-  "fs",
 ] }
 futures-util = "0.3"
 
 # HTTP core. hyper speaks both 1.1 and 2, which the proxy needs in both
-# directions; hyper-util supplies the tokio glue and the pooled client.
+# directions. Connections are driven directly through hyper::server::conn and
+# hyper::client::conn, so all that is wanted from hyper-util is the tokio glue.
 hyper = { version = "1.11", features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", features = [
-  "tokio",
-  "server",
-  "server-auto",
-  "client",
-  "client-legacy",
-  "http1",
-  "http2",
-] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
@@ -55,7 +47,7 @@ rustls-pemfile = "2"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 
 # Inspector API, live event socket and the pages this binary serves.
-axum = { version = "0.8", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -72,7 +64,7 @@ zstd = "0.13"
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting"] }
 anyhow = "1"
 local-ip-address = "0.6"
 x509-parser = "0.18.1"
@@ -91,8 +83,6 @@ eframe = { version = "0.32", default-features = false, features = [
 tokio = { version = "1.53", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-manual-roots",
-  "json",
-  "http2",
 ] }
 tempfile = "3"
 

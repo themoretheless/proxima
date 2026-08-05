@@ -196,10 +196,6 @@ impl BodyWriter {
         self.seen
     }
 
-    pub fn is_truncated(&self) -> bool {
-        self.truncated
-    }
-
     /// Commits the retained bytes to the store and describes them.
     pub fn finish(
         self,
