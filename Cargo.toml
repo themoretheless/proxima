@@ -1,0 +1,115 @@
+[package]
+name = "proxima"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "HTTPS debugging proxy and API client: see every request your phone makes, then replay it"
+license = "MIT"
+default-run = "proxima"
+
+[dependencies]
+tokio = { version = "1.53", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "sync",
+  "time",
+  "signal",
+  "fs",
+] }
+futures-util = "0.3"
+
+# HTTP core. hyper speaks both 1.1 and 2, which the proxy needs in both
+# directions; hyper-util supplies the tokio glue and the pooled client.
+hyper = { version = "1.11", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+  "tokio",
+  "server",
+  "server-auto",
+  "client",
+  "client-legacy",
+  "http1",
+  "http2",
+] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# TLS. The ring provider is deliberate: aws-lc-rs needs cmake, which is not a
+# reasonable thing to require of someone cloning a debugging tool.
+rustls = { version = "0.23", default-features = false, features = [
+  "std",
+  "tls12",
+  "ring",
+  "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+  "tls12",
+  "ring",
+  "logging",
+] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+
+# Inspector API, live event socket and the pages this binary serves.
+axum = { version = "0.8", features = ["ws", "macros"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+
+# Content decoding for captured bodies.
+flate2 = "1"
+brotli = "8"
+zstd = "0.13"
+
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.9"
+time = { version = "0.3", features = ["formatting", "macros"] }
+anyhow = "1"
+thiserror = "2"
+tokio-tungstenite = "0.30"
+local-ip-address = "0.6"
+x509-parser = "0.18.1"
+# The native window. Optional and off by default: it drags in winit and a GL
+# stack, which is a minute of build time nobody running the CLI should pay for.
+# glow rather than wgpu because the inspector draws text and rectangles, and
+# wgpu's driver surface is a large thing to depend on for that.
+eframe = { version = "0.32", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls-manual-roots",
+  "json",
+  "http2",
+] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[features]
+gui = ["dep:eframe"]
+
+[[bin]]
+name = "proxima"
+path = "src/main.rs"
+
+[[bin]]
+name = "proxima-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]

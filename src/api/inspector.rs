@@ -1,0 +1,1365 @@
+//! The traffic inspector: one page, assembled here from constants.
+//!
+//! It is the whole front end. Markup, stylesheet and script are string
+//! constants in this file for the same reason the setup page is: the only thing
+//! that has to be running for it to work is this process.
+//!
+//! Nothing captured is interpolated into any of it. Header names, URLs, bodies
+//! and error text arrive afterwards over `fetch` and the event socket, and they
+//! reach the document only as `textContent` on nodes made with `createElement`.
+//! That is the whole cross-site-scripting story: a captured response body
+//! carrying markup never touches the HTML parser, so it renders as the text it
+//! is. The policy header below is a second line of defence, not the first.
+
+use axum::body::Body;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::Response;
+use base64::Engine as _;
+use rand::RngCore;
+
+/// Serves the inspector, which lives at the root and nowhere else.
+///
+/// Anything else reaching the fallback is a mistake worth naming: a stray
+/// `/api/` path answered with HTML only turns into a parse error in a console.
+pub(super) fn serve(path: &str) -> Response {
+    if path != "/" && path != "/index.html" {
+        return not_found();
+    }
+
+    let nonce = nonce();
+    let mut response = Response::new(Body::from(page(&nonce)));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&policy(&nonce)) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response
+}
+
+fn not_found() -> Response {
+    let mut response = Response::new(Body::from(
+        "Not found. The inspector is at /, the API under /api/.\n",
+    ));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// Names this page's own script and style so the policy never has to say
+/// `unsafe-inline`. `ws:` is spelled out because browsers disagree about
+/// whether `'self'` covers a socket back to the origin that served the page.
+fn policy(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
+         img-src data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// URL-safe base64, so the value is safe both in a header and in an attribute
+/// without any escaping.
+fn nonce() -> String {
+    let mut raw = [0u8; 16];
+    rand::rng().fill_bytes(&mut raw);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// The nonce is the only thing this function substitutes, and it is generated
+/// here rather than derived from anything a request carries.
+fn page(nonce: &str) -> String {
+    let mut page = String::with_capacity(40 * 1024);
+    page.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    page.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    page.push_str("<meta name=\"color-scheme\" content=\"dark\">\n<title>Proxima</title>\n");
+    page.push_str(ICON);
+    page.push_str("<style nonce=\"");
+    page.push_str(nonce);
+    page.push_str("\">");
+    page.push_str(CSS);
+    page.push_str("</style>\n</head>\n<body>\n");
+    page.push_str(BODY);
+    page.push_str("<script nonce=\"");
+    page.push_str(nonce);
+    page.push_str("\">");
+    page.push_str(SCRIPT);
+    page.push_str("</script>\n</body>\n</html>\n");
+    page
+}
+
+/* ------------------------------------------------------------------ */
+/* the page                                                            */
+/* ------------------------------------------------------------------ */
+
+/// Inline, so a tab does not spend a request on /favicon.ico it will only get a
+/// 404 for.
+const ICON: &str = "<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%230c0e12'/%3E%3Ccircle cx='8' cy='8' r='3.2' fill='%235ea9ff'/%3E%3C/svg%3E\">\n";
+
+const BODY: &str = r#"<header>
+  <span class="mark">PROXIMA</span>
+  <span id="dot" class="dot"></span><span id="state" class="state">connecting</span>
+  <input id="filter" type="search" placeholder="Filter by method, host, path or status" autocomplete="off" spellcheck="false" aria-label="Filter">
+  <span id="count" class="count"></span>
+  <button id="compose" class="btn" type="button">Compose</button>
+  <button id="clear" class="btn" type="button">Clear</button>
+  <a class="btn" href="/setup">Set up a device</a>
+</header>
+<main>
+  <section id="list">
+    <div class="head">
+      <span>Method</span><span>Host</span><span>Path</span><span>Status</span><span>Size</span><span>Time</span>
+    </div>
+    <div id="rows" role="list"></div>
+    <p id="empty">Nothing captured yet. Point a device at the proxy, trust the certificate, then load something.</p>
+  </section>
+  <section id="detail"><p class="hint">Pick a request to see its headers and body.</p></section>
+  <section id="composer" hidden>
+    <div class="c-line">
+      <select id="c-method" aria-label="Method">
+        <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option>
+        <option>DELETE</option><option>HEAD</option><option>OPTIONS</option>
+      </select>
+      <input id="c-url" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://api.example.com/v1/thing" aria-label="URL">
+      <button id="c-send" class="btn" type="button">Send</button>
+    </div>
+    <label class="c-label" for="c-headers">Headers, one per line, as Name: value</label>
+    <textarea id="c-headers" spellcheck="false" placeholder="content-type: application/json"></textarea>
+    <label class="c-label" for="c-body">Body</label>
+    <textarea id="c-body" spellcheck="false"></textarea>
+    <div id="c-out"></div>
+  </section>
+</main>
+"#;
+
+const CSS: &str = r#"
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+:root {
+  --bg: #0c0e12; --card: #14171d; --line: #242a34; --hover: #1a1f28;
+  --ink: #e9ecf2; --dim: #99a1b0; --accent: #5ea9ff;
+  --good: #4ade80; --warn: #fbbf24; --bad: #f87171; --info: #7dd3fc;
+}
+html, body { height: 100%; }
+body {
+  margin: 0; display: flex; flex-direction: column;
+  background: var(--bg); color: var(--ink);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+header {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px; background: var(--card); border-bottom: 1px solid var(--line);
+}
+.mark { font-size: 11px; letter-spacing: .18em; font-weight: 700; color: var(--accent); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+.dot.live { background: var(--good); }
+.dot.gone { background: var(--bad); }
+.state { color: var(--dim); font-size: 12px; min-width: 6.5rem; }
+#filter {
+  flex: 1; min-width: 0; height: 28px; padding: 0 9px;
+  background: #0f1216; color: var(--ink);
+  border: 1px solid var(--line); border-radius: 7px; font: inherit;
+}
+#filter:focus { outline: none; border-color: var(--accent); }
+.count { color: var(--dim); font-size: 12px; white-space: nowrap; }
+.btn {
+  height: 28px; padding: 0 11px; display: inline-flex; align-items: center;
+  background: #1e2530; color: var(--ink); border: 1px solid #33404f;
+  border-radius: 7px; font: inherit; text-decoration: none; cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: #263041; }
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 40%); }
+#list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+#rows { flex: 1; overflow: auto; }
+#detail { overflow: auto; padding: 12px 14px 40px; min-height: 0; }
+/* Composing takes the whole width: a request being written deserves more room
+   than a split view leaves it. */
+main.composing { grid-template-columns: minmax(0, 1fr); }
+main.composing > #list, main.composing > #detail { display: none; }
+#composer {
+  overflow: auto; min-height: 0; padding: 12px 14px 40px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.c-line { display: flex; gap: 8px; }
+#c-url { flex: 1; min-width: 0; }
+#composer select, #composer input, #composer textarea {
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px; font: inherit;
+}
+#composer select:focus, #composer input:focus, #composer textarea:focus {
+  outline: 1px solid var(--accent); border-color: var(--accent);
+}
+#composer textarea { min-height: 92px; resize: vertical; }
+.c-label {
+  color: var(--dim); font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+}
+.btn.on { border-color: var(--accent); color: var(--accent); }
+.head, .row {
+  display: grid; align-items: baseline; gap: 10px; padding: 3px 12px;
+  grid-template-columns: 4rem minmax(5rem, 11rem) minmax(0, 1fr) 4rem 4.6rem 4.4rem;
+}
+.head {
+  flex: none; color: var(--dim); font-size: 11px; letter-spacing: .06em;
+  text-transform: uppercase; border-bottom: 1px solid var(--line); padding-block: 6px;
+}
+.row {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; cursor: default; border-bottom: 1px solid #171b22;
+}
+.row:hover { background: var(--hover); }
+.row.on { background: #182437; }
+.row.pinned { box-shadow: inset 3px 0 0 var(--warn); }
+.row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .host { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.row .hostname { min-width: 0; }
+.pin {
+  flex: none; display: inline-block; padding: 0 4px; border-radius: 3px;
+  background: var(--warn); color: #221a02; font-size: 10px; font-weight: 700;
+}
+.size, .dur { color: var(--dim); text-align: right; }
+.s2 .status { color: var(--good); }
+.s3 .status { color: var(--info); }
+.s4 .status { color: var(--warn); }
+.s5 .status, .serr .status { color: var(--bad); }
+.swait .status { color: var(--dim); }
+#empty { flex: none; margin: 0; padding: 22px 14px; color: var(--dim); }
+.hint { color: var(--dim); }
+.dhead { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+.dmethod { font-weight: 700; color: var(--accent); }
+.durl { word-break: break-all; font-size: 12px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px 10px; margin-bottom: 14px; }
+.fkey { color: var(--dim); }
+.fval { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+.block { margin-bottom: 16px; }
+.block h2 {
+  font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--dim); margin: 0 0 6px; font-weight: 600;
+}
+.headers { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); gap: 1px 10px; font-size: 12px; }
+.hrow { display: contents; }
+.hname { color: var(--accent); word-break: break-all; }
+.hval { word-break: break-all; }
+.none { color: var(--dim); margin: 0; }
+.note { color: var(--dim); margin: 0 0 6px; }
+pre.body, pre.copy {
+  margin: 8px 0 0; padding: 9px 11px; max-height: 26rem; overflow: auto;
+  background: #0f1216; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px; white-space: pre-wrap; word-break: break-word;
+}
+.error {
+  margin: 0 0 14px; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid #6b2020; background: #1c0f0f;
+}
+.etitle { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.error p { margin: 8px 0 0; color: #f0c9c9; }
+.frame { display: grid; grid-template-columns: 9rem 9rem minmax(0, 1fr); gap: 8px; font-size: 12px; padding: 2px 0; }
+.frame .dir { color: var(--dim); }
+.frame.up .dir { color: var(--accent); }
+.frame .text { word-break: break-all; white-space: pre-wrap; }
+@media (max-width: 1000px) {
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  #list { border-right: none; border-bottom: 1px solid var(--line); }
+  .head, .row { grid-template-columns: 3.6rem minmax(4rem, 8rem) minmax(0, 1fr) 3.4rem 4.2rem; }
+  .head span:last-child, .row .dur { display: none; }
+}
+"#;
+
+const SCRIPT: &str = r#"
+(function () {
+  'use strict';
+
+  var MAX_ROWS = 2000;
+  var MAX_BODY_CHARS = 200000;
+  var MAX_FRAMES = 200;
+  var RETRY_MIN = 400;
+  var RETRY_MAX = 4000;
+
+  var rowsEl = document.getElementById('rows');
+  var detailEl = document.getElementById('detail');
+  var filterEl = document.getElementById('filter');
+  var countEl = document.getElementById('count');
+  var emptyEl = document.getElementById('empty');
+  var dotEl = document.getElementById('dot');
+  var stateEl = document.getElementById('state');
+
+  var rows = new Map();
+  var needles = new Map();
+  var visible = 0;
+  var needle = '';
+  var selectedId = null;
+  var selectedRow = null;
+  var detailToken = 0;
+  var queue = null;
+  var greeted = false;
+  var backoff = RETRY_MIN;
+  var frameList = null;
+  var frameOwner = null;
+
+  // Every string that came off the wire enters the document through here, and
+  // textContent is why a captured body full of markup stays a captured body
+  // full of markup.
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined && text !== null) { node.textContent = String(text); }
+    return node;
+  }
+
+  function str(value) {
+    if (typeof value === 'string') { return value; }
+    if (value === undefined || value === null) { return ''; }
+    return String(value);
+  }
+
+  function strip(node) { while (node.firstChild) { node.removeChild(node.firstChild); } }
+
+  function size(bytes) {
+    var n = typeof bytes === 'number' && isFinite(bytes) && bytes > 0 ? bytes : 0;
+    if (n < 1024) { return n + ' B'; }
+    if (n < 1048576) { return (n / 1024).toFixed(1) + ' KB'; }
+    return (n / 1048576).toFixed(1) + ' MB';
+  }
+
+  function millis(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms)) { return '...'; }
+    if (ms < 1000) { return Math.round(ms) + ' ms'; }
+    return (ms / 1000).toFixed(2) + ' s';
+  }
+
+  function clock(epochMs) {
+    if (typeof epochMs !== 'number' || !epochMs) { return ''; }
+    return new Date(epochMs).toLocaleTimeString();
+  }
+
+  function statusLabel(flow) {
+    if (typeof flow.status === 'number' && flow.status > 0) { return String(flow.status); }
+    if (flow.state === 'error') { return 'failed'; }
+    if (flow.state === 'aborted') { return 'gone'; }
+    if (flow.kind === 'tunnel') { return 'opaque'; }
+    return '...';
+  }
+
+  function statusClass(flow) {
+    if (typeof flow.status === 'number' && flow.status >= 100) {
+      return 's' + Math.floor(flow.status / 100);
+    }
+    if (flow.error || flow.state === 'error' || flow.state === 'aborted') { return 'serr'; }
+    return 'swait';
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* the list                                                          */
+  /* ---------------------------------------------------------------- */
+
+  function makeRow(flow) {
+    var row = el('div', 'row');
+    row.setAttribute('role', 'listitem');
+    // The id lives on the element object, not in an attribute, so no captured
+    // value ever needs quoting.
+    row.flowId = flow.id;
+    row.hidden = true;
+    row.appendChild(el('span', 'method'));
+    var host = el('span', 'host');
+    host.appendChild(el('span', 'hostname'));
+    host.appendChild(el('span', 'pin', 'PINNED'));
+    row.appendChild(host);
+    row.appendChild(el('span', 'path'));
+    row.appendChild(el('span', 'status'));
+    row.appendChild(el('span', 'size'));
+    row.appendChild(el('span', 'dur'));
+    row.addEventListener('click', function () { select(row.flowId); });
+    return row;
+  }
+
+  function paint(row, flow) {
+    row.querySelector('.method').textContent = str(flow.method);
+    row.querySelector('.hostname').textContent = str(flow.authority);
+    row.querySelector('.pin').hidden = !flow.likelyPinning;
+    row.querySelector('.path').textContent = str(flow.path);
+    row.querySelector('.status').textContent = statusLabel(flow);
+    row.querySelector('.size').textContent = size(flow.responseSize);
+    row.querySelector('.dur').textContent =
+      typeof flow.duration === 'number' ? millis(flow.duration) : '...';
+
+    var cls = 'row ' + statusClass(flow);
+    if (flow.likelyPinning) { cls += ' pinned'; }
+    if (flow.id === selectedId) { cls += ' on'; }
+    row.className = cls;
+
+    needles.set(flow.id, [
+      str(flow.method), str(flow.authority), str(flow.path),
+      statusLabel(flow), str(flow.error)
+    ].join(' ').toLowerCase());
+    filterRow(row, flow.id);
+  }
+
+  function filterRow(row, id) {
+    var text = needles.get(id) || '';
+    var hide = needle !== '' && text.indexOf(needle) < 0;
+    if (row.hidden !== hide) {
+      row.hidden = hide;
+      visible += hide ? -1 : 1;
+    }
+  }
+
+  function upsert(flow, atTop) {
+    if (!flow || typeof flow.id !== 'string') { return; }
+    var row = rows.get(flow.id);
+    if (!row) {
+      row = makeRow(flow);
+      rows.set(flow.id, row);
+      if (atTop) { rowsEl.insertBefore(row, rowsEl.firstChild); } else { rowsEl.appendChild(row); }
+    }
+    paint(row, flow);
+    trim();
+  }
+
+  function trim() {
+    while (rows.size > MAX_ROWS) {
+      var last = rowsEl.lastElementChild;
+      if (!last) { return; }
+      rowsEl.removeChild(last);
+      rows.delete(last.flowId);
+      needles.delete(last.flowId);
+      if (!last.hidden) { visible -= 1; }
+      if (last === selectedRow) { selectedRow = null; }
+    }
+  }
+
+  function wipe() {
+    strip(rowsEl);
+    rows.clear();
+    needles.clear();
+    visible = 0;
+    selectedRow = null;
+    selectedId = null;
+    frameList = null;
+    frameOwner = null;
+    detailToken += 1;
+    hint('Pick a request to see its headers and body.');
+    tally();
+  }
+
+  function tally() {
+    var total = rows.size;
+    emptyEl.hidden = total > 0;
+    if (!total) { countEl.textContent = ''; return; }
+    countEl.textContent = visible === total
+      ? total + ' flows'
+      : visible + ' of ' + total + ' flows';
+  }
+
+  filterEl.addEventListener('input', function () {
+    needle = filterEl.value.trim().toLowerCase();
+    rows.forEach(function (row, id) { filterRow(row, id); });
+    tally();
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* the detail view                                                   */
+  /* ---------------------------------------------------------------- */
+
+  // Every path that replaces the detail pane with a sentence comes through
+  // here, so this is where the frame list stops being live. Without it a socket
+  // whose detail view failed to reload keeps appending frames to a node that
+  // was detached from the document several selections ago.
+  function hint(text) {
+    strip(detailEl);
+    frameList = null;
+    frameOwner = null;
+    detailEl.appendChild(el('p', 'hint', text));
+  }
+
+  async function select(id) {
+    selectedId = id;
+    if (selectedRow) { selectedRow.classList.remove('on'); }
+    selectedRow = rows.get(id) || null;
+    if (selectedRow) { selectedRow.classList.add('on'); }
+
+    var token = ++detailToken;
+    hint('Loading...');
+    try {
+      var flow = await getJson('/api/flows/' + encodeURIComponent(id));
+      if (token === detailToken) { renderFlow(flow); }
+    } catch (error) {
+      if (token === detailToken) { hint('Could not load that flow: ' + error.message); }
+    }
+  }
+
+  function renderFlow(flow) {
+    strip(detailEl);
+    frameList = null;
+    frameOwner = null;
+    var request = flow.request || {};
+    var response = flow.response || null;
+
+    var head = el('div', 'dhead');
+    head.appendChild(el('span', 'dmethod', str(request.method)));
+    head.appendChild(el('span', 'durl mono', str(request.url)));
+    detailEl.appendChild(head);
+
+    var actions = el('div', 'actions');
+    var copy = el('button', 'btn', 'Copy as cURL');
+    copy.type = 'button';
+    copy.addEventListener('click', function () { copyCurl(flow.id, copy); });
+    actions.appendChild(copy);
+    detailEl.appendChild(actions);
+
+    detailEl.appendChild(facts(flow, request, response));
+
+    if (flow.error) {
+      var box = el('div', 'error');
+      box.appendChild(el('div', 'etitle', str(flow.error.message)));
+      if (flow.error.likelyPinning) {
+        box.appendChild(el('p', null, 'The client rejected the Proxima certificate, which almost always means the app pins its own. Nothing here is broken and no setting on this machine will decrypt it: the app has to be built against a permissive network security config, or run on a device where Proxima is in the system trust store.'));
+      }
+      detailEl.appendChild(box);
+    }
+
+    detailEl.appendChild(headerBlock('Request headers', request.headers));
+    detailEl.appendChild(bodyBlock(flow.id, 'request', request.body));
+    if (response) {
+      detailEl.appendChild(headerBlock('Response headers', response.headers));
+      detailEl.appendChild(bodyBlock(flow.id, 'response', response.body));
+    }
+    if (Array.isArray(flow.wsMessages)) {
+      detailEl.appendChild(frameBlock(flow.id, flow.wsMessages));
+    }
+  }
+
+  function facts(flow, request, response) {
+    var server = flow.server || {};
+    var client = flow.client || {};
+    var timings = flow.timings || {};
+    var pairs = [];
+
+    pairs.push(['Status', response
+      ? str(response.status) + ' ' + str(response.statusText)
+      : statusLabel({ state: flow.state, kind: flow.kind, error: flow.error })]);
+    pairs.push(['Kind', str(flow.kind) + (flow.intercepted ? ', decrypted' : ', not decrypted')]);
+    pairs.push(['HTTP', str(request.httpVersion)]);
+    pairs.push(['Started', clock(timings.start)]);
+    pairs.push(['Duration', typeof timings.end === 'number' && typeof timings.start === 'number'
+      ? millis(timings.end - timings.start)
+      : 'in flight']);
+    pairs.push(['Client', str(client.address) + ':' + str(client.port)]);
+    if (server.address) { pairs.push(['Server', str(server.address) + ':' + str(server.port)]); }
+    if (server.sni) { pairs.push(['SNI', server.sni]); }
+    if (server.alpn) { pairs.push(['ALPN', server.alpn]); }
+    if (server.tlsVersion) {
+      pairs.push(['TLS', str(server.tlsVersion) + (server.cipher ? ', ' + str(server.cipher) : '')]);
+    }
+    if (server.certFingerprint) { pairs.push(['Origin cert', server.certFingerprint]); }
+    if (flow.tunnel) {
+      pairs.push(['Tunnelled', size(flow.tunnel.bytesSent) + ' up, ' +
+        size(flow.tunnel.bytesReceived) + ' down, ' + str(flow.tunnel.reason)]);
+    }
+    if (flow.replayOf) { pairs.push(['Replay of', flow.replayOf]); }
+
+    var grid = el('div', 'facts');
+    for (var i = 0; i < pairs.length; i++) {
+      grid.appendChild(el('span', 'fkey', pairs[i][0]));
+      grid.appendChild(el('span', 'fval', pairs[i][1]));
+    }
+    return grid;
+  }
+
+  function headerBlock(title, headers) {
+    var block = el('section', 'block');
+    block.appendChild(el('h2', null, title));
+    var list = Array.isArray(headers) ? headers : [];
+    if (!list.length) {
+      block.appendChild(el('p', 'none', 'none'));
+      return block;
+    }
+    var grid = el('div', 'headers mono');
+    for (var i = 0; i < list.length; i++) {
+      var pair = list[i];
+      if (!Array.isArray(pair)) { continue; }
+      var line = el('div', 'hrow');
+      line.appendChild(el('span', 'hname', str(pair[0])));
+      line.appendChild(el('span', 'hval', str(pair[1])));
+      grid.appendChild(line);
+    }
+    block.appendChild(grid);
+    return block;
+  }
+
+  function bodyBlock(id, which, meta) {
+    var block = el('section', 'block');
+    block.appendChild(el('h2', null, which === 'request' ? 'Request body' : 'Response body'));
+    if (!meta) {
+      block.appendChild(el('p', 'none', 'none'));
+      return block;
+    }
+
+    var note = size(meta.size);
+    if (meta.truncated) { note += ', cut short at the capture limit'; }
+    if (meta.contentEncoding) { note += ', ' + str(meta.contentEncoding); }
+    if (meta.contentType) { note += ', ' + str(meta.contentType); }
+    block.appendChild(el('p', 'note', note));
+
+    var save = el('a', 'btn', 'Download');
+    // The store mints these ids, and encoding keeps whatever it minted inside
+    // one path segment.
+    save.href = '/api/flows/' + encodeURIComponent(id) + '/body/' + which + '?download=1';
+    block.appendChild(save);
+
+    var pre = el('pre', 'body mono');
+    block.appendChild(pre);
+    if (!textual(meta.contentType)) {
+      pre.textContent = 'Binary. Download it rather than reading it here.';
+      return block;
+    }
+    pre.textContent = 'Loading...';
+    loadBody(id, which, meta.contentType, pre);
+    return block;
+  }
+
+  function textual(contentType) {
+    if (!contentType) { return true; }
+    var ct = String(contentType).toLowerCase();
+    if (ct.indexOf('text/') === 0) { return true; }
+    var kinds = ['json', 'xml', 'javascript', 'ecmascript', 'html', 'csv', 'graphql', 'x-www-form-urlencoded'];
+    for (var i = 0; i < kinds.length; i++) {
+      if (ct.indexOf(kinds[i]) >= 0) { return true; }
+    }
+    return false;
+  }
+
+  async function loadBody(id, which, contentType, into) {
+    try {
+      var url = '/api/flows/' + encodeURIComponent(id) + '/body/' + which + '?decode=1';
+      var response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) {
+        into.textContent = 'The body is no longer available (' + response.status + ').';
+        return;
+      }
+      var text = await response.text();
+      var cut = text.length > MAX_BODY_CHARS;
+      if (cut) { text = text.slice(0, MAX_BODY_CHARS); }
+      into.textContent = indent(text, contentType) +
+        (cut ? '\n\n[stopped after ' + MAX_BODY_CHARS + ' characters]' : '');
+    } catch (error) {
+      into.textContent = 'Could not read the body: ' + error.message;
+    }
+  }
+
+  // Reformatting JSON is worth it: most captured JSON arrives on one line.
+  function indent(text, contentType) {
+    if (!contentType || String(contentType).toLowerCase().indexOf('json') < 0) { return text; }
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch (error) {
+      return text;
+    }
+  }
+
+  function frameBlock(id, messages) {
+    var block = el('section', 'block');
+    block.appendChild(el('h2', null, 'WebSocket frames'));
+    frameList = el('div', 'frames mono');
+    frameOwner = id;
+    var recent = messages.slice(-MAX_FRAMES);
+    for (var i = 0; i < recent.length; i++) {
+      frameList.appendChild(frameLine(recent[i]));
+    }
+    block.appendChild(frameList);
+    return block;
+  }
+
+  function frameLine(message) {
+    var out = message.direction === 'send';
+    var line = el('div', out ? 'frame up' : 'frame down');
+    line.appendChild(el('span', 'dir', out ? 'client to server' : 'server to client'));
+    line.appendChild(el('span', 'meta',
+      opcode(message.opcode) + ', ' + size(message.size) + (message.truncated ? ', cut short' : '')));
+    if (typeof message.text === 'string') { line.appendChild(el('span', 'text', message.text)); }
+    return line;
+  }
+
+  function opcode(code) {
+    if (code === 1) { return 'text'; }
+    if (code === 2) { return 'binary'; }
+    if (code === 8) { return 'close'; }
+    if (code === 9) { return 'ping'; }
+    if (code === 10) { return 'pong'; }
+    return 'opcode ' + str(code);
+  }
+
+  async function copyCurl(id, button) {
+    var label = button.textContent;
+    var text;
+    try {
+      var data = await getJson('/api/flows/' + encodeURIComponent(id) + '/curl');
+      text = data && typeof data.curl === 'string' ? data.curl : '';
+    } catch (error) {
+      button.textContent = 'Failed: ' + error.message;
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard) { throw new Error('there is no clipboard here'); }
+      await navigator.clipboard.writeText(text);
+      button.textContent = 'Copied';
+      setTimeout(function () { button.textContent = label; }, 1500);
+    } catch (error) {
+      // Served over plain HTTP to a LAN address there is no clipboard API at
+      // all, and even on localhost the write is refused unless the document
+      // holds focus. The command is the point, so put it on screen either way.
+      offer(button, text);
+    }
+  }
+
+  function offer(button, text) {
+    var actions = button.parentNode;
+    var stale = actions.parentNode.querySelector('pre.copy');
+    if (stale) { stale.parentNode.removeChild(stale); }
+    actions.parentNode.insertBefore(el('pre', 'copy mono', text), actions.nextSibling);
+    button.textContent = 'Copy it by hand';
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* the wire                                                          */
+  /* ---------------------------------------------------------------- */
+
+  async function getJson(url) {
+    var response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) { throw new Error('the server answered ' + response.status); }
+    return response.json();
+  }
+
+  function apply(event) {
+    if (!event || typeof event.type !== 'string') { return; }
+    if (event.type === 'flow:new' || event.type === 'flow:update' || event.type === 'flow:done') {
+      upsert(event.flow, true);
+      tally();
+      return;
+    }
+    if (event.type === 'clear') { wipe(); return; }
+    if (event.type === 'status') {
+      // The first one is the handshake. A later one means the socket dropped
+      // events on the floor and this list has holes in it.
+      if (greeted) { reload(); } else { greeted = true; }
+      return;
+    }
+    if (event.type === 'ws:message' && event.id === frameOwner && frameList) {
+      frameList.appendChild(frameLine(event.message || {}));
+      while (frameList.childElementCount > MAX_FRAMES) {
+        frameList.removeChild(frameList.firstChild);
+      }
+    }
+  }
+
+  async function reload() {
+    // Events that land mid-fetch would otherwise be overwritten by the older
+    // snapshot they raced.
+    queue = [];
+    try {
+      var page = await getJson('/api/flows?limit=' + MAX_ROWS);
+      wipe();
+      var list = page && Array.isArray(page.flows) ? page.flows : [];
+      for (var i = 0; i < list.length; i++) { upsert(list[i], false); }
+    } catch (error) {
+      stateEl.textContent = 'cannot read flows';
+    }
+    var pending = queue;
+    queue = null;
+    for (var j = 0; j < pending.length; j++) { apply(pending[j]); }
+    tally();
+  }
+
+  function link(kind, text) {
+    dotEl.className = 'dot ' + kind;
+    stateEl.textContent = text;
+  }
+
+  function connect() {
+    var socket;
+    try {
+      var scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      socket = new WebSocket(scheme + '//' + location.host + '/api/stream');
+    } catch (error) {
+      retry();
+      return;
+    }
+
+    socket.addEventListener('open', function () {
+      backoff = RETRY_MIN;
+      greeted = false;
+      link('live', 'live');
+      reload();
+    });
+    socket.addEventListener('message', function (event) {
+      var data;
+      try { data = JSON.parse(event.data); } catch (error) { return; }
+      if (queue) { queue.push(data); } else { apply(data); }
+    });
+    socket.addEventListener('close', retry);
+  }
+
+  // The server is restarted constantly while it is being worked on, so this
+  // reconnects on its own rather than waiting for a reload.
+  function retry() {
+    link('gone', 'reconnecting');
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, RETRY_MAX);
+  }
+
+  /* ---- the composer: the half of this tool that sends rather than watches ---- */
+
+  var composerEl = document.getElementById('composer');
+  var mainEl = document.querySelector('main');
+  var composeBtn = document.getElementById('compose');
+  var outEl = document.getElementById('c-out');
+
+  function composing(on) {
+    mainEl.classList.toggle('composing', on);
+    composerEl.hidden = !on;
+    composeBtn.classList.toggle('on', on);
+    if (on) { document.getElementById('c-url').focus(); }
+  }
+
+  function readHeaders(text) {
+    var out = [];
+    var lines = str(text).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line) { continue; }
+      var at = line.indexOf(':');
+      // A name has to be there, so a leading colon is a typo rather than a header.
+      if (at < 1) { continue; }
+      out.push([line.slice(0, at).trim(), line.slice(at + 1).trim()]);
+    }
+    return out;
+  }
+
+  // The wire carries bodies as base64, so anything non-ASCII survives the trip.
+  function toBase64(text) {
+    var bytes = new TextEncoder().encode(text);
+    var binary = '';
+    for (var i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
+    return btoa(binary);
+  }
+
+  function fromBase64(value) {
+    var binary = atob(str(value));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) { bytes[i] = binary.charCodeAt(i); }
+    return new TextDecoder().decode(bytes);
+  }
+
+  function contentTypeOf(headers) {
+    var list = Array.isArray(headers) ? headers : [];
+    for (var i = 0; i < list.length; i++) {
+      if (Array.isArray(list[i]) && str(list[i][0]).toLowerCase() === 'content-type') {
+        return str(list[i][1]);
+      }
+    }
+    return '';
+  }
+
+  async function fire() {
+    var button = document.getElementById('c-send');
+    var url = document.getElementById('c-url').value.trim();
+    strip(outEl);
+    if (!url) {
+      outEl.appendChild(el('p', 'hint', 'Give it a URL first.'));
+      return;
+    }
+
+    var bodyText = document.getElementById('c-body').value;
+    var spec = {
+      method: document.getElementById('c-method').value,
+      url: url,
+      headers: readHeaders(document.getElementById('c-headers').value),
+      bodyBase64: bodyText ? toBase64(bodyText) : null
+    };
+
+    button.disabled = true;
+    outEl.appendChild(el('p', 'hint', 'Sending...'));
+    try {
+      var response = await fetch('/api/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(spec),
+        cache: 'no-store'
+      });
+      var text = await response.text();
+      strip(outEl);
+      if (!response.ok) {
+        outEl.appendChild(el('p', 'hint', 'The request failed.'));
+        outEl.appendChild(el('pre', 'mono', text));
+        return;
+      }
+
+      var result = JSON.parse(text);
+      var took = result.timings && result.timings.end
+        ? result.timings.end - result.timings.start
+        : null;
+      var summary = el('section', 'block');
+      summary.appendChild(el('h2', null, 'Response'));
+      summary.appendChild(el('p', 'mono',
+        str(result.status) + ' ' + str(result.statusText) + '   ' + str(result.httpVersion) +
+        (took === null ? '' : '   ' + millis(took))));
+      outEl.appendChild(summary);
+      outEl.appendChild(headerBlock('Response headers', result.headers));
+
+      var shown;
+      try { shown = fromBase64(result.bodyBase64); }
+      catch (error) { shown = '[the body is not text]'; }
+      var body = el('section', 'block');
+      body.appendChild(el('h2', null, 'Response body'));
+      body.appendChild(el('pre', 'mono', indent(shown, contentTypeOf(result.headers))));
+      outEl.appendChild(body);
+    } catch (error) {
+      strip(outEl);
+      outEl.appendChild(el('p', 'hint', 'Could not send: ' + error.message));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  composeBtn.addEventListener('click', function () { composing(composerEl.hidden); });
+  document.getElementById('c-send').addEventListener('click', fire);
+  document.addEventListener('keydown', function (event) {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !composerEl.hidden) {
+      event.preventDefault();
+      fire();
+    }
+  });
+
+  document.getElementById('clear').addEventListener('click', async function () {
+    try {
+      var response = await fetch('/api/flows', { method: 'DELETE', cache: 'no-store' });
+      if (!response.ok) { throw new Error('the server answered ' + response.status); }
+      wipe();
+    } catch (error) {
+      hint('Could not clear the capture: ' + error.message);
+    }
+  });
+
+  connect();
+})();
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FlowKind, FlowState, FlowSummary, HttpVersion, Scheme};
+
+    /// Every JavaScript string literal in the script, on the assumption that
+    /// single quotes always delimit one. Nothing in the script escapes a quote,
+    /// and a test that breaks the day something does is the point.
+    fn literals() -> Vec<&'static str> {
+        SCRIPT.split('\'').skip(1).step_by(2).collect()
+    }
+
+    #[test]
+    fn captured_data_has_no_route_into_the_html_parser() {
+        for sink in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "createContextualFragment",
+            "setHTMLUnsafe",
+            "srcdoc",
+            "eval(",
+            "new Function",
+            "javascript:",
+        ] {
+            assert!(
+                !SCRIPT.contains(sink),
+                "the inspector must not use {sink}: captured bodies reach the document \
+                 as text or not at all"
+            );
+        }
+        assert!(
+            SCRIPT.contains("node.textContent = String(text)"),
+            "the single node builder must still be the one that sets textContent"
+        );
+    }
+
+    #[test]
+    fn a_response_body_holding_a_script_tag_renders_as_text() {
+        // A body is written with textContent on a node that is already in the
+        // tree, so its bytes are never handed to the HTML parser. There is no
+        // second path: the sink check above covers the rest of the file.
+        assert!(
+            SCRIPT.contains("into.textContent = indent(text, contentType) +"),
+            "a captured body must still be written as text, not built into markup"
+        );
+        assert!(
+            SCRIPT.contains("pre.textContent = 'Binary. Download it"),
+            "an undisplayable body must still be replaced rather than rendered"
+        );
+    }
+
+    #[test]
+    fn captured_header_names_and_values_are_built_as_nodes_not_markup() {
+        for line in [
+            "line.appendChild(el('span', 'hname', str(pair[0])));",
+            "line.appendChild(el('span', 'hval', str(pair[1])));",
+        ] {
+            assert!(
+                SCRIPT.contains(line),
+                "header rendering must go through the node builder: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_page_shell_carries_exactly_one_script_of_its_own() {
+        let rendered = page("Zm9ydHl0d28");
+        assert_eq!(
+            rendered.matches("<script").count(),
+            1,
+            "the page has one script element, the one this file wrote"
+        );
+        assert_eq!(
+            rendered.matches("<style").count(),
+            1,
+            "the page has one style element, the one this file wrote"
+        );
+    }
+
+    #[test]
+    fn the_page_substitutes_nothing_but_its_own_nonce() {
+        let one = page("aaaaaaaaaaaa").replace("aaaaaaaaaaaa", "N");
+        let two = page("bbbbbbbbbbbb").replace("bbbbbbbbbbbb", "N");
+        assert_eq!(
+            one, two,
+            "the only value the page interpolates must be the nonce"
+        );
+    }
+
+    #[test]
+    fn the_inline_script_and_style_cannot_end_themselves_early() {
+        for (name, source) in [("script", SCRIPT), ("style", CSS)] {
+            assert!(
+                !source.contains("</"),
+                "a closing tag inside the inline {name} would end it early"
+            );
+            assert!(
+                !source.contains("<!--"),
+                "a comment opener inside the inline {name} confuses the parser"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inspector_loads_nothing_from_the_network() {
+        let rendered = page("nonce");
+        for fragment in ["src=\"http", "href=\"http", "@import", "//cdn", "fonts."] {
+            assert!(
+                !rendered.contains(fragment),
+                "the inspector must be self contained, found {fragment}"
+            );
+        }
+    }
+
+    /// Every path-shaped literal in the script, whether it opens an endpoint or
+    /// is concatenated onto the middle of one. The suffixes matter as much as
+    /// the prefixes: `/curl` and `/body/` are the halves that decide which route
+    /// a request lands on, and checking only the `/api` prefix would let a
+    /// rename of either go unnoticed.
+    const KNOWN_PATHS: [&str; 7] = [
+        "/api/flows",
+        "/api/flows?limit=",
+        "/api/flows/",
+        "/api/stream",
+        "/api/send",
+        "/body/",
+        "/curl",
+    ];
+
+    #[test]
+    fn the_page_only_calls_endpoints_the_router_serves() {
+        for literal in literals() {
+            // The scheme separator the socket URL is built from is the one
+            // leading slash in the script that is not part of a path.
+            if literal.starts_with('/') && literal != "//" {
+                assert!(
+                    KNOWN_PATHS.contains(&literal),
+                    "{literal} is not an endpoint the router serves"
+                );
+            }
+        }
+        for path in KNOWN_PATHS {
+            assert!(
+                literals().contains(&path),
+                "{path} is listed as used but no longer appears in the script"
+            );
+        }
+    }
+
+    #[test]
+    fn the_endpoints_the_script_assembles_are_the_ones_the_router_spells_out() {
+        // These two are only ever built by concatenation, so the literal scan
+        // above sees the halves and never the whole.
+        for (expression, route) in [
+            (
+                "'/api/flows/' + encodeURIComponent(id) + '/body/' + which",
+                "/api/flows/{id}/body/{which}",
+            ),
+            (
+                "'/api/flows/' + encodeURIComponent(id) + '/curl'",
+                "/api/flows/{id}/curl",
+            ),
+        ] {
+            assert!(
+                SCRIPT.contains(expression),
+                "{route} is a route, but nothing in the script assembles it any more"
+            );
+        }
+
+        assert!(
+            BODY.contains("href=\"/setup\""),
+            "the setup link is the one endpoint the markup reaches on its own"
+        );
+        assert_eq!(
+            BODY.matches("href=").count(),
+            1,
+            "a second href in the markup would be a second endpoint nothing checks"
+        );
+    }
+
+    #[test]
+    fn the_filter_matches_by_substring_so_a_regex_metacharacter_is_just_text() {
+        // Typing `.*` or `a(b` into the filter has to narrow the list, not throw
+        // and not match everything, which is what building a RegExp out of it
+        // would do.
+        assert!(
+            SCRIPT.contains("text.indexOf(needle) < 0"),
+            "the filter must stay a substring search"
+        );
+        for builder in ["new RegExp", ".match(", ".test(", ".search("] {
+            assert!(
+                !SCRIPT.contains(builder),
+                "the filter needle must never reach {builder}: a metacharacter typed \
+                 into the box would change what matches, or throw"
+            );
+        }
+        assert!(
+            SCRIPT.contains("filterEl.value.trim().toLowerCase()"),
+            "the needle is lowercased once, and the haystack with it"
+        );
+    }
+
+    #[test]
+    fn the_event_socket_reconnects_on_its_own_with_a_bounded_backoff() {
+        for line in [
+            "socket.addEventListener('close', retry);",
+            "setTimeout(connect, backoff);",
+            "backoff = Math.min(backoff * 2, RETRY_MAX);",
+            "backoff = RETRY_MIN;",
+        ] {
+            assert!(
+                SCRIPT.contains(line),
+                "the socket has to come back after the server restarts: {line}"
+            );
+        }
+        // A throw out of the constructor is the one failure that never reaches a
+        // close event, so it has to schedule its own retry.
+        assert!(
+            SCRIPT.contains("retry();\n      return;"),
+            "a WebSocket that will not even construct must still schedule a retry"
+        );
+    }
+
+    #[test]
+    fn a_detail_pane_replaced_by_a_message_stops_owning_the_frame_list() {
+        // Selecting a flow whose detail fetch then fails used to leave frameList
+        // pointing at a node no longer in the document, and every later frame
+        // for that id was appended to it where nobody could see it.
+        let hint = SCRIPT
+            .split_once("function hint(text) {")
+            .expect("the script still has a hint function")
+            .1;
+        let body = hint.split_once('}').expect("hint has a body").0;
+        for reset in ["frameList = null", "frameOwner = null"] {
+            assert!(
+                body.contains(reset),
+                "tearing the detail pane down must drop the frame list: {reset}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_policy_names_the_nonce_and_forbids_everything_else() {
+        let policy = policy("abc123");
+        assert!(policy.contains("script-src 'nonce-abc123'"));
+        assert!(policy.contains("style-src 'nonce-abc123'"));
+        assert!(policy.starts_with("default-src 'none'"));
+        assert!(
+            policy.contains("connect-src 'self' ws: wss:"),
+            "the event socket has to survive the policy"
+        );
+        assert!(!policy.contains("unsafe-inline"));
+        assert!(page("abc123").contains("nonce=\"abc123\""));
+    }
+
+    #[test]
+    fn a_nonce_is_safe_in_both_a_header_and_an_attribute() {
+        for _ in 0..64 {
+            let value = nonce();
+            assert_eq!(value.len(), 22, "16 bytes of base64 without padding");
+            assert!(
+                value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "a nonce must never need escaping, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_root_path_answers_with_the_inspector() {
+        let root = serve("/");
+        assert_eq!(root.status(), StatusCode::OK);
+        assert_eq!(
+            root.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert!(root.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+
+        for path in ["/api/nope", "/favicon.ico", "/flows/abc"] {
+            assert_eq!(
+                serve(path).status(),
+                StatusCode::NOT_FOUND,
+                "{path} is not the inspector"
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_reads_only_fields_a_flow_summary_sends() {
+        let summary = FlowSummary {
+            id: "abc".to_string(),
+            kind: FlowKind::Http,
+            state: FlowState::Complete,
+            intercepted: true,
+            method: "GET".to_string(),
+            scheme: Scheme::Https,
+            authority: "example.com".to_string(),
+            path: "/".to_string(),
+            http_version: HttpVersion::Http11,
+            status: Some(200),
+            content_type: None,
+            request_size: 0,
+            response_size: 12,
+            start: 1,
+            duration: Some(3),
+            error: None,
+            likely_pinning: true,
+        };
+        let json = serde_json::to_value(&summary).expect("a summary serialises");
+        let object = json.as_object().expect("a summary is an object");
+
+        for field in [
+            "id",
+            "kind",
+            "state",
+            "method",
+            "authority",
+            "path",
+            "status",
+            "responseSize",
+            "duration",
+            "error",
+            "likelyPinning",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "the flow list reads {field}, which FlowSummary no longer sends"
+            );
+        }
+    }
+
+    #[test]
+    fn the_composer_reads_only_fields_a_send_result_sends() {
+        let result = crate::replay::SendResult {
+            flow_id: "abc".to_string(),
+            status: 200,
+            status_text: "OK".to_string(),
+            http_version: HttpVersion::Http11,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body_base64: "aGk=".to_string(),
+            timings: crate::types::FlowTimings {
+                start: 1,
+                end: Some(4),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_value(&result).expect("a send result serialises");
+        let object = json.as_object().expect("a send result is an object");
+
+        for field in [
+            "status",
+            "statusText",
+            "httpVersion",
+            "headers",
+            "bodyBase64",
+            "timings",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "the composer reads {field}, which SendResult no longer sends"
+            );
+        }
+    }
+
+    /// Serde drops a key it does not recognise, so a field the page invents
+    /// reads on screen as a promise and on the wire as nothing at all.
+    #[test]
+    fn every_key_the_composer_sends_is_one_the_send_endpoint_acts_on() {
+        let payload = serde_json::json!({
+            "method": "POST",
+            "url": "https://api.example.com/v1/thing",
+            "headers": [["content-type", "application/json"]],
+            "bodyBase64": "aGk=",
+        });
+        let object = payload.as_object().expect("the payload is an object");
+        for key in object.keys() {
+            assert!(
+                SCRIPT.contains(&format!("{key}:")),
+                "{key} is in this test but the composer no longer sends it"
+            );
+        }
+
+        let spec: crate::replay::SendSpec =
+            serde_json::from_value(payload).expect("the composer's payload is a SendSpec");
+        assert_eq!(spec.method.as_deref(), Some("POST"));
+        assert_eq!(
+            spec.url.as_deref(),
+            Some("https://api.example.com/v1/thing")
+        );
+
+        // The composer once sent this and nothing has ever implemented it.
+        let mut invented = serde_json::json!({ "url": "https://example.com/" });
+        invented["followRedirects"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<crate::replay::SendSpec>(invented).is_err(),
+            "a key the engine does not act on must be refused, not swallowed"
+        );
+        assert!(
+            !SCRIPT.contains("followRedirects"),
+            "the composer must not ask for a behaviour nothing implements"
+        );
+    }
+}

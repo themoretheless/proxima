@@ -1,0 +1,6 @@
+/target
+*.log
+.DS_Store
+
+# Per-machine tool settings, not project configuration.
+.claude/settings.local.json
