@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "HTTPS debugging proxy and API client: see every request your phone makes, then replay it"
 license = "MIT"
+repository = "https://github.com/themoretheless/proxima"
 default-run = "proxima"
 
 [dependencies]
@@ -73,8 +74,6 @@ sha2 = "0.10"
 rand = "0.9"
 time = { version = "0.3", features = ["formatting", "macros"] }
 anyhow = "1"
-thiserror = "2"
-tokio-tungstenite = "0.30"
 local-ip-address = "0.6"
 x509-parser = "0.18.1"
 # The native window. Optional and off by default: it drags in winit and a GL
