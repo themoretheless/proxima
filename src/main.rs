@@ -132,8 +132,8 @@ async fn ctrl_c() {
 fn init_tracing() {
     let filter = match std::env::var("PROXIMA_LOG") {
         Ok(value) => EnvFilter::new(value),
-        // RUST_LOG is what the README documents and what a Rust user types by
-        // reflex, so it keeps working as a second name for the same knob.
+        // RUST_LOG is what a Rust user types by reflex, so it keeps working as a
+        // second name for the same knob.
         Err(_) => match std::env::var("RUST_LOG") {
             Ok(value) => EnvFilter::new(value),
             Err(_) => EnvFilter::new(DEFAULT_LOG),

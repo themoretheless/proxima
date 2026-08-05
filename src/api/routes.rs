@@ -46,10 +46,11 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 // inspector needs nothing here: it is served from this same origin, and a same
 // origin fetch is not subject to CORS at all.
 pub(super) fn build(state: ApiState) -> Router {
-    // The two endpoints that carry a whole request body read it with the `Bytes`
+    // The endpoints that carry a whole request body read it with the `Bytes`
     // extractor, which otherwise stops at the axum default of 2 MB. Capture
-    // accepts bodies four times that, and a replay of one has to be able to
-    // carry it back out.
+    // keeps bodies up to `max_body_bytes`, 10 MB by default, and a replay of one
+    // has to be able to carry it back out, so the limit follows the config
+    // rather than the framework.
     let body_limit = usize::try_from(state.config.max_body_bytes).unwrap_or(usize::MAX);
 
     Router::new()
