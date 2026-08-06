@@ -598,6 +598,7 @@ fn summarize(flow: &Flow) -> FlowSummary {
         start: flow.timings.start,
         duration,
         error: flow.error.as_ref().map(|e| e.message.clone()),
+        client: flow.client.address.clone(),
         likely_pinning: flow
             .error
             .as_ref()

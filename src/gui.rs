@@ -686,6 +686,7 @@ mod tests {
             duration: Some(42),
             error: None,
             likely_pinning: false,
+            client: "127.0.0.1".to_string(),
         }
     }
 

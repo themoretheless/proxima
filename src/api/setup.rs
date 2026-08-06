@@ -75,7 +75,7 @@ pub(super) fn render(state: &ApiState, user_agent: Option<&str>) -> String {
     page.push_str(
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n",
     );
-    page.push_str("<meta name=\"color-scheme\" content=\"dark\">\n");
+    page.push_str("<meta name=\"color-scheme\" content=\"light dark\">\n");
     page.push_str("<title>Proxima setup</title>\n<style>");
     page.push_str(CSS);
     page.push_str("</style>\n</head>\n<body>\n");
@@ -363,10 +363,38 @@ fn escape(input: &str) -> String {
 
 const CSS: &str = r#"
 *, *::before, *::after { box-sizing: border-box; }
+/* The same palette the inspector carries, written the same way: one name per
+   colour, each naming both schemes. A phone opens this page in whichever scheme
+   it is set to, and there is no switch here to correct a colour that was only
+   ever checked against one background. */
 :root {
-  --bg: #0c0e12; --card: #14171d; --line: #242a34;
-  --ink: #e9ecf2; --dim: #99a1b0; --accent: #5ea9ff;
-  --good: #4ade80; --warn: #fbbf24; --bad: #f87171;
+  color-scheme: light dark;
+  --bg: light-dark(#faf9f5, #262624);
+  --card: light-dark(#f0eee6, #30302e);
+  --line: light-dark(#e2dfd4, #3d3d3a);
+  --ink: light-dark(#1f1e1d, #f0eee6);
+  --dim: light-dark(#73716a, #a09d94);
+  --accent: light-dark(#c96442, #d97757);
+  --good: light-dark(#3d7f56, #7bc08d);
+  --warn: light-dark(#a06c11, #e0b054);
+  --bad: light-dark(#b3392c, #e58a7a);
+  --field: light-dark(#ffffff, #1f1f1e);
+  --pick: light-dark(#f7e8e2, #3b2f2a);
+  --accent-ink: light-dark(#ffffff, #2a1207);
+  --accent-down: light-dark(#a94f33, #c2653f);
+  --btn: light-dark(#ffffff, #3a3a37);
+  --btn-line: light-dark(#ddd9cd, #4b4b47);
+  --btn-down: light-dark(#f2f0e8, #454541);
+  --note-line: light-dark(#dfc48a, #6b5310);
+  --note-bg: light-dark(#fbf3e2, #251d08);
+  --note-ink: light-dark(#6b4e12, #f0dca4);
+  --note-mark: light-dark(#8a6413, #ffd76a);
+  --good-line: light-dark(#b6d6c2, #1f5b38);
+  --good-bg: light-dark(#eef6f1, #0f1f16);
+  --warn-line: light-dark(#e4cf9c, #6b5310);
+  --warn-bg: light-dark(#fbf4e6, #241d08);
+  --bad-line: light-dark(#e6c3bb, #6b3a30);
+  --bad-bg: light-dark(#fbeeea, #2a1c18);
 }
 html { -webkit-text-size-adjust: 100%; }
 body {
@@ -394,7 +422,7 @@ h2 { font-size: 19px; margin: 0 0 10px; }
 .aside { color: var(--dim); font-size: 15px; margin: 10px 0 0; }
 .fp {
   font-size: 13px; word-break: break-all; line-height: 1.7;
-  color: var(--ink); background: #0f1216; border: 1px solid var(--line);
+  color: var(--ink); background: var(--field); border: 1px solid var(--line);
   border-radius: 8px; padding: 10px 12px; margin: 6px 0 14px;
 }
 .tabs { display: flex; gap: 8px; margin: 22px 0 4px; }
@@ -404,17 +432,17 @@ h2 { font-size: 19px; margin: 0 0 10px; }
   border: 1px solid var(--line); border-radius: 11px;
   font: inherit; font-size: 15px; cursor: pointer;
 }
-.tab.on { color: var(--ink); border-color: var(--accent); background: #17222f; }
+.tab.on { color: var(--ink); border-color: var(--accent); background: var(--pick); }
 .panel[hidden] { display: none; }
 ol { padding-left: 1.35em; margin: 18px 0; }
 ol > li { margin-bottom: 20px; padding-left: 4px; }
 ol > li::marker { color: var(--accent); font-weight: 700; }
 li.pivotal {
-  background: #241d08; border: 1px solid #6b5310;
+  background: var(--note-bg); border: 1px solid var(--note-line);
   border-radius: 12px; padding: 14px 14px 14px 8px; margin-left: -8px;
 }
 .path {
-  margin: 8px 0; padding: 9px 11px; background: #0f1216;
+  margin: 8px 0; padding: 9px 11px; background: var(--field);
   border: 1px solid var(--line); border-radius: 8px;
   font-size: 15px; color: var(--ink);
 }
@@ -424,44 +452,44 @@ li.pivotal {
 .os b { color: var(--ink); }
 code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: .9em; background: #0f1216; border: 1px solid var(--line);
+  font-size: .9em; background: var(--field); border: 1px solid var(--line);
   border-radius: 5px; padding: 1px 5px;
   /* break-word, not break-all: a host name should move to the next line whole
      rather than split down the middle of itself. */
   overflow-wrap: break-word;
 }
 pre {
-  background: #0f1216; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--field); border: 1px solid var(--line); border-radius: 9px;
   padding: 12px; margin: 10px 0 0; overflow-x: auto; font-size: 14px;
 }
 .install {
   display: flex; align-items: center; justify-content: center; text-align: center;
   min-height: 60px; margin: 26px 0; padding: 0 16px;
-  background: var(--accent); color: #06121f; text-decoration: none;
+  background: var(--accent); color: var(--accent-ink); text-decoration: none;
   border-radius: 14px; font-size: 18px; font-weight: 650;
 }
-.install:active { background: #4b93e6; }
+.install:active { background: var(--accent-down); }
 .btn {
   width: 100%; min-height: 56px; font: inherit; font-size: 17px; font-weight: 600;
-  background: #1e2530; color: var(--ink); border: 1px solid #33404f;
+  background: var(--btn); color: var(--ink); border: 1px solid var(--btn-line);
   border-radius: 12px; cursor: pointer;
 }
-.btn:active { background: #263041; }
+.btn:active { background: var(--btn-down); }
 .btn[disabled] { opacity: .6; }
 .result {
   margin-top: 14px; padding: 13px 14px; border-radius: 11px;
-  border: 1px solid var(--line); background: #0f1216; font-size: 16px;
+  border: 1px solid var(--line); background: var(--field); font-size: 16px;
 }
 .result.busy { color: var(--dim); }
-.result.good { border-color: #1f5b38; background: #0d1c14; color: var(--good); }
-.result.warn { border-color: #6b5310; background: #1c1708; color: var(--warn); }
-.result.bad  { border-color: #6b2020; background: #1c0f0f; color: var(--bad); }
+.result.good { border-color: var(--good-line); background: var(--good-bg); color: var(--good); }
+.result.warn { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn); }
+.result.bad  { border-color: var(--bad-line); background: var(--bad-bg); color: var(--bad); }
 .result .hint { display: block; margin-top: 6px; color: var(--dim); font-size: 15px; }
 .warn {
   margin: 18px 0; padding: 14px; border-radius: 12px;
-  border: 1px solid #6b5310; background: #1c1708; color: #f0dca4; font-size: 15px;
+  border: 1px solid var(--note-line); background: var(--note-bg); color: var(--note-ink); font-size: 15px;
 }
-.warn b { color: #ffd76a; }
+.warn b { color: var(--note-mark); }
 footer { margin-top: 30px; color: var(--dim); font-size: 14px; }
 "#;
 

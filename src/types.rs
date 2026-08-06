@@ -271,6 +271,11 @@ pub struct FlowSummary {
     pub error: Option<String>,
     /// Surfaced in the list so a pinned host is obvious without opening it.
     pub likely_pinning: bool,
+    /// The address the request came from, without its port. One machine opens a
+    /// connection per request and a new port each time, so the port names a
+    /// connection while the address names the device, and the device is what
+    /// anyone watching two of them wants to tell apart.
+    pub client: String,
 }
 
 /* ------------------------------------------------------------------ */

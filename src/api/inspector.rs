@@ -81,7 +81,7 @@ fn page(nonce: &str) -> String {
     let mut page = String::with_capacity(40 * 1024);
     page.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     page.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    page.push_str("<meta name=\"color-scheme\" content=\"dark\">\n<title>Proxima</title>\n");
+    page.push_str("<meta name=\"color-scheme\" content=\"light dark\">\n<title>Proxima</title>\n");
     page.push_str(ICON);
     page.push_str("<style nonce=\"");
     page.push_str(nonce);
@@ -110,12 +110,41 @@ const BODY: &str = r#"<header>
   <span id="dot" class="dot"></span><span id="state" class="state">connecting</span>
   <input id="filter" type="search" placeholder="Filter by method, host, path or status" autocomplete="off" spellcheck="false" aria-label="Filter">
   <span id="count" class="count"></span>
+  <button id="theme" class="btn" type="button" title="Light, dark, or whatever this machine is set to">Theme: system</button>
+  <button id="view" class="btn on" type="button">Hide tree</button>
   <button id="compose" class="btn" type="button">Compose</button>
   <button id="clear" class="btn" type="button">Clear</button>
   <a class="btn" href="/setup">Set up a device</a>
 </header>
 <main>
+  <section id="tree">
+    <div id="live" class="part">
+      <div class="shelf" data-part="live">
+        <span class="twist">▾</span><span class="shelf-name">Requests</span>
+        <button id="hunt-live" class="icon" type="button" title="Search hosts and paths" aria-label="Search hosts and paths">⌕</button>
+      </div>
+      <input id="live-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Host or path" aria-label="Search hosts and paths" hidden>
+      <div id="devices" role="group" aria-label="Devices"></div>
+      <div id="hosts" role="tree" aria-label="Hosts and paths"></div>
+    </div>
+    <div id="saved" class="part">
+      <div class="shelf" data-part="saved">
+        <span class="twist">▾</span><span class="shelf-name">Saved requests</span>
+        <button id="hunt-saved" class="icon" type="button" title="Search saved requests" aria-label="Search saved requests">⌕</button>
+        <button id="new-book" class="icon" type="button" title="New collection" aria-label="New collection">+</button>
+      </div>
+      <input id="saved-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Name or URL" aria-label="Search saved requests" hidden>
+      <div id="books" role="tree" aria-label="Saved requests"></div>
+      <p id="no-books" class="pad hint">Nothing saved yet. Compose a request, name it, and save.</p>
+    </div>
+  </section>
   <section id="list">
+    <div id="scope" class="idle">
+      <span id="scope-name" class="mono"></span>
+      <button id="scope-clear" type="button">Show everything</button>
+    </div>
     <div class="head">
       <span>Method</span><span>Host</span><span>Path</span><span>Status</span><span>Size</span><span>Time</span>
     </div>
@@ -124,6 +153,11 @@ const BODY: &str = r#"<header>
   </section>
   <section id="detail"><p class="hint">Pick a request to see its headers and body.</p></section>
   <section id="composer" hidden>
+    <div class="c-line">
+      <input id="c-name" type="text" autocomplete="off" placeholder="Name to save it under" aria-label="Name">
+      <select id="c-book" aria-label="Collection"></select>
+      <button id="c-save" class="btn" type="button">Save</button>
+    </div>
     <div class="c-line">
       <select id="c-method" aria-label="Method">
         <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option>
@@ -145,11 +179,44 @@ const BODY: &str = r#"<header>
 const CSS: &str = r#"
 *, *::before, *::after { box-sizing: border-box; }
 [hidden] { display: none !important; }
-:root {
-  --bg: #0c0e12; --card: #14171d; --line: #242a34; --hover: #1a1f28;
-  --ink: #e9ecf2; --dim: #99a1b0; --accent: #5ea9ff;
-  --good: #4ade80; --warn: #fbbf24; --bad: #f87171; --info: #7dd3fc;
+/* Anything meant to be clicked rather than read: clicking a fold open and shut
+   a few times otherwise selects its label, and the selection sits there
+   looking like state the page is keeping. Captured text is left selectable,
+   because copying it out is the whole point of the page. */
+.shelf, .gline, .sitem, .chip, .tab, .icon, .star, .kill, .twist {
+  user-select: none; -webkit-user-select: none;
 }
+/* Every colour on this page is named here and nowhere else, and each name
+   carries both schemes at once. Writing them as one pair per line is what keeps
+   the two in step: a colour added to one of them cannot be forgotten in the
+   other, because there is nowhere else to put it. Which half is used follows
+   the machine, until the switch in the header says otherwise. */
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#faf9f5, #262624);
+  --card: light-dark(#f0eee6, #30302e);
+  --line: light-dark(#e2dfd4, #3d3d3a);
+  --hover: light-dark(#eeece3, #333331);
+  --ink: light-dark(#1f1e1d, #f0eee6);
+  --dim: light-dark(#73716a, #a09d94);
+  --accent: light-dark(#c96442, #d97757);
+  --good: light-dark(#3d7f56, #7bc08d);
+  --warn: light-dark(#a06c11, #e0b054);
+  --bad: light-dark(#b3392c, #e58a7a);
+  --info: light-dark(#2f6f8f, #86bcd8);
+  --field: light-dark(#ffffff, #1f1f1e);
+  --rule: light-dark(#edeae0, #302f2d);
+  --pick: light-dark(#f7e8e2, #3b2f2a);
+  --btn: light-dark(#ffffff, #3a3a37);
+  --btn-line: light-dark(#ddd9cd, #4b4b47);
+  --btn-hover: light-dark(#f2f0e8, #454541);
+  --err-line: light-dark(#e6c3bb, #6b3a30);
+  --err-bg: light-dark(#fbeeea, #2a1c18);
+  --err-ink: light-dark(#7a2f24, #f0c9c0);
+  --pin-ink: light-dark(#33260a, #2a1d05);
+}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 html, body { height: 100%; }
 body {
   margin: 0; display: flex; flex-direction: column;
@@ -169,26 +236,44 @@ header {
 .state { color: var(--dim); font-size: 12px; min-width: 6.5rem; }
 #filter {
   flex: 1; min-width: 0; height: 28px; padding: 0 9px;
-  background: #0f1216; color: var(--ink);
+  background: var(--field); color: var(--ink);
   border: 1px solid var(--line); border-radius: 7px; font: inherit;
 }
 #filter:focus { outline: none; border-color: var(--accent); }
 .count { color: var(--dim); font-size: 12px; white-space: nowrap; }
 .btn {
   height: 28px; padding: 0 11px; display: inline-flex; align-items: center;
-  background: #1e2530; color: var(--ink); border: 1px solid #33404f;
+  background: var(--btn); color: var(--ink); border: 1px solid var(--btn-line);
   border-radius: 7px; font: inherit; text-decoration: none; cursor: pointer;
   white-space: nowrap;
 }
-.btn:hover { background: #263041; }
-main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 40%); }
-#list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+.btn:hover { background: var(--btn-hover); }
+/* The tree stands beside both panes, and the request sits under the list it
+   was picked from rather than off to one side of it: header lines and bodies
+   are wide things, and a column beside the list is not. */
+main {
+  flex: 1; min-height: 0; display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr);
+}
+#tree { grid-column: 1; grid-row: 1 / span 2; }
+#list { grid-column: 2; grid-row: 1; }
+#detail { grid-column: 2; grid-row: 2; }
+/* The tree is a filter, not a view: hiding it gives its width back to the two
+   panes that were always here. */
+main.flat { grid-template-columns: minmax(0, 1fr); }
+main.flat > #tree { display: none; }
+main.flat > #list, main.flat > #detail { grid-column: 1; }
+#list { display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid var(--line); }
 #rows { flex: 1; overflow: auto; }
 #detail { overflow: auto; padding: 12px 14px 40px; min-height: 0; }
-/* Composing takes the whole width: a request being written deserves more room
-   than a split view leaves it. */
-main.composing { grid-template-columns: minmax(0, 1fr); }
+/* Composing takes the list and the pane under it, and leaves the tree alone: a
+   saved request is opened from that tree, and covering it would put away the
+   thing being picked from. */
+main.composing { grid-template-rows: minmax(0, 1fr); }
 main.composing > #list, main.composing > #detail { display: none; }
+main.composing > #composer { grid-column: 2; grid-row: 1; }
+main.composing.flat > #composer { grid-column: 1; }
 #composer {
   overflow: auto; min-height: 0; padding: 12px 14px 40px;
   display: flex; flex-direction: column; gap: 8px;
@@ -209,25 +294,28 @@ main.composing > #list, main.composing > #detail { display: none; }
 .btn.on { border-color: var(--accent); color: var(--accent); }
 .head, .row {
   display: grid; align-items: baseline; gap: 10px; padding: 3px 12px;
-  grid-template-columns: 4rem minmax(5rem, 11rem) minmax(0, 1fr) 4rem 4.6rem 4.4rem;
+  grid-template-columns: 4rem minmax(4rem, 11rem) minmax(0, 1fr) 4rem 4.6rem 4.4rem;
 }
 .head {
   flex: none; color: var(--dim); font-size: 11px; letter-spacing: .06em;
   text-transform: uppercase; border-bottom: 1px solid var(--line); padding-block: 6px;
 }
+/* The tree takes a column off the list, so the headings have to give way the
+   same way the cells under them already do. */
+.head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px; cursor: default; border-bottom: 1px solid #171b22;
+  font-size: 12px; cursor: default; border-bottom: 1px solid var(--rule);
 }
 .row:hover { background: var(--hover); }
-.row.on { background: #182437; }
+.row.on { background: var(--pick); }
 .row.pinned { box-shadow: inset 3px 0 0 var(--warn); }
 .row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .host { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
 .row .hostname { min-width: 0; }
 .pin {
   flex: none; display: inline-block; padding: 0 4px; border-radius: 3px;
-  background: var(--warn); color: #221a02; font-size: 10px; font-weight: 700;
+  background: var(--warn); color: var(--pin-ink); font-size: 10px; font-weight: 700;
 }
 .size, .dur { color: var(--dim); text-align: right; }
 .s2 .status { color: var(--good); }
@@ -235,12 +323,149 @@ main.composing > #list, main.composing > #detail { display: none; }
 .s4 .status { color: var(--warn); }
 .s5 .status, .serr .status { color: var(--bad); }
 .swait .status { color: var(--dim); }
+/* The tree: hosts and the paths under them, as somewhere to click rather than
+   as a second list. Picking a branch narrows the list beside it. */
+/* Two trees, one column. What came in is above, what was kept is below: they
+   are read the same way and neither is worth a pane of its own. */
+#tree {
+  min-height: 0; display: flex; flex-direction: column; overflow: hidden;
+  border-right: 1px solid var(--line);
+}
+/* Both halves carry the same bar and fold away the same way. A folded one
+   keeps only its bar, and the space it was using goes to the other. */
+.part { display: flex; flex-direction: column; min-height: 0; }
+.part.shut > *:not(.shelf) { display: none; }
+/* The hosts take the height they need and no more, so the bar under them sits
+   right below the last one rather than at some share of the column decided in
+   advance. Past two thirds they stop growing and scroll instead, or a busy
+   capture would push the saved requests off the bottom. */
+#live { flex: 0 1 auto; max-height: 66%; }
+#saved { flex: 1 1 auto; border-top: 1px solid var(--line); }
+/* Written against the ids on purpose: the shares above are set that way too,
+   and a class alone loses to them, which leaves a folded half still holding
+   the room it was given. Folded halves stack at the top instead. */
+#live.shut, #saved.shut { flex: none; }
+#hosts { flex: 0 1 auto; min-height: 0; overflow: auto; padding: 4px 0 12px; }
+/* Devices sit above the hosts because they are the coarser cut: which machine,
+   then which of its hosts. One device is the usual case, and one chip that
+   says so is small enough to leave alone. */
+#devices {
+  flex: none; display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 8px;
+  border-bottom: 1px solid var(--rule);
+}
+#devices:empty { display: none; }
+.chip {
+  padding: 2px 8px; cursor: pointer; white-space: nowrap;
+  background: none; border: 1px solid var(--btn-line); border-radius: 20px;
+  color: var(--dim); font: inherit; font-size: 11px;
+}
+.chip:hover { background: var(--hover); color: var(--ink); }
+.chip.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
+.star {
+  flex: none; visibility: hidden; padding: 0 2px; cursor: pointer;
+  background: none; border: none; color: var(--dim); font: inherit; font-size: 11px;
+}
+.star.on { visibility: visible; color: var(--accent); }
+.gline:hover .star { visibility: visible; }
+#books { flex: 1; min-height: 0; overflow: auto; padding: 2px 0 12px; }
+.shelf {
+  flex: none; display: flex; align-items: center; gap: 6px; cursor: default;
+  padding: 4px 6px 4px 8px; border-bottom: 1px solid var(--rule);
+}
+.shelf:hover { background: var(--hover); }
+.shelf > .twist { font-size: 10px; }
+.shelf .icon { width: 22px; height: 22px; font-size: 13px; }
+.hunt {
+  flex: none; margin: 5px 8px 3px; height: 24px; padding: 0 8px;
+  background: var(--field); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: 12px;
+}
+.hunt:focus { outline: none; border-color: var(--accent); }
+.shelf-name {
+  flex: 1; color: var(--dim); font-size: 11px;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.pad { margin: 0; padding: 10px 12px; font-size: 12px; }
+.sitem {
+  display: flex; gap: 6px; align-items: baseline; padding: 3px 8px 3px 12px;
+  cursor: default; font-size: 12px;
+}
+.sitem:hover { background: var(--hover); }
+.smethod {
+  flex: none; width: 3.2rem; color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
+}
+.sname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A control that destroys something should not be sitting under the pointer
+   before the pointer is anywhere near it. */
+.kill {
+  flex: none; visibility: hidden; padding: 0 3px; cursor: pointer;
+  background: none; border: none; color: var(--dim); font: inherit; font-size: 13px;
+}
+.kill:hover { color: var(--bad); }
+.sitem:hover .kill, .gline:hover .kill { visibility: visible; }
+.gline {
+  display: flex; gap: 6px; align-items: baseline; padding: 3px 10px 3px 4px;
+  cursor: default; border-radius: 0 6px 6px 0;
+}
+.gline:hover { background: var(--hover); }
+.gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
+.twist { flex: none; width: .9rem; color: var(--dim); text-align: center; }
+.gname {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+  color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.group.host > .gline > .gname { color: var(--ink); }
+.gcount { flex: none; color: var(--dim); font-size: 11px; }
+.gline.picked > .gname, .gline.picked > .gcount { color: var(--accent); }
+.gbody { margin-left: 11px; border-left: 1px solid var(--rule); }
+.group.shut > .gbody { display: none; }
+#scope {
+  display: flex; gap: 6px; align-items: baseline; padding: 5px 10px;
+  color: var(--dim); font-size: 12px; border-bottom: 1px solid var(--line);
+}
+#scope button {
+  background: none; border: none; padding: 0; margin: 0; cursor: pointer;
+  color: var(--accent); font: inherit;
+}
+#scope.idle { display: none; }
 #empty { flex: none; margin: 0; padding: 22px 14px; color: var(--dim); }
 .hint { color: var(--dim); }
-.dhead { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+.dhead { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.icon {
+  flex: none; width: 26px; height: 26px; padding: 0; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--btn); color: var(--dim); border: 1px solid var(--btn-line);
+  border-radius: 7px; font: inherit; font-size: 14px; line-height: 1;
+}
+.icon:hover { background: var(--btn-hover); color: var(--ink); }
+.icon.caret { width: 18px; font-size: 10px; }
+.icon.on { border-color: var(--accent); color: var(--accent); }
+/* The menu hangs off the pair of buttons, so they are what it is measured
+   from. No shadow: nothing else on this page is raised, and a border against
+   the card colour is enough to read as in front. */
+/* One control with a seam down it rather than two buttons side by side: the
+   arrow belongs to the mark it stands next to. The halves overlap by the width
+   of a border so the seam is one line, and whichever half is under the pointer
+   comes forward so its own border is the one that shows. */
+.copybar { position: relative; display: inline-flex; }
+.copybar > .icon { position: relative; border-radius: 0; }
+.copybar > .icon:first-child { border-radius: 7px 0 0 7px; }
+.copybar > .caret { border-radius: 0 7px 7px 0; margin-left: -1px; }
+.copybar > .icon:hover, .copybar > .icon.on { z-index: 1; }
+.menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 5;
+  display: flex; flex-direction: column; min-width: 13rem; padding: 4px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+}
+.mitem {
+  padding: 5px 9px; text-align: left; white-space: nowrap; cursor: pointer;
+  background: none; border: none; border-radius: 6px; color: var(--ink); font: inherit;
+}
+.mitem:hover { background: var(--hover); }
 .dmethod { font-weight: 700; color: var(--accent); }
 .durl { word-break: break-all; font-size: 12px; }
-.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px 10px; margin-bottom: 14px; }
 .fkey { color: var(--dim); }
 .fval { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
@@ -257,24 +482,42 @@ main.composing > #list, main.composing > #detail { display: none; }
 .note { color: var(--dim); margin: 0 0 6px; }
 pre.body, pre.copy {
   margin: 8px 0 0; padding: 9px 11px; max-height: 26rem; overflow: auto;
-  background: #0f1216; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--field); border: 1px solid var(--line); border-radius: 8px;
   font-size: 12px; white-space: pre-wrap; word-break: break-word;
 }
 .error {
   margin: 0 0 14px; padding: 10px 12px; border-radius: 9px;
-  border: 1px solid #6b2020; background: #1c0f0f;
+  border: 1px solid var(--err-line); background: var(--err-bg);
 }
 .etitle { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-.error p { margin: 8px 0 0; color: #f0c9c9; }
+.error p { margin: 8px 0 0; color: var(--err-ink); }
+/* The switch over the bottom pane. Request and response are the same shape and
+   are usually read against each other, so both fitting on one screen is worth
+   a mode of its own rather than a second click every time. */
+.tabs { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.tab {
+  height: 26px; padding: 0 10px; background: none; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px; color: var(--dim); font: inherit;
+}
+.tab:hover { background: var(--hover); color: var(--ink); }
+.tab.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
+.tabs .gap { flex: 1; min-width: 12px; }
+.panes.both { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 20px; }
+.panes.both > .wide { grid-column: 1 / -1; }
 .frame { display: grid; grid-template-columns: 9rem 9rem minmax(0, 1fr); gap: 8px; font-size: 12px; padding: 2px 0; }
 .frame .dir { color: var(--dim); }
 .frame.up .dir { color: var(--accent); }
 .frame .text { word-break: break-all; white-space: pre-wrap; }
 @media (max-width: 1000px) {
-  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
-  #list { border-right: none; border-bottom: 1px solid var(--line); }
+  /* The tree is the pane you can do without: the filter box narrows the same
+     list without taking a column to do it. */
+  main, main.flat { grid-template-columns: minmax(0, 1fr); }
+  main > #tree { display: none; }
+  main > #list, main > #detail, main.composing > #composer { grid-column: 1; }
   .head, .row { grid-template-columns: 3.6rem minmax(4rem, 8rem) minmax(0, 1fr) 3.4rem 4.2rem; }
   .head span:last-child, .row .dur { display: none; }
+  /* Two columns of headers at this width are two columns of ellipsis. */
+  .panes.both { grid-template-columns: minmax(0, 1fr); }
 }
 "#;
 
@@ -282,6 +525,7 @@ const SCRIPT: &str = r#"
 (function () {
   'use strict';
 
+  var COPY_MARK = '⧉';
   var MAX_ROWS = 2000;
   var MAX_BODY_CHARS = 200000;
   var MAX_FRAMES = 200;
@@ -289,6 +533,14 @@ const SCRIPT: &str = r#"
   var RETRY_MAX = 4000;
 
   var rowsEl = document.getElementById('rows');
+  var treeEl = document.getElementById('hosts');
+  var devicesEl = document.getElementById('devices');
+  var booksEl = document.getElementById('books');
+  var noBooksEl = document.getElementById('no-books');
+  var mainEl = document.querySelector('main');
+  var viewBtn = document.getElementById('view');
+  var scopeEl = document.getElementById('scope');
+  var scopeNameEl = document.getElementById('scope-name');
   var detailEl = document.getElementById('detail');
   var filterEl = document.getElementById('filter');
   var countEl = document.getElementById('count');
@@ -298,16 +550,23 @@ const SCRIPT: &str = r#"
 
   var rows = new Map();
   var needles = new Map();
+  var groups = new Map();
+  var branches = new Map();
+  var homes = new Map();
+  var seen = new Map();
   var visible = 0;
   var needle = '';
+  var scope = '';
+  var device = '';
   var selectedId = null;
-  var selectedRow = null;
   var detailToken = 0;
   var queue = null;
   var greeted = false;
   var backoff = RETRY_MIN;
   var frameList = null;
   var frameOwner = null;
+  var side = 'info';
+  var paired = false;
 
   // Every string that came off the wire enters the document through here, and
   // textContent is why a captured body full of markup stays a captured body
@@ -402,14 +661,81 @@ const SCRIPT: &str = r#"
 
     needles.set(flow.id, [
       str(flow.method), str(flow.authority), str(flow.path),
-      statusLabel(flow), str(flow.error)
+      statusLabel(flow), str(flow.error), str(flow.client)
     ].join(' ').toLowerCase());
+    settle(flow);
     filterRow(row, flow.id);
   }
 
+  /* ---------------------------------------------------------------- */
+  /* devices                                                           */
+  /* ---------------------------------------------------------------- */
+
+  /* Two phones and a laptop through one proxy is three streams in one list.
+     The address is the only thing that tells them apart here, so it is what
+     the chips above the tree are: a coarser cut than the host, taken first. */
+
+  function settle(flow) {
+    var was = homes.get(flow.id);
+    var now = str(flow.client) || 'unknown';
+    if (was === now) { return; }
+    if (was) { note(was, -1); }
+    homes.set(flow.id, now);
+    note(now, 1);
+    paintDevices();
+  }
+
+  function forget(id) {
+    var was = homes.get(id);
+    if (!was) { return; }
+    homes.delete(id);
+    note(was, -1);
+    paintDevices();
+  }
+
+  function note(address, by) {
+    var count = (seen.get(address) || 0) + by;
+    if (count > 0) { seen.set(address, count); } else { seen.delete(address); }
+  }
+
+  function paintDevices() {
+    strip(devicesEl);
+    // One device is the ordinary case and needs no choosing between.
+    if (seen.size < 2) {
+      if (device) { pickDevice(device); }
+      return;
+    }
+    var addresses = Array.from(seen.keys()).sort();
+    for (var i = 0; i < addresses.length; i++) {
+      devicesEl.appendChild(chip(addresses[i]));
+    }
+    if (device && !seen.has(device)) { pickDevice(device); }
+  }
+
+  function chip(address) {
+    var button = el('button', device === address ? 'chip on' : 'chip',
+      address + '  ' + seen.get(address));
+    button.type = 'button';
+    button.addEventListener('click', function () { pickDevice(address); });
+    return button;
+  }
+
+  function pickDevice(address) {
+    device = device === address ? '' : address;
+    paintDevices();
+    rows.forEach(function (row, id) { filterRow(row, id); });
+    restack();
+    tally();
+  }
+
+  // The three narrowings are one decision: a row survives the typed needle, the
+  // device the chips picked, and the branch that was clicked, or it is not on
+  // screen.
   function filterRow(row, id) {
     var text = needles.get(id) || '';
-    var hide = needle !== '' && text.indexOf(needle) < 0;
+    var hide = (needle !== '' && text.indexOf(needle) < 0)
+      || (device !== '' && homes.get(id) !== device)
+      || !inScope(id);
     if (row.hidden !== hide) {
       row.hidden = hide;
       visible += hide ? -1 : 1;
@@ -425,6 +751,7 @@ const SCRIPT: &str = r#"
       if (atTop) { rowsEl.insertBefore(row, rowsEl.firstChild); } else { rowsEl.appendChild(row); }
     }
     paint(row, flow);
+    place(flow);
     trim();
   }
 
@@ -434,18 +761,28 @@ const SCRIPT: &str = r#"
       if (!last) { return; }
       rowsEl.removeChild(last);
       rows.delete(last.flowId);
+      unplace(last.flowId);
+      forget(last.flowId);
       needles.delete(last.flowId);
       if (!last.hidden) { visible -= 1; }
-      if (last === selectedRow) { selectedRow = null; }
     }
   }
 
   function wipe() {
     strip(rowsEl);
+    strip(treeEl);
     rows.clear();
     needles.clear();
+    groups.clear();
+    branches.clear();
+    homes.clear();
+    seen.clear();
+    device = '';
+    strip(devicesEl);
+    // The branch that was picked no longer exists, so neither does the scope.
+    scope = '';
+    scopeEl.classList.add('idle');
     visible = 0;
-    selectedRow = null;
     selectedId = null;
     frameList = null;
     frameOwner = null;
@@ -466,7 +803,292 @@ const SCRIPT: &str = r#"
   filterEl.addEventListener('input', function () {
     needle = filterEl.value.trim().toLowerCase();
     rows.forEach(function (row, id) { filterRow(row, id); });
+    restack();
     tally();
+  });
+
+  // What the filter box did to the list, it also did to the branch counts.
+  function restack() {
+    branches.forEach(function (held, id) {
+      var now = visibleIn(id);
+      if (now !== held.shown) { count(held, 0, now - held.shown); }
+    });
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* the tree                                                          */
+  /* ---------------------------------------------------------------- */
+
+  /* Hosts, and the paths under them, as a place to click. It is not a second
+     list: picking a branch narrows the one list there is, the same way typing
+     in the filter box does, and the two narrow together. */
+
+  function groupFor(key, label, parent) {
+    var rec = groups.get(key);
+    if (rec) { return rec; }
+
+    var box = el('div', parent ? 'group' : 'group host');
+    var line = el('div', 'gline');
+    var twist = el('span', 'twist', '▾');
+    line.appendChild(twist);
+    line.appendChild(el('span', 'gname', label));
+    var count = el('span', 'gcount', '0');
+    line.appendChild(count);
+    if (!parent) { line.appendChild(starFor(box, label)); }
+    var body = el('div', 'gbody');
+    box.appendChild(line);
+    box.appendChild(body);
+    // The twisty folds the branch away, the rest of the line narrows the list.
+    // Two jobs on one row, so the first has to keep the click to itself.
+    twist.addEventListener('click', function (event) {
+      event.stopPropagation();
+      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+    });
+    line.addEventListener('click', function () { scopeTo(key); });
+
+    rec = { key: key, el: box, line: line, body: body, count: count, parent: parent, total: 0, shown: 0 };
+    groups.set(key, rec);
+    if (parent) { parent.body.appendChild(box); } else { seat(box, label); }
+    // A host that turns up while a search is on has to answer it too, rather
+    // than arriving on screen past a filter it was never shown.
+    if (hostHunt !== '') { huntHosts(hostHunt); }
+    return rec;
+  }
+
+  /* Hosts arrive in whatever order the device asks for them, which is to say
+     the one you care about is somewhere in the middle by the time you look.
+     A kept host sits at the top of the tree instead, and stays kept across
+     restarts of the tab, since the interesting hosts do not change nearly as
+     often as the traffic does. */
+
+  var kept = readKept();
+
+  function isKept(host) { return kept.indexOf(host) >= 0; }
+
+  function readKept() {
+    try {
+      var held = JSON.parse(localStorage.getItem('proxima.kept') || '[]');
+      return Array.isArray(held) ? held.filter(function (h) { return typeof h === 'string'; }) : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function writeKept() {
+    try { localStorage.setItem('proxima.kept', JSON.stringify(kept)); } catch (error) { /* not fatal */ }
+  }
+
+  function starFor(box, host) {
+    var star = el('button', isKept(host) ? 'star on' : 'star', '★');
+    star.type = 'button';
+    star.title = 'Keep this host at the top';
+    star.setAttribute('aria-label', 'Keep this host at the top');
+    box.kept = isKept(host);
+    star.addEventListener('click', function (event) {
+      // The line under it narrows the list, which is not what was asked for.
+      event.stopPropagation();
+      var at = kept.indexOf(host);
+      if (at < 0) { kept.push(host); } else { kept.splice(at, 1); }
+      writeKept();
+      box.kept = at < 0;
+      star.className = box.kept ? 'star on' : 'star';
+      seat(box, host);
+    });
+    return star;
+  }
+
+  // Kept hosts first, in the order they were kept; everything else after them,
+  // in the order it arrived.
+  function seat(box, host) {
+    box.kept = isKept(host);
+    if (box.parentNode) { box.parentNode.removeChild(box); }
+    var others = treeEl.children;
+    for (var i = 0; i < others.length; i++) {
+      if (box.kept ? !others[i].kept : false) {
+        treeEl.insertBefore(box, others[i]);
+        return;
+      }
+    }
+    treeEl.appendChild(box);
+  }
+
+  // Where a flow sits: the host, then one branch per directory segment of its
+  // path. The last segment is the request itself rather than a branch, and the
+  // query string goes with it, because two calls that differ only by query are
+  // two requests and not two places.
+  function branch(flow) {
+    var raw = str(flow.path);
+    var cut = raw.indexOf('?');
+    var parts = (cut < 0 ? raw : raw.slice(0, cut)).split('/');
+    var dirs = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i]) { dirs.push(parts[i]); }
+    }
+    if (dirs.length) { dirs.pop(); }
+    return { host: str(flow.authority) || 'unknown host', dirs: dirs };
+  }
+
+  function place(flow) {
+    var spot = branch(flow);
+    var key = spot.host;
+    var rec = groupFor(key, spot.host, null);
+    for (var i = 0; i < spot.dirs.length; i++) {
+      key += '/' + spot.dirs[i];
+      rec = groupFor(key, spot.dirs[i], rec);
+    }
+
+    // A flow that arrives as a bare CONNECT and only later reports its path
+    // moves, so a stale placement is undone rather than left where it was.
+    var held = branches.get(flow.id);
+    if (held && held.key === key) {
+      count(held, 0, visibleIn(flow.id) - held.shown);
+      return;
+    }
+    if (held) { unplace(flow.id); }
+    var held2 = { key: key, rec: rec, shown: 0 };
+    branches.set(flow.id, held2);
+    count(held2, 1, visibleIn(flow.id));
+  }
+
+  function unplace(id) {
+    var held = branches.get(id);
+    if (!held) { return; }
+    branches.delete(id);
+    count(held, -1, -held.shown);
+    prune(held.rec);
+  }
+
+  // Whether the needle alone would show this flow. The scope is left out on
+  // purpose: a count that shrank because you clicked a branch would say the
+  // other branches had emptied, when all that happened is you looked away.
+  function visibleIn(id) {
+    var text = needles.get(id) || '';
+    if (needle !== '' && text.indexOf(needle) < 0) { return 0; }
+    if (device !== '' && homes.get(id) !== device) { return 0; }
+    return 1;
+  }
+
+  // Counts ride up the chain rather than being recounted: a branch only ever
+  // changes by the one flow that arrived, left, or fell out of the filter.
+  function count(held, total, shown) {
+    held.shown += shown;
+    var rec = held.rec;
+    while (rec) {
+      rec.total += total;
+      rec.shown += shown;
+      rec.count.textContent = rec.shown === rec.total
+        ? String(rec.total)
+        : rec.shown + ' of ' + rec.total;
+      dress(rec);
+      rec = rec.parent;
+    }
+  }
+
+  // Two reasons to hide a branch, and one place that decides: nothing under it
+  // survived the filter box, or nothing under it answers the search in the bar.
+  function dress(rec) {
+    rec.el.hidden = (rec.total > 0 && rec.shown === 0) || rec.astray === true;
+  }
+
+  /* The search in each bar is a search of that tree, not of the capture: it
+     hides branches rather than flows, and the counts on the ones left standing
+     go on saying how much traffic they hold. */
+
+  var hostHunt = '';
+
+  function huntHosts(text) {
+    var want = text.trim().toLowerCase();
+    hostHunt = want;
+    groups.forEach(function (rec) { rec.astray = want !== ''; });
+    if (want !== '') {
+      groups.forEach(function (rec) {
+        if (rec.key.toLowerCase().indexOf(want) < 0) { return; }
+        // A branch that answers brings the ones above it along, or it would be
+        // hidden inside a parent that does not answer itself.
+        for (var up = rec; up; up = up.parent) { up.astray = false; }
+      });
+    }
+    groups.forEach(dress);
+  }
+
+  // A branch nothing hangs off is noise, and leaving it would let the tree grow
+  // without bound while the list it stands beside stays capped.
+  function prune(rec) {
+    while (rec && rec.total === 0) {
+      if (rec.el.parentNode) { rec.el.parentNode.removeChild(rec.el); }
+      groups.delete(rec.key);
+      // The list cannot stay narrowed to a branch that is no longer there.
+      if (rec.key === scope) { scopeTo(scope); }
+      rec = rec.parent;
+    }
+  }
+
+  // A flow is in scope when it sits on the chosen branch or below it. Comparing
+  // whole segments is what keeps `example.com/v1` from claiming `/v10`.
+  function inScope(id) {
+    if (!scope) { return true; }
+    var held = branches.get(id);
+    if (!held) { return false; }
+    return held.key === scope || held.key.indexOf(scope + '/') === 0;
+  }
+
+  function scopeTo(key) {
+    scope = scope === key ? '' : key;
+    groups.forEach(function (rec) { rec.line.classList.toggle('picked', rec.key === scope); });
+    scopeEl.classList.toggle('idle', scope === '');
+    scopeNameEl.textContent = scope;
+    rows.forEach(function (row, id) { filterRow(row, id); });
+    tally();
+  }
+
+  function highlight(id, on) {
+    var row = rows.get(id);
+    if (row) { row.classList.toggle('on', on); }
+  }
+
+  document.getElementById('scope-clear').addEventListener('click', function () {
+    if (scope) { scopeTo(scope); }
+  });
+
+  /* The scheme follows the machine unless it is told not to. The choice
+     outlives the tab, because a tool you leave open all day should not go back
+     to arguing with you after every restart. */
+
+  var THEMES = ['system', 'light', 'dark'];
+  var themeBtn = document.getElementById('theme');
+
+  function wearTheme(name) {
+    if (name === 'system') { document.documentElement.removeAttribute('data-theme'); }
+    else { document.documentElement.setAttribute('data-theme', name); }
+    themeBtn.textContent = 'Theme: ' + name;
+    themeBtn.classList.toggle('on', name !== 'system');
+  }
+
+  function rememberedTheme() {
+    // Private browsing refuses storage outright, and a stored value from an
+    // older build is not one of ours.
+    try {
+      var held = localStorage.getItem('proxima.theme');
+      return THEMES.indexOf(held) < 0 ? 'system' : held;
+    } catch (error) {
+      return 'system';
+    }
+  }
+
+  var theme = rememberedTheme();
+  themeBtn.addEventListener('click', function () {
+    // Storage that refuses to be written must still leave the button working
+    // for as long as the tab is open, so the choice is held here as well.
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    try { localStorage.setItem('proxima.theme', theme); } catch (error) { /* not fatal */ }
+    wearTheme(theme);
+  });
+  wearTheme(theme);
+
+  viewBtn.addEventListener('click', function () {
+    var off = mainEl.classList.toggle('flat');
+    viewBtn.classList.toggle('on', !off);
+    viewBtn.textContent = off ? 'Tree' : 'Hide tree';
   });
 
   /* ---------------------------------------------------------------- */
@@ -485,10 +1107,10 @@ const SCRIPT: &str = r#"
   }
 
   async function select(id) {
+    // Both views carry the selection, so switching between them keeps it.
+    if (selectedId) { highlight(selectedId, false); }
     selectedId = id;
-    if (selectedRow) { selectedRow.classList.remove('on'); }
-    selectedRow = rows.get(id) || null;
-    if (selectedRow) { selectedRow.classList.add('on'); }
+    highlight(id, true);
 
     var token = ++detailToken;
     hint('Loading...');
@@ -508,37 +1130,108 @@ const SCRIPT: &str = r#"
     var response = flow.response || null;
 
     var head = el('div', 'dhead');
+    // One line, and the copy sits at the head of it: it acts on the URL beside
+    // it, and a row of its own for a single control was a row of mostly nothing.
+    head.appendChild(copyBar(flow, request, response));
     head.appendChild(el('span', 'dmethod', str(request.method)));
     head.appendChild(el('span', 'durl mono', str(request.url)));
     detailEl.appendChild(head);
 
-    var actions = el('div', 'actions');
-    var copy = el('button', 'btn', 'Copy as cURL');
-    copy.type = 'button';
-    copy.addEventListener('click', function () { copyCurl(flow.id, copy); });
-    actions.appendChild(copy);
-    detailEl.appendChild(actions);
+    sides(flow, request, response);
+  }
 
-    detailEl.appendChild(facts(flow, request, response));
+  /* The bottom pane holds two halves of one exchange. Which of them is on
+     screen is a preference rather than a property of the flow, so it is kept
+     across selections: picking the next request does not put you back on a
+     tab you had just moved away from. */
 
-    if (flow.error) {
-      var box = el('div', 'error');
-      box.appendChild(el('div', 'etitle', str(flow.error.message)));
-      if (flow.error.likelyPinning) {
-        box.appendChild(el('p', null, 'The client rejected the Proxima certificate, which almost always means the app pins its own. Nothing here is broken and no setting on this machine will decrypt it: the app has to be built against a permissive network security config, or run on a device where Proxima is in the system trust store.'));
+  function sides(flow, request, response) {
+    var frames = Array.isArray(flow.wsMessages) ? flow.wsMessages : null;
+    var tabs = el('div', 'tabs');
+    var panes = el('div', 'panes');
+    var buttons = [];
+
+    function draw() {
+      strip(panes);
+      // Whatever the frame list was pointing at is about to leave the document.
+      frameList = null;
+      frameOwner = null;
+      panes.className = paired ? 'panes both' : 'panes';
+
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].hidden = paired;
+        buttons[i].classList.toggle('on', !paired && buttons[i].side === side);
       }
-      detailEl.appendChild(box);
+      if (paired) {
+        panes.appendChild(pane('info', flow, request, response, frames));
+        panes.appendChild(pane('request', flow, request, response, frames));
+        if (response) { panes.appendChild(pane('response', flow, request, response, frames)); }
+        if (frames) { panes.appendChild(pane('frames', flow, request, response, frames)); }
+        return;
+      }
+      panes.appendChild(pane(side, flow, request, response, frames));
     }
 
-    detailEl.appendChild(headerBlock('Request headers', request.headers));
-    detailEl.appendChild(bodyBlock(flow.id, 'request', request.body));
-    if (response) {
-      detailEl.appendChild(headerBlock('Response headers', response.headers));
-      detailEl.appendChild(bodyBlock(flow.id, 'response', response.body));
+    function offer(name, label) {
+      var button = el('button', 'tab', label);
+      button.type = 'button';
+      button.side = name;
+      button.addEventListener('click', function () { side = name; draw(); });
+      buttons.push(button);
+      tabs.appendChild(button);
     }
-    if (Array.isArray(flow.wsMessages)) {
-      detailEl.appendChild(frameBlock(flow.id, flow.wsMessages));
+
+    offer('info', 'Info');
+    offer('request', 'Request');
+    if (response) { offer('response', 'Response'); }
+    if (frames) { offer('frames', 'Frames'); }
+    // A flow still in flight has no response half, and most have no frames.
+    // What every flow does have is the account of itself.
+    if (side === 'response' && !response) { side = 'info'; }
+    if (side === 'frames' && !frames) { side = 'info'; }
+
+    tabs.appendChild(el('span', 'gap'));
+    var mode = el('button', 'tab', paired ? 'One at a time' : 'Both at once');
+    mode.type = 'button';
+    mode.addEventListener('click', function () {
+      paired = !paired;
+      mode.textContent = paired ? 'One at a time' : 'Both at once';
+      mode.classList.toggle('on', paired);
+      draw();
+    });
+    mode.classList.toggle('on', paired);
+    tabs.appendChild(mode);
+
+    detailEl.appendChild(tabs);
+    detailEl.appendChild(panes);
+    draw();
+  }
+
+  function pane(which, flow, request, response, frames) {
+    // Info and the frames are about the exchange rather than one end of it, so
+    // side by side they take the full width instead of a column each.
+    var box = el('div', which === 'request' || which === 'response' ? 'pane' : 'pane wide');
+    if (which === 'frames') {
+      box.appendChild(frameBlock(flow.id, frames));
+      return box;
     }
+    if (which === 'info') {
+      box.appendChild(facts(flow, request, response));
+      if (flow.error) {
+        var trouble = el('div', 'error');
+        trouble.appendChild(el('div', 'etitle', str(flow.error.message)));
+        if (flow.error.likelyPinning) {
+          trouble.appendChild(el('p', null, 'The client rejected the Proxima certificate, which almost always means the app pins its own. Nothing here is broken and no setting on this machine will decrypt it: the app has to be built against a permissive network security config, or run on a device where Proxima is in the system trust store.'));
+        }
+        box.appendChild(trouble);
+      }
+      return box;
+    }
+    var half = which === 'response' ? response : request;
+    box.appendChild(headerBlock(
+      which === 'response' ? 'Response headers' : 'Request headers', half.headers));
+    box.appendChild(bodyBlock(flow.id, which, half.body));
+    return box;
   }
 
   function facts(flow, request, response) {
@@ -641,22 +1334,29 @@ const SCRIPT: &str = r#"
     return false;
   }
 
+  // Whole, decoded, and not cut down: the pane below trims it to what it can
+  // show, and copying wants the thing itself.
+  async function bodyText(id, which) {
+    var url = '/api/flows/' + encodeURIComponent(id) + '/body/' + which + '?decode=1';
+    var response = await fetch(url, { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error('it is no longer available (' + response.status + ')');
+    }
+    return response.text();
+  }
+
   async function loadBody(id, which, contentType, into) {
+    var text;
     try {
-      var url = '/api/flows/' + encodeURIComponent(id) + '/body/' + which + '?decode=1';
-      var response = await fetch(url, { cache: 'no-store' });
-      if (!response.ok) {
-        into.textContent = 'The body is no longer available (' + response.status + ').';
-        return;
-      }
-      var text = await response.text();
-      var cut = text.length > MAX_BODY_CHARS;
-      if (cut) { text = text.slice(0, MAX_BODY_CHARS); }
-      into.textContent = indent(text, contentType) +
-        (cut ? '\n\n[stopped after ' + MAX_BODY_CHARS + ' characters]' : '');
+      text = await bodyText(id, which);
     } catch (error) {
       into.textContent = 'Could not read the body: ' + error.message;
+      return;
     }
+    var cut = text.length > MAX_BODY_CHARS;
+    if (cut) { text = text.slice(0, MAX_BODY_CHARS); }
+    into.textContent = indent(text, contentType) +
+      (cut ? '\n\n[stopped after ' + MAX_BODY_CHARS + ' characters]' : '');
   }
 
   // Reformatting JSON is worth it: most captured JSON arrives on one line.
@@ -701,36 +1401,134 @@ const SCRIPT: &str = r#"
     return 'opcode ' + str(code);
   }
 
-  async function copyCurl(id, button) {
-    var label = button.textContent;
+  // A mark rather than a word, so it can sit at the head of the URL line. What
+  // it did has to show somewhere all the same, and for one character that is
+  // the mark itself and the tooltip behind it.
+  function says(button, mark, why) {
+    button.textContent = mark;
+    button.title = why;
+  }
+
+  /* The mark copies the command, which is what it is wanted for nine times in
+     ten. The arrow beside it is where the tenth lives, so the other things
+     worth lifting out of a flow do not each need a button of their own. */
+
+  function copyBar(flow, request, response) {
+    var bar = el('div', 'copybar');
+    var mark = el('button', 'icon', COPY_MARK);
+    mark.type = 'button';
+    mark.title = 'Copy as cURL';
+    mark.setAttribute('aria-label', 'Copy as cURL');
+    mark.addEventListener('click', function () {
+      shut();
+      copyWhat(mark, function () { return curlOf(flow.id); });
+    });
+
+    var caret = el('button', 'icon caret', '▾');
+    caret.type = 'button';
+    caret.title = 'Other things to copy';
+    caret.setAttribute('aria-label', 'Other things to copy');
+
+    var menu = el('div', 'menu');
+    menu.hidden = true;
+
+    function item(label, make) {
+      var entry = el('button', 'mitem', label);
+      entry.type = 'button';
+      entry.addEventListener('click', function () {
+        shut();
+        copyWhat(mark, make);
+      });
+      menu.appendChild(entry);
+    }
+
+    item('cURL command', function () { return curlOf(flow.id); });
+    item('URL', function () { return str(request.url); });
+    item('Request headers', function () { return headerLines(request.headers); });
+    if (request.body) {
+      item('Request body', function () { return bodyText(flow.id, 'request'); });
+    }
+    if (response) {
+      item('Response headers', function () { return headerLines(response.headers); });
+      if (response.body) {
+        item('Response body', function () { return bodyText(flow.id, 'response'); });
+      }
+    }
+
+    caret.addEventListener('click', function (event) {
+      // Without this the document listener below would close the menu in the
+      // same click that opened it.
+      event.stopPropagation();
+      var open = menu.hidden;
+      shut();
+      menu.hidden = !open;
+      caret.classList.toggle('on', open);
+    });
+
+    bar.appendChild(mark);
+    bar.appendChild(caret);
+    bar.appendChild(menu);
+    openMenu = menu;
+    openCaret = caret;
+    return bar;
+  }
+
+  var openMenu = null;
+  var openCaret = null;
+
+  function shut() {
+    if (openMenu) { openMenu.hidden = true; }
+    if (openCaret) { openCaret.classList.remove('on'); }
+  }
+
+  document.addEventListener('click', shut);
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') { shut(); }
+  });
+
+  async function curlOf(id) {
+    var data = await getJson('/api/flows/' + encodeURIComponent(id) + '/curl');
+    return data && typeof data.curl === 'string' ? data.curl : '';
+  }
+
+  function headerLines(headers) {
+    var list = Array.isArray(headers) ? headers : [];
+    var lines = [];
+    for (var i = 0; i < list.length; i++) {
+      if (Array.isArray(list[i])) { lines.push(str(list[i][0]) + ': ' + str(list[i][1])); }
+    }
+    return lines.join('\n');
+  }
+
+  async function copyWhat(button, make) {
     var text;
     try {
-      var data = await getJson('/api/flows/' + encodeURIComponent(id) + '/curl');
-      text = data && typeof data.curl === 'string' ? data.curl : '';
+      text = await make();
     } catch (error) {
-      button.textContent = 'Failed: ' + error.message;
+      says(button, '!', 'Could not copy that: ' + error.message);
+      setTimeout(function () { says(button, COPY_MARK, 'Copy as cURL'); }, 3000);
       return;
     }
 
     try {
       if (!navigator.clipboard) { throw new Error('there is no clipboard here'); }
       await navigator.clipboard.writeText(text);
-      button.textContent = 'Copied';
-      setTimeout(function () { button.textContent = label; }, 1500);
+      says(button, '✓', 'Copied');
+      setTimeout(function () { says(button, COPY_MARK, 'Copy as cURL'); }, 1500);
     } catch (error) {
       // Served over plain HTTP to a LAN address there is no clipboard API at
       // all, and even on localhost the write is refused unless the document
-      // holds focus. The command is the point, so put it on screen either way.
+      // holds focus. What was asked for is the point, so put it on screen.
       offer(button, text);
     }
   }
 
   function offer(button, text) {
-    var actions = button.parentNode;
-    var stale = actions.parentNode.querySelector('pre.copy');
+    var head = button.parentNode;
+    var stale = head.parentNode.querySelector('pre.copy');
     if (stale) { stale.parentNode.removeChild(stale); }
-    actions.parentNode.insertBefore(el('pre', 'copy mono', text), actions.nextSibling);
-    button.textContent = 'Copy it by hand';
+    head.parentNode.insertBefore(el('pre', 'copy mono', text), head.nextSibling);
+    says(button, COPY_MARK, 'There is no clipboard here, so the command is below to copy by hand');
   }
 
   /* ---------------------------------------------------------------- */
@@ -823,7 +1621,6 @@ const SCRIPT: &str = r#"
   /* ---- the composer: the half of this tool that sends rather than watches ---- */
 
   var composerEl = document.getElementById('composer');
-  var mainEl = document.querySelector('main');
   var composeBtn = document.getElementById('compose');
   var outEl = document.getElementById('c-out');
 
@@ -942,6 +1739,326 @@ const SCRIPT: &str = r#"
       fire();
     }
   });
+
+  /* ---------------------------------------------------------------- */
+  /* saved requests                                                    */
+  /* ---------------------------------------------------------------- */
+
+  /* The other half of this tool: requests kept on purpose rather than caught
+     in passing. They live in the same column as the hosts because they are read
+     the same way, and they open in the composer, which is the only thing here
+     that sends anything. */
+
+  var books = [];
+
+  async function loadBooks() {
+    try {
+      var got = await getJson('/api/collections');
+      books = Array.isArray(got) ? got : [];
+    } catch (error) {
+      books = [];
+    }
+    paintBooks();
+  }
+
+  var bookHunt = '';
+
+  // A collection whose own name answers keeps all of it: asking for the name of
+  // a folder is asking for the folder, not for the requests that repeat it.
+  function keptFor(book) {
+    var all = book.requests || [];
+    if (bookHunt === '') { return all; }
+    if (str(book.name).toLowerCase().indexOf(bookHunt) >= 0) { return all; }
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var spec = all[i].spec || {};
+      var hay = (str(all[i].name) + ' ' + str(spec.method) + ' ' + str(spec.url)).toLowerCase();
+      if (hay.indexOf(bookHunt) >= 0) { out.push(all[i]); }
+    }
+    return out;
+  }
+
+  function paintBooks() {
+    strip(booksEl);
+    var count = 0;
+    var showing = 0;
+    for (var i = 0; i < books.length; i++) {
+      var found = keptFor(books[i]);
+      count += (books[i].requests || []).length;
+      // While searching, a collection with nothing to show is not shown.
+      if (bookHunt !== '' && !found.length) { continue; }
+      showing += 1;
+      booksEl.appendChild(bookNode(books[i], found));
+    }
+    noBooksEl.hidden = showing > 0;
+    if (books.length && !showing) {
+      noBooksEl.textContent = 'Nothing saved here answers that.';
+    } else if (!books.length) {
+      noBooksEl.textContent = 'Nothing saved yet. Compose a request, name it, and save.';
+    }
+    fillBookChoices();
+    return count;
+  }
+
+  function bookNode(book, showing) {
+    var box = el('div', 'group host');
+    var line = el('div', 'gline');
+    var twist = el('span', 'twist', '▾');
+    var all = book.requests || [];
+    var kept = showing || all;
+    line.appendChild(twist);
+    line.appendChild(el('span', 'gname', str(book.name)));
+    line.appendChild(el('span', 'gcount', kept.length === all.length
+      ? String(all.length)
+      : kept.length + ' of ' + all.length));
+
+    var kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = 'Delete this collection';
+    kill.setAttribute('aria-label', 'Delete this collection');
+    kill.addEventListener('click', function (event) {
+      event.stopPropagation();
+      dropBook(book);
+    });
+    line.appendChild(kill);
+
+    line.addEventListener('click', function () {
+      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+    });
+
+    var body = el('div', 'gbody');
+    for (var i = 0; i < kept.length; i++) {
+      body.appendChild(keptNode(book, kept[i]));
+    }
+    box.appendChild(line);
+    box.appendChild(body);
+    return box;
+  }
+
+  function keptNode(book, saved) {
+    var spec = saved.spec || {};
+    var item = el('div', 'sitem');
+    item.appendChild(el('span', 'smethod', str(spec.method) || 'GET'));
+    item.appendChild(el('span', 'sname', str(saved.name) || str(spec.url)));
+
+    var kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = 'Delete this request';
+    kill.setAttribute('aria-label', 'Delete this request');
+    kill.addEventListener('click', function (event) {
+      event.stopPropagation();
+      dropSaved(book, saved);
+    });
+    item.appendChild(kill);
+
+    item.addEventListener('click', function () { openSaved(saved); });
+    return item;
+  }
+
+  // Straight into the composer, which is where a saved request is of any use.
+  function openSaved(saved) {
+    var spec = saved.spec || {};
+    document.getElementById('c-method').value = str(spec.method) || 'GET';
+    document.getElementById('c-url').value = str(spec.url);
+    document.getElementById('c-headers').value = headerLines(spec.headers);
+    var body = '';
+    if (spec.bodyBase64) {
+      try { body = fromBase64(spec.bodyBase64); } catch (error) { body = ''; }
+    }
+    document.getElementById('c-body').value = body;
+    document.getElementById('c-name').value = str(saved.name);
+    // The answer on screen belongs to the request that was open a moment ago.
+    // Left up, it reads as the answer to this one, and it is convincing: same
+    // shape, same pane, only the URL above it has changed.
+    strip(outEl);
+    composing(true);
+  }
+
+  function fillBookChoices() {
+    var choose = document.getElementById('c-book');
+    var held = choose.value;
+    strip(choose);
+    for (var i = 0; i < books.length; i++) {
+      var option = el('option', null, str(books[i].name));
+      option.value = books[i].id;
+      choose.appendChild(option);
+    }
+    var fresh = el('option', null, 'New collection...');
+    fresh.value = '';
+    choose.appendChild(fresh);
+    choose.value = held;
+    // A collection that was deleted while its name sat in the box leaves the
+    // select on nothing at all.
+    if (!choose.value) { choose.value = books.length ? books[0].id : ''; }
+  }
+
+  async function putBook(book) {
+    var url = book.id ? '/api/collections/' + encodeURIComponent(book.id) : '/api/collections';
+    var response = await fetch(url, {
+      method: book.id ? 'PUT' : 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(book),
+      cache: 'no-store'
+    });
+    if (!response.ok) { throw new Error('the server answered ' + response.status); }
+    return response.json();
+  }
+
+  async function saveComposed() {
+    var out = document.getElementById('c-out');
+    var url = document.getElementById('c-url').value.trim();
+    if (!url) {
+      strip(out);
+      out.appendChild(el('p', 'hint', 'Give it a URL before saving it.'));
+      return;
+    }
+
+    var bodyText = document.getElementById('c-body').value;
+    var saved = {
+      // The store mints the id: an empty one is its word for new.
+      id: '',
+      name: document.getElementById('c-name').value.trim() || url,
+      spec: {
+        method: document.getElementById('c-method').value,
+        url: url,
+        headers: readHeaders(document.getElementById('c-headers').value),
+        bodyBase64: bodyText ? toBase64(bodyText) : null
+      }
+    };
+
+    var chosen = document.getElementById('c-book').value;
+    var book = null;
+    for (var i = 0; i < books.length; i++) {
+      if (books[i].id === chosen) { book = books[i]; }
+    }
+    if (!book) { book = { id: '', name: 'Saved requests', requests: [] }; }
+    book.requests = (book.requests || []).concat([saved]);
+
+    strip(out);
+    try {
+      await putBook(book);
+      await loadBooks();
+      out.appendChild(el('p', 'hint', 'Saved as ' + saved.name + '.'));
+    } catch (error) {
+      out.appendChild(el('p', 'hint', 'Could not save it: ' + error.message));
+    }
+  }
+
+  async function dropSaved(book, saved) {
+    var kept = [];
+    var all = book.requests || [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].id !== saved.id) { kept.push(all[i]); }
+    }
+    book.requests = kept;
+    try {
+      await putBook(book);
+      await loadBooks();
+    } catch (error) {
+      noBooksEl.hidden = false;
+      noBooksEl.textContent = 'Could not delete that: ' + error.message;
+    }
+  }
+
+  async function dropBook(book) {
+    if (!book.id) { return; }
+    try {
+      var response = await fetch('/api/collections/' + encodeURIComponent(book.id), {
+        method: 'DELETE',
+        cache: 'no-store'
+      });
+      if (!response.ok) { throw new Error('the server answered ' + response.status); }
+      await loadBooks();
+    } catch (error) {
+      noBooksEl.hidden = false;
+      noBooksEl.textContent = 'Could not delete that: ' + error.message;
+    }
+  }
+
+  /* Either half of the column folds to its bar. Which of them is folded is
+     remembered, because it is a decision about how you work rather than about
+     what is on screen at the moment. */
+
+  var shutParts = readShut();
+
+  function readShut() {
+    try {
+      var held = JSON.parse(localStorage.getItem('proxima.shut') || '[]');
+      return Array.isArray(held) ? held.filter(function (p) { return typeof p === 'string'; }) : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function foldPart(name, shut) {
+    var part = document.getElementById(name);
+    if (!part) { return; }
+    part.classList.toggle('shut', shut);
+    part.querySelector('.twist').textContent = shut ? '▸' : '▾';
+  }
+
+  /* One search box per bar, folded away until it is asked for: two boxes always
+     on screen would take a line each from the trees they search. */
+
+  function huntBox(buttonId, inputId, run) {
+    var button = document.getElementById(buttonId);
+    var box = document.getElementById(inputId);
+    button.addEventListener('click', function (event) {
+      // The bar it sits on folds the section, which is not what was asked for.
+      event.stopPropagation();
+      box.hidden = !box.hidden;
+      button.classList.toggle('on', !box.hidden);
+      if (box.hidden) {
+        box.value = '';
+        run('');
+      } else {
+        box.focus();
+      }
+    });
+    box.addEventListener('input', function () { run(box.value); });
+    box.addEventListener('keydown', function (event) {
+      if (event.key !== 'Escape') { return; }
+      box.value = '';
+      box.hidden = true;
+      button.classList.remove('on');
+      run('');
+    });
+  }
+
+  huntBox('hunt-live', 'live-hunt', huntHosts);
+  huntBox('hunt-saved', 'saved-hunt', function (text) {
+    bookHunt = text.trim().toLowerCase();
+    paintBooks();
+  });
+
+  var shelves = document.querySelectorAll('.shelf');
+  for (var s = 0; s < shelves.length; s++) {
+    (function (shelf) {
+      var name = shelf.getAttribute('data-part');
+      foldPart(name, shutParts.indexOf(name) >= 0);
+      shelf.addEventListener('click', function () {
+        var at = shutParts.indexOf(name);
+        if (at < 0) { shutParts.push(name); } else { shutParts.splice(at, 1); }
+        try { localStorage.setItem('proxima.shut', JSON.stringify(shutParts)); }
+        catch (error) { /* not fatal */ }
+        foldPart(name, at < 0);
+      });
+    }(shelves[s]));
+  }
+
+  document.getElementById('c-save').addEventListener('click', saveComposed);
+  document.getElementById('new-book').addEventListener('click', async function (event) {
+    // The bar it sits on folds the section, which is not what was asked for.
+    event.stopPropagation();
+    try {
+      await putBook({ id: '', name: 'New collection', requests: [] });
+      await loadBooks();
+    } catch (error) {
+      noBooksEl.hidden = false;
+      noBooksEl.textContent = 'Could not add a collection: ' + error.message;
+    }
+  });
+  loadBooks();
 
   document.getElementById('clear').addEventListener('click', async function () {
     try {
@@ -1078,12 +2195,14 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 7] = [
+    const KNOWN_PATHS: [&str; 9] = [
         "/api/flows",
         "/api/flows?limit=",
         "/api/flows/",
         "/api/stream",
         "/api/send",
+        "/api/collections",
+        "/api/collections/",
         "/body/",
         "/curl",
     ];
@@ -1091,9 +2210,10 @@ mod tests {
     #[test]
     fn the_page_only_calls_endpoints_the_router_serves() {
         for literal in literals() {
-            // The scheme separator the socket URL is built from is the one
-            // leading slash in the script that is not part of a path.
-            if literal.starts_with('/') && literal != "//" {
+            // Two leading slashes in the script name nothing on the router:
+            // the scheme separator the socket URL is built from, and the
+            // separator the tree splits a path on.
+            if literal.starts_with('/') && literal != "//" && literal != "/" {
                 assert!(
                     KNOWN_PATHS.contains(&literal),
                     "{literal} is not an endpoint the router serves"
@@ -1158,6 +2278,497 @@ mod tests {
         assert!(
             SCRIPT.contains("filterEl.value.trim().toLowerCase()"),
             "the needle is lowercased once, and the haystack with it"
+        );
+    }
+
+    #[test]
+    fn the_tree_and_the_filter_box_narrow_the_one_list_together() {
+        // Picking a branch is a second narrowing of the same list, not a second
+        // list. Both have to reach the same decision about a row, or clicking a
+        // host would show rows the typed filter had already ruled out.
+        let filter = SCRIPT
+            .split_once("function filterRow(row, id) {")
+            .expect("the script still filters rows")
+            .1;
+        for cut in [
+            "(needle !== '' && text.indexOf(needle) < 0)",
+            "(device !== '' && homes.get(id) !== device)",
+            "!inScope(id)",
+        ] {
+            assert!(
+                filter.contains(cut),
+                "a row has to survive every narrowing at once, not any one: {cut}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("rows.forEach(function (row, id) { filterRow(row, id); });"),
+            "picking a branch and typing both re-decide every row"
+        );
+    }
+
+    #[test]
+    fn a_branch_claims_whole_segments_and_not_prefixes() {
+        // Scoping to example.com/v1 must leave example.com/v10 alone, which is
+        // what the trailing separator in the comparison is for.
+        assert!(
+            SCRIPT.contains("held.key === scope || held.key.indexOf(scope + '/') === 0"),
+            "the scope test must compare whole path segments"
+        );
+    }
+
+    #[test]
+    fn a_flow_leaving_the_list_leaves_the_tree_with_it() {
+        // The list is capped at MAX_ROWS. Without the same eviction on the tree
+        // side, the branches keep every flow the process has ever seen, their
+        // counts describe flows nothing can show, and the cap stops meaning
+        // anything.
+        let trim = SCRIPT
+            .split_once("function trim() {")
+            .expect("the script still trims the list")
+            .1;
+        assert!(
+            trim.contains("unplace(last.flowId);"),
+            "trimming a row must take it off its branch as well"
+        );
+        let wipe = SCRIPT
+            .split_once("function wipe() {")
+            .expect("the script still wipes")
+            .1;
+        for reset in [
+            "strip(treeEl);",
+            "groups.clear();",
+            "branches.clear();",
+            "scope = '';",
+        ] {
+            assert!(
+                wipe.contains(reset),
+                "clearing the capture must empty the tree too: {reset}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("while (rec && rec.total === 0) {"),
+            "a branch whose last flow left has to be pruned, not kept empty"
+        );
+        assert!(
+            SCRIPT.contains("if (rec.key === scope) { scopeTo(scope); }"),
+            "a pruned branch cannot go on being the thing the list is narrowed to"
+        );
+    }
+
+    /// Byte offsets of every colour literal in a stylesheet: a `#` followed by
+    /// exactly three or six hex digits and then something that is not one. The
+    /// length check is what keeps an id selector like `#detail` or `#empty` out
+    /// of the results.
+    fn colour_literals(css: &str) -> Vec<usize> {
+        let bytes = css.as_bytes();
+        let mut found = Vec::new();
+        for (at, _) in css.match_indices('#') {
+            let digits = bytes[at + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            let after = bytes.get(at + 1 + digits);
+            let runs_on = after.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-');
+            if (digits == 3 || digits == 6) && !runs_on {
+                found.push(at);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_colour_is_named_once_and_carries_both_schemes() {
+        // The page is read in whichever scheme the machine is set to, and only
+        // one of the two gets looked at while it is being worked on. A literal
+        // outside the palette is a colour that was only ever checked against one
+        // background; a palette entry that is not a pair is the same thing.
+        let (palette, rest) = CSS
+            .split_once("html, body {")
+            .expect("the palette still comes before the page");
+        assert!(
+            colour_literals(rest).is_empty(),
+            "every colour belongs in the palette, found one further down: {:?}",
+            colour_literals(rest)
+                .iter()
+                .map(|at| &rest[*at..*at + 7])
+                .collect::<Vec<_>>()
+        );
+
+        let mut entries = 0;
+        for line in palette.lines() {
+            let Some((name, value)) = line.trim().split_once(": ") else {
+                continue;
+            };
+            if !name.starts_with("--") {
+                continue;
+            }
+            entries += 1;
+            assert!(
+                value.starts_with("light-dark(") && colour_literals(value).len() == 2,
+                "{name} has to name a colour for each scheme, got {value}"
+            );
+        }
+        assert!(entries > 12, "the palette lost most of itself: {entries}");
+
+        assert!(
+            page("nonce").contains("content=\"light dark\""),
+            "the page has to admit to both schemes or the browser paints its own"
+        );
+    }
+
+    #[test]
+    fn the_scheme_follows_the_machine_until_it_is_told_not_to() {
+        // The switch works by changing which half of every light-dark() pair is
+        // used, so it needs no second palette to fall out of step with.
+        for rule in [
+            ":root[data-theme=\"light\"] { color-scheme: light; }",
+            ":root[data-theme=\"dark\"] { color-scheme: dark; }",
+        ] {
+            assert!(CSS.contains(rule), "the theme switch needs {rule}");
+        }
+        assert!(
+            SCRIPT.contains("document.documentElement.removeAttribute('data-theme');"),
+            "going back to system means dropping the override, not picking a side"
+        );
+        // Storage is refused outright in private browsing, and a page that
+        // throws on load paints nothing at all.
+        let remembered = SCRIPT
+            .split_once("function rememberedTheme() {")
+            .expect("the script still remembers a theme")
+            .1;
+        assert!(
+            remembered.contains("try {") && remembered.contains("return 'system';"),
+            "unreadable storage has to fall back rather than throw"
+        );
+        assert!(
+            SCRIPT.contains("THEMES.indexOf(held) < 0 ? 'system' : held"),
+            "a stored value from another build is not one of ours"
+        );
+    }
+
+    #[test]
+    fn the_bottom_pane_shows_one_side_or_all_of_them() {
+        // Request and response are the same shape and are read against each
+        // other, so both have to fit on screen at once as well as one at a time.
+        for line in [
+            "panes.className = paired ? 'panes both' : 'panes';",
+            "panes.appendChild(pane(side, flow, request, response, frames));",
+        ] {
+            assert!(SCRIPT.contains(line), "the bottom pane needs both modes: {line}");
+        }
+        for tab in ["offer('info', 'Info');", "offer('request', 'Request');"] {
+            assert!(SCRIPT.contains(tab), "the bottom pane lost a tab: {tab}");
+        }
+        // Which side you are reading is a preference, not a property of the
+        // flow, so it is declared outside the function that draws one.
+        assert!(
+            SCRIPT.contains("var side = 'info';") && SCRIPT.contains("var paired = false;"),
+            "the choice of side must outlive the flow that was on screen"
+        );
+        // A flow in flight has no response, and most have no frames. What every
+        // flow has is the account of itself, so that is where a missing side
+        // lands rather than on a tab that is not there.
+        for fallback in [
+            "if (side === 'response' && !response) { side = 'info'; }",
+            "if (side === 'frames' && !frames) { side = 'info'; }",
+        ] {
+            assert!(
+                SCRIPT.contains(fallback),
+                "a missing side must not leave the pane pointed at nothing: {fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_copy_control_is_a_mark_that_still_says_what_it_did() {
+        // A single character has no room to report anything, so what it did has
+        // to reach the tooltip as well, and a control with no words at all needs
+        // a name for anything that is not looking at it.
+        for named in [
+            "mark.setAttribute('aria-label', 'Copy as cURL');",
+            "mark.title = 'Copy as cURL';",
+            "caret.setAttribute('aria-label', 'Other things to copy');",
+            "caret.title = 'Other things to copy';",
+        ] {
+            assert!(SCRIPT.contains(named), "a wordless control has to name itself: {named}");
+        }
+        let says = SCRIPT
+            .split_once("function says(button, mark, why) {")
+            .expect("the script still speaks through the mark")
+            .1;
+        assert!(
+            says.contains("button.textContent = mark;") && says.contains("button.title = why;"),
+            "every outcome must change the mark and the tooltip together"
+        );
+        // The clipboard is absent over plain HTTP to a LAN address, which is
+        // how a phone reaches this page. The command is the point either way.
+        assert!(
+            SCRIPT.contains("offer(button, text);"),
+            "a refused clipboard must still put the command on screen"
+        );
+    }
+
+    #[test]
+    fn the_copy_menu_offers_only_what_the_flow_has() {
+        // An entry for a body that was never captured copies an empty string
+        // and looks like the copy failed, so each one is asked for first.
+        for guard in [
+            "if (request.body) {",
+            "if (response) {",
+            "if (response.body) {",
+        ] {
+            assert!(
+                SCRIPT.contains(guard),
+                "the menu must not offer what the flow does not have: {guard}"
+            );
+        }
+        // Every entry goes through the one copy path, so the mark reports the
+        // outcome whichever of them was picked.
+        assert_eq!(
+            SCRIPT.matches("copyWhat(mark, make);").count(),
+            1,
+            "the menu entries share one copy path"
+        );
+        // A menu left open over a flow that is no longer on screen is a menu
+        // acting on the wrong one.
+        assert!(
+            SCRIPT.contains("document.addEventListener('click', shut);"),
+            "a click anywhere else has to close the menu"
+        );
+        assert!(
+            SCRIPT.contains("if (event.key === 'Escape') { shut(); }"),
+            "escape has to close the menu"
+        );
+        assert!(
+            SCRIPT.contains("event.stopPropagation();"),
+            "the click that opens the menu must not also be the one that closes it"
+        );
+    }
+
+    #[test]
+    fn switching_halves_hands_back_the_frame_list() {
+        // The frames block is one of the halves now, so leaving it detaches the
+        // node every later frame would have been appended to.
+        let draw = SCRIPT
+            .split_once("function draw() {")
+            .expect("the bottom pane still redraws itself")
+            .1;
+        for reset in ["frameList = null;", "frameOwner = null;"] {
+            assert!(
+                draw.contains(reset),
+                "redrawing the bottom pane must drop the frame list: {reset}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_that_no_longer_has_a_flow_stops_being_offered() {
+        // The chips are counted from the flows on screen. A flow evicted from
+        // the ring buffer that never decrements its device leaves a chip that
+        // narrows the list to nothing.
+        let trim = SCRIPT
+            .split_once("function trim() {")
+            .expect("the script still trims")
+            .1;
+        assert!(
+            trim.contains("forget(last.flowId);"),
+            "an evicted flow must stop counting towards its device"
+        );
+        assert!(
+            SCRIPT.contains("if (device && !seen.has(device)) { pickDevice(device); }"),
+            "a device with nothing left cannot go on being the one that is picked"
+        );
+        // One device is the ordinary case: a row of chips to choose between one
+        // thing is a row that only takes up height.
+        assert!(
+            SCRIPT.contains("if (seen.size < 2) {"),
+            "a single device needs no choosing between"
+        );
+    }
+
+    #[test]
+    fn both_halves_of_the_column_carry_a_bar_and_fold_away() {
+        for shelf in ["data-part=\"live\"", "data-part=\"saved\""] {
+            assert!(
+                BODY.contains(shelf),
+                "each half of the column needs a bar of its own: {shelf}"
+            );
+        }
+        // A folded half keeps its bar and nothing else, or there is no way back.
+        assert!(
+            CSS.contains(".part.shut > *:not(.shelf) { display: none; }"),
+            "folding a half must leave the bar that unfolds it"
+        );
+        // The shares are set on the ids, so the rule that drops them has to be
+        // as well. A class alone loses, and the folded half goes on holding the
+        // room it was given, which is a bar with a hole under it.
+        assert!(
+            CSS.contains("#live.shut, #saved.shut { flex: none; }"),
+            "a folded half must give its share of the column back"
+        );
+        assert!(
+            SCRIPT.contains("localStorage.setItem('proxima.shut', JSON.stringify(shutParts));"),
+            "which half is folded has to outlive the tab"
+        );
+        // The button on the saved bar adds a collection rather than folding it.
+        let adds = SCRIPT
+            .split_once("document.getElementById('new-book')")
+            .expect("the script still adds collections")
+            .1;
+        assert!(
+            adds.contains("event.stopPropagation();"),
+            "adding a collection must not fold the section it is added to"
+        );
+    }
+
+    #[test]
+    fn each_tree_searches_itself_without_touching_the_capture() {
+        for control in ["id=\"hunt-live\"", "id=\"hunt-saved\"", "id=\"live-hunt\"", "id=\"saved-hunt\""] {
+            assert!(BODY.contains(control), "each tree needs a search of its own: {control}");
+        }
+        // A branch that answers has to bring its ancestors with it, or it hides
+        // inside a parent that does not answer itself.
+        assert!(
+            SCRIPT.contains("for (var up = rec; up; up = up.parent) { up.astray = false; }"),
+            "a branch that answers must pull the ones above it into view"
+        );
+        // Hiding is one decision made in one place: an emptied branch and an
+        // unanswering branch both go through it.
+        let dress = SCRIPT
+            .split_once("function dress(rec) {")
+            .expect("the script still decides what a branch shows")
+            .1;
+        assert!(
+            dress.contains("(rec.total > 0 && rec.shown === 0) || rec.astray === true"),
+            "the filter box and the search must not each hide branches on their own"
+        );
+        // A host arriving mid-search would otherwise land on screen past a
+        // filter it was never shown.
+        assert!(
+            SCRIPT.contains("if (hostHunt !== '') { huntHosts(hostHunt); }"),
+            "a branch made while a search is on has to answer it too"
+        );
+        // The search buttons sit on bars that fold.
+        let boxes = SCRIPT
+            .split_once("function huntBox(buttonId, inputId, run) {")
+            .expect("the script still builds search boxes")
+            .1;
+        assert!(
+            boxes.contains("event.stopPropagation();"),
+            "opening a search must not fold the section it searches"
+        );
+    }
+
+    #[test]
+    fn a_kept_host_goes_to_the_top_and_stays_there() {
+        // Hosts arrive in the order the device asks for them, so the one being
+        // watched has to be movable out of that order, and stay moved.
+        assert!(
+            SCRIPT.contains("localStorage.setItem('proxima.kept', JSON.stringify(kept));"),
+            "keeping a host has to outlive the tab"
+        );
+        let read = SCRIPT
+            .split_once("function readKept() {")
+            .expect("the script still reads what was kept")
+            .1;
+        assert!(
+            read.contains("try {") && read.contains("return [];"),
+            "unreadable or invented storage has to fall back rather than throw"
+        );
+        // The star sits on the line that narrows the list, so it has to keep
+        // its click, the same as the twisty does.
+        let star = SCRIPT
+            .split_once("function starFor(box, host) {")
+            .expect("the script still builds a star")
+            .1;
+        assert!(
+            star.contains("event.stopPropagation();"),
+            "keeping a host must not also narrow the list to it"
+        );
+    }
+
+    #[test]
+    fn saved_requests_go_out_and_come_back_the_way_the_composer_sends_them() {
+        // A saved request is a SendSpec under a name. Saving one shape and
+        // loading another would leave the composer filling fields nothing reads.
+        for field in ["method:", "url: url,", "headers:", "bodyBase64:"] {
+            assert!(
+                SCRIPT.contains(field),
+                "a saved request carries what the send endpoint acts on: {field}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("id: '',"),
+            "the store mints request ids, and an empty one is how it is asked to"
+        );
+        let open = SCRIPT
+            .split_once("function openSaved(saved) {")
+            .expect("the script still opens a saved request")
+            .1;
+        for filled in ["c-method", "c-url", "c-headers", "c-body"] {
+            assert!(
+                open.contains(filled),
+                "opening a saved request has to fill {filled}"
+            );
+        }
+        assert!(
+            open.contains("composing(true);"),
+            "a saved request is only of use in the composer, so open it there"
+        );
+        // An answer left over from the request that was open a moment ago reads
+        // as this one's: same shape, same pane, only the URL above it changed.
+        assert!(
+            open.contains("strip(outEl);"),
+            "opening another request must take the last one's answer down with it"
+        );
+    }
+
+    /// The composer's own payload is checked elsewhere against `SendSpec`. This
+    /// is the other half: what a saved request looks like on disk.
+    #[test]
+    fn a_saved_request_is_a_collection_the_store_accepts() {
+        let payload = serde_json::json!({
+            "id": "",
+            "name": "Saved requests",
+            "requests": [{
+                "id": "",
+                "name": "orders",
+                "spec": {
+                    "method": "POST",
+                    "url": "https://api.example.com/v1/orders",
+                    "headers": [["content-type", "application/json"]],
+                    "bodyBase64": "aGk=",
+                },
+            }],
+        });
+        let book: crate::replay::Collection =
+            serde_json::from_value(payload).expect("the page sends a collection");
+        assert_eq!(book.requests.len(), 1);
+        let spec: crate::replay::SendSpec =
+            serde_json::from_value(book.requests[0].spec.clone())
+                .expect("a saved spec is a SendSpec");
+        assert_eq!(spec.method.as_deref(), Some("POST"));
+    }
+
+    #[test]
+    fn the_tree_is_assembled_from_nodes_like_the_rest_of_the_page() {
+        // Host names and path segments are captured strings, so they reach the
+        // document the same way every other captured string does.
+        assert!(
+            SCRIPT.contains("line.appendChild(el('span', 'gname', label));"),
+            "a captured name must be written as text, not built into markup"
+        );
+        assert!(
+            SCRIPT.contains("scopeNameEl.textContent = scope;"),
+            "the branch being shown is captured text too"
+        );
+        assert!(
+            BODY.contains("<div id=\"hosts\" role=\"tree\""),
+            "the tree needs a pane of its own beside the list"
+        );
+        assert!(
+            BODY.contains("<button id=\"view\""),
+            "the tree pane needs something to fold it away"
         );
     }
 
@@ -1267,6 +2878,7 @@ mod tests {
             duration: Some(3),
             error: None,
             likely_pinning: true,
+            client: "192.168.1.4".to_string(),
         };
         let json = serde_json::to_value(&summary).expect("a summary serialises");
         let object = json.as_object().expect("a summary is an object");
@@ -1283,6 +2895,7 @@ mod tests {
             "duration",
             "error",
             "likelyPinning",
+            "client",
         ] {
             assert!(
                 object.contains_key(field),
