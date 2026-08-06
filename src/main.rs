@@ -303,6 +303,20 @@ fn parse_map_host(text: &str) -> std::result::Result<RewriteRule, String> {
 }
 
 fn parse_target(text: &str) -> std::result::Result<DialTarget, String> {
+    let target = parse_target_parts(text)?;
+    // A port with nothing in front of it, "=:3000", parses cleanly and then
+    // fails much later as a connection to the empty host, which reads as a 502
+    // from an origin rather than as the typo it is.
+    if target.host.is_empty() {
+        return Err(format!(
+            "--map-host was given a port with no host in front of it: {text:?}. \
+             Name where the traffic should go, for example 127.0.0.1:3000."
+        ));
+    }
+    Ok(target)
+}
+
+fn parse_target_parts(text: &str) -> std::result::Result<DialTarget, String> {
     if text.is_empty() {
         return Err("--map-host was given nothing to send the traffic to".to_string());
     }
@@ -801,6 +815,25 @@ mod tests {
         let err = config_from(&cli(&["--map-host", "api.example.com=127.0.0.1:notaport"]))
             .expect_err("that is not a port");
         assert!(err.contains("not a port"), "{err}");
+    }
+
+    #[test]
+    fn a_target_with_no_host_is_refused_at_the_flag_rather_than_at_the_socket() {
+        // Each of these parses into something shaped like a target and would
+        // otherwise only fail on connect, surfacing as a 502 that looks like the
+        // origin's fault rather than like the typo it is.
+        for text in [
+            "api.example.com=:3000",
+            "api.example.com=",
+            "api.example.com=[]:3000",
+        ] {
+            let err = config_from(&cli(&["--map-host", text]))
+                .expect_err(&format!("{text:?} names nowhere to send the traffic"));
+            assert!(
+                err.contains("--map-host"),
+                "the error does not name the flag that was wrong: {err}"
+            );
+        }
     }
 
     #[test]

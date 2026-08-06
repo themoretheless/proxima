@@ -22,8 +22,11 @@
 //!    that grows without bound is how this feature would end up deleted.
 //! 3. **Submitted SQL is read only and cannot touch the filesystem.** The UI
 //!    port has no authentication and listens on every interface, so an endpoint
-//!    that runs SQL is an endpoint that runs SQL for anyone on the network. See
-//!    [`is_read_only`] and the connection settings in `open`.
+//!    that runs SQL is an endpoint that runs SQL for anyone on the network.
+//!    Queries run on a connection opened read only, so the engine decides what
+//!    is a write, by the statement's real type rather than by its first
+//!    keyword. [`is_read_only`] runs in front of that for the error message
+//!    only; on its own it would let `WITH ... DELETE` through.
 //!
 //! Without the `archive` feature this module still compiles, and [`Archive::open`]
 //! reports that the binary was built without it. Callers then have one shape to
@@ -87,10 +90,16 @@ pub struct QueryResult {
 /// Rejects anything that is not a single read only statement.
 ///
 /// This is a whitelist of leading keywords plus a ban on statement separators,
-/// not an attempt to parse SQL. DuckDB will happily `COPY ... TO '/etc/passwd'`
-/// or `ATTACH` another database, and the connection settings block the
-/// filesystem separately, but neither of those should be reachable at all from
-/// an unauthenticated port, so the front door is shut here as well.
+/// not an attempt to parse SQL, and it is **not** what keeps the archive safe.
+/// It cannot be: `WITH x AS (SELECT 1) DELETE FROM flows_raw` leads with an
+/// allowed keyword and deletes rows, which DuckDB accepts and which this check
+/// waves through. What actually stops it is that submitted SQL runs on a
+/// connection opened read only, where the engine refuses the statement by its
+/// real type rather than by its first word.
+///
+/// This stays because a whitelist gives a wrong statement a sentence explaining
+/// what the endpoint is for, in front of the engine's less friendly refusal.
+/// Treat it as a message, not as a wall.
 pub fn is_read_only(sql: &str) -> bool {
     let trimmed = sql.trim().trim_end_matches(';');
     if trimmed.is_empty() {
@@ -159,9 +168,11 @@ mod imp {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use std::path::PathBuf;
+
     use anyhow::{anyhow, Context, Result};
     use duckdb::types::Value as DuckValue;
-    use duckdb::{params, Config as DuckConfig, Connection};
+    use duckdb::{params, AccessMode, Config as DuckConfig, Connection};
     use serde_json::{json, Value};
     use tokio::sync::oneshot;
     use tracing::{debug, info, warn};
@@ -258,29 +269,19 @@ mod imp {
                 })?;
             }
 
-            // `enable_external_access` off is the setting that matters. It stops
-            // SQL from reading or writing files and from opening http/s3 URLs,
-            // which is what turns an unauthenticated query endpoint from a
-            // reporting tool into a way to read the machine. `lock_configuration`
-            // then stops submitted SQL from turning it back on with a SET.
-            let config = DuckConfig::default()
-                .enable_external_access(false)
-                .with_context(|| "refusing external access")?;
-            let connection = Connection::open_with_flags(path, config)
+            let connection = open_connection(path, AccessMode::ReadWrite)
                 .with_context(|| format!("opening the archive at {}", path.display()))?;
             connection
                 .execute_batch(SCHEMA)
                 .context("creating the archive schema")?;
-            connection
-                .execute_batch("SET lock_configuration = true;")
-                .context("locking the archive configuration")?;
 
             let session = super::super::new_id();
             let (jobs, rx) = sync_channel::<Job>(QUEUE_CAPACITY);
             let thread_session = session.clone();
+            let thread_path = path.to_path_buf();
             std::thread::Builder::new()
                 .name("proxima-archive".to_string())
-                .spawn(move || writer_loop(connection, rx, thread_session))
+                .spawn(move || writer_loop(connection, thread_path, rx, thread_session))
                 .context("starting the archive writer thread")?;
 
             info!(path = %path.display(), session = %session, "traffic archive open");
@@ -363,9 +364,52 @@ mod imp {
         }
     }
 
-    /// Owns the connection. Everything that touches DuckDB happens here, on one
-    /// thread, so the connection needs no lock and inserts need no coordination.
-    fn writer_loop(connection: Connection, rx: std::sync::mpsc::Receiver<Job>, session: String) {
+    /// Opens the archive file.
+    ///
+    /// `enable_external_access` off is the setting that matters most. It stops
+    /// SQL from reading or writing files and from opening http/s3 URLs, which is
+    /// what would turn an unauthenticated query endpoint into a way to read the
+    /// machine. `lock_configuration` then stops submitted SQL from turning it
+    /// back on with a `SET`. Both are applied to every connection, including the
+    /// read-only ones, because a setting that is only on the writer protects
+    /// nothing: submitted SQL never runs there.
+    fn open_connection(path: &Path, mode: AccessMode) -> Result<Connection> {
+        let config = DuckConfig::default()
+            .enable_external_access(false)
+            .context("refusing external access")?
+            .access_mode(mode)
+            .context("setting the access mode")?;
+        let connection = Connection::open_with_flags(path, config)?;
+        connection
+            .execute_batch("SET lock_configuration = true;")
+            .context("locking the archive configuration")?;
+        Ok(connection)
+    }
+
+    /// A connection that cannot write, opened fresh for one caller.
+    ///
+    /// Fresh every time, and this is not caution. DuckDB gives a read-only
+    /// connection the snapshot it saw when it opened, and it never advances: a
+    /// long-lived reader answers every question with the state of the file at
+    /// startup, which for a live capture is the wrong answer to all of them.
+    fn open_reader(path: &Path) -> Result<Connection> {
+        open_connection(path, AccessMode::ReadOnly)
+            .with_context(|| format!("opening {} for reading", path.display()))
+    }
+
+    /// Owns the writing connection. Everything that touches DuckDB happens on
+    /// this one thread, so the connection needs no lock and inserts need no
+    /// coordination.
+    ///
+    /// Submitted SQL never runs on `connection`. It runs on a read-only handle
+    /// opened per query, so a statement that turns out to modify data is refused
+    /// by the engine rather than by the guess made about it beforehand.
+    fn writer_loop(
+        connection: Connection,
+        path: PathBuf,
+        rx: std::sync::mpsc::Receiver<Job>,
+        session: String,
+    ) {
         let mut pending: Vec<ArchiveRow> = Vec::with_capacity(BATCH_ROWS);
         loop {
             match rx.recv_timeout(FLUSH_INTERVAL) {
@@ -376,14 +420,15 @@ mod imp {
                     }
                 }
                 Ok(Job::Query { sql, reply }) => {
-                    // Before answering, so a query sees the flows the caller
-                    // just watched go by rather than the ones from a moment ago.
+                    // Before opening the reader, so a query sees the flows the
+                    // caller just watched go by rather than the ones from a
+                    // moment ago. The reader takes its snapshot as it opens.
                     flush(&connection, &session, &mut pending);
-                    let _ = reply.send(guard(|| run_query(&connection, &sql)));
+                    let _ = reply.send(guard(|| run_query(&open_reader(&path)?, &sql)));
                 }
                 Ok(Job::Stats { reply }) => {
                     flush(&connection, &session, &mut pending);
-                    let _ = reply.send(guard(|| run_stats(&connection)));
+                    let _ = reply.send(guard(|| run_stats(&open_reader(&path)?)));
                 }
                 Err(RecvTimeoutError::Timeout) => flush(&connection, &session, &mut pending),
                 // Every handle is gone, so nothing more will arrive.
@@ -1054,6 +1099,60 @@ mod tests {
         );
         let day = result.rows[0][1].as_str().expect("a string");
         assert_eq!(day.len(), 10, "a date should read as YYYY-MM-DD, got {day}");
+    }
+
+    /// A CTE in front of a DELETE leads with an allowed keyword, and DuckDB
+    /// runs it. Before queries moved onto a read-only connection this deleted
+    /// rows through an endpoint that anyone on the network can reach.
+    #[tokio::test]
+    async fn a_write_hidden_behind_a_cte_cannot_touch_the_archive() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, archive) = store(dir.path(), 100);
+        let id = store.create(init("GET", "api.example.com", "/users"));
+        respond(&store, &id, 200);
+
+        for attack in [
+            "WITH x AS (SELECT 1) DELETE FROM flows_raw",
+            "WITH x AS (SELECT 1) UPDATE flows_raw SET host = 'nowhere'",
+            "WITH x AS (SELECT 1) INSERT INTO flows_raw SELECT * FROM flows_raw",
+        ] {
+            let refused = archive.query(attack.to_string()).await;
+            assert!(refused.is_err(), "{attack} was accepted");
+        }
+
+        let survivors = archive
+            .query("SELECT count(*) FROM flows_raw WHERE host = 'api.example.com'".into())
+            .await
+            .expect("counting");
+        assert_eq!(
+            count(&survivors),
+            1,
+            "a statement leading with WITH modified the archive"
+        );
+    }
+
+    /// The reason the reading connection is opened per query rather than kept.
+    /// DuckDB freezes a read-only connection at the snapshot it opened with, so
+    /// a kept one answers every question with the state of the file at startup.
+    #[tokio::test]
+    async fn a_query_sees_the_flow_that_finished_a_moment_ago() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, archive) = store(dir.path(), 100);
+
+        for round in 1..=3 {
+            let id = store.create(init("GET", "api.example.com", "/users"));
+            respond(&store, &id, 200);
+
+            let result = archive
+                .query("SELECT count(*) FROM flows".into())
+                .await
+                .expect("counting");
+            assert_eq!(
+                count(&result),
+                round,
+                "the archive answered from a stale snapshot"
+            );
+        }
     }
 
     #[tokio::test]

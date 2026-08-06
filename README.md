@@ -104,9 +104,15 @@ sizes and content types: bodies are the one part of a capture with no ceiling on
 size, and a file that grows without bound is a feature that ends up deleted.
 **Submitted SQL is read only and cannot touch the filesystem**: the UI port has
 no authentication and listens on every interface, so anything else would be a
-file browser for whoever is on the network. Non-`SELECT` statements are refused
-before DuckDB sees them, and DuckDB itself is opened with external access off
-and its configuration locked.
+file browser for whoever is on the network. Queries run on a connection opened
+read only, with external access off and the configuration locked, so it is the
+engine that decides what counts as a write. The leading-keyword check in front
+of it is only there for the error message: `WITH x AS (SELECT 1) DELETE FROM
+flows_raw` starts with an allowed word, and DuckDB will happily run it.
+
+That read-only connection is opened per query rather than kept, because DuckDB
+freezes one at the snapshot it opened with; a long-lived reader would answer
+every question with the state of the file at startup.
 
 `archive` is off by default for the same reason as `gui`: it compiles DuckDB's
 C++ amalgamation, which is minutes of cold build and tens of megabytes of
