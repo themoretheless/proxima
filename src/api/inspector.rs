@@ -122,6 +122,9 @@ const BODY: &str = r#"<header>
       <div class="shelf" data-part="live">
         <span class="twist">▾</span><span class="shelf-name">Requests</span>
         <button id="hunt-live" class="icon" type="button" title="Search hosts and paths" aria-label="Search hosts and paths">⌕</button>
+        <span class="sift"><button id="sift-live" class="icon" type="button"
+              title="Grouping and filters" aria-label="Grouping and filters"
+              aria-haspopup="menu" aria-expanded="false">▽</button></span>
       </div>
       <input id="live-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
              placeholder="Host or path" aria-label="Search hosts and paths" hidden>
@@ -132,6 +135,9 @@ const BODY: &str = r#"<header>
       <div class="shelf" data-part="saved">
         <span class="twist">▾</span><span class="shelf-name">Saved requests</span>
         <button id="hunt-saved" class="icon" type="button" title="Search saved requests" aria-label="Search saved requests">⌕</button>
+        <span class="sift"><button id="sift-saved" class="icon" type="button"
+              title="Grouping" aria-label="Grouping"
+              aria-haspopup="menu" aria-expanded="false">▽</button></span>
         <button id="new-book" class="icon" type="button" title="New collection" aria-label="New collection">+</button>
       </div>
       <input id="saved-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
@@ -442,6 +448,8 @@ main.composing.flat > #composer { grid-column: 1; }
 .icon:hover { background: var(--btn-hover); color: var(--ink); }
 .icon.caret { width: 18px; font-size: 10px; }
 .icon.on { border-color: var(--accent); color: var(--accent); }
+/* Not the same thing as an open menu: this one says the menu was used. */
+.icon.set { border-color: var(--accent); color: var(--accent); }
 /* The menu hangs off the pair of buttons, so they are what it is measured
    from. No shadow: nothing else on this page is raised, and a border against
    the card colour is enough to read as in front. */
@@ -464,6 +472,17 @@ main.composing.flat > #composer { grid-column: 1; }
   background: none; border: none; border-radius: 6px; color: var(--ink); font: inherit;
 }
 .mitem:hover { background: var(--hover); }
+/* The same menu, hung off a button that sits at the right edge of a narrow
+   column: measured from that edge instead, or most of it would be off the
+   side of the tree it belongs to. */
+.sift { position: relative; display: inline-flex; }
+.sift > .menu { left: auto; right: 0; }
+.mhead {
+  padding: 5px 9px 2px; color: var(--dim); font-size: 11px;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.mband { display: flex; flex-direction: column; }
+.mitem .tick { display: inline-block; width: 1.1rem; color: var(--accent); }
 .dmethod { font-weight: 700; color: var(--accent); }
 .durl { word-break: break-all; font-size: 12px; }
 .facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px 10px; margin-bottom: 14px; }
@@ -557,11 +576,18 @@ const SCRIPT: &str = r#"
   var groups = new Map();
   var branches = new Map();
   var homes = new Map();
+  var spots = new Map();
+  var bads = new Map();
   var seen = new Map();
   var visible = 0;
   var needle = '';
   var scope = '';
   var device = '';
+  // What the menus on the two bars are set to. Read back from storage further
+  // down, once the functions that act on them exist.
+  var liveGroup = 'host';
+  var onlyBad = false;
+  var bookGroup = 'book';
   var selectedId = null;
   var detailToken = 0;
   var queue = null;
@@ -658,10 +684,14 @@ const SCRIPT: &str = r#"
     row.querySelector('.dur').textContent =
       typeof flow.duration === 'number' ? millis(flow.duration) : '...';
 
-    var cls = 'row ' + statusClass(flow);
+    var mark = statusClass(flow);
+    var cls = 'row ' + mark;
     if (flow.likelyPinning) { cls += ' pinned'; }
     if (flow.id === selectedId) { cls += ' on'; }
     row.className = cls;
+    // What "went wrong" means to the menu below: a status the server refused
+    // with, or a flow that never got one at all.
+    bads.set(flow.id, mark === 's4' || mark === 's5' || mark === 'serr');
 
     needles.set(flow.id, [
       str(flow.method), str(flow.authority), str(flow.path),
@@ -744,13 +774,14 @@ const SCRIPT: &str = r#"
     tally();
   }
 
-  // The three narrowings are one decision: a row survives the typed needle, the
-  // device the chips picked, and the branch that was clicked, or it is not on
-  // screen.
+  // The narrowings are one decision: a row survives the typed needle, the
+  // device the chips picked, whatever the menu on the bar is asking for, and
+  // the branch that was clicked, or it is not on screen.
   function filterRow(row, id) {
     var text = needles.get(id) || '';
     var hide = (needle !== '' && text.indexOf(needle) < 0)
       || (device !== '' && homes.get(id) !== device)
+      || (onlyBad && !bads.get(id))
       || !inScope(id);
     if (row.hidden !== hide) {
       row.hidden = hide;
@@ -781,6 +812,8 @@ const SCRIPT: &str = r#"
       forget(last.flowId);
       needles.delete(last.flowId);
       summaries.delete(last.flowId);
+      spots.delete(last.flowId);
+      bads.delete(last.flowId);
       if (!last.hidden) { visible -= 1; }
     }
   }
@@ -795,6 +828,8 @@ const SCRIPT: &str = r#"
     groups.clear();
     branches.clear();
     homes.clear();
+    spots.clear();
+    bads.clear();
     seen.clear();
     device = '';
     strip(devicesEl);
@@ -853,7 +888,10 @@ const SCRIPT: &str = r#"
     line.appendChild(el('span', 'gname', label));
     var count = el('span', 'gcount', '0');
     line.appendChild(count);
-    if (!parent) { line.appendChild(starFor(box, label)); }
+    // The star keeps a host at the top, so it belongs to a line that is one:
+    // grouped by device the top line is an address, and keeping it would mean
+    // something else again.
+    if (!parent && liveGroup === 'host') { line.appendChild(starFor(box, label)); }
     var body = el('div', 'gbody');
     box.appendChild(line);
     box.appendChild(body);
@@ -947,10 +985,31 @@ const SCRIPT: &str = r#"
     return { host: str(flow.authority) || 'unknown host', dirs: dirs };
   }
 
+  /* Where a flow belongs is worked out from the flow, but the tree is built
+     again whenever the grouping changes, and by then the flow itself is long
+     gone. What the tree needs of it is kept instead. */
+
   function place(flow) {
-    var spot = branch(flow);
-    var key = spot.host;
-    var rec = groupFor(key, spot.host, null);
+    spots.set(flow.id, branch(flow));
+    perch(flow.id);
+  }
+
+  function perch(id) {
+    var spot = spots.get(id);
+    if (!spot) { return; }
+    var key;
+    var rec;
+    // Grouped by device the address is the first branch and the host the
+    // second, which is the same cut the chips take, made once and kept.
+    if (liveGroup === 'device') {
+      key = homes.get(id) || 'unknown';
+      rec = groupFor(key, key, null);
+      key += '/' + spot.host;
+      rec = groupFor(key, spot.host, rec);
+    } else {
+      key = spot.host;
+      rec = groupFor(key, spot.host, null);
+    }
     for (var i = 0; i < spot.dirs.length; i++) {
       key += '/' + spot.dirs[i];
       rec = groupFor(key, spot.dirs[i], rec);
@@ -958,15 +1017,32 @@ const SCRIPT: &str = r#"
 
     // A flow that arrives as a bare CONNECT and only later reports its path
     // moves, so a stale placement is undone rather than left where it was.
-    var held = branches.get(flow.id);
+    var held = branches.get(id);
     if (held && held.key === key) {
-      count(held, 0, visibleIn(flow.id) - held.shown);
+      count(held, 0, visibleIn(id) - held.shown);
       return;
     }
-    if (held) { unplace(flow.id); }
+    if (held) { unplace(id); }
     var held2 = { key: key, rec: rec, shown: 0 };
-    branches.set(flow.id, held2);
-    count(held2, 1, visibleIn(flow.id));
+    branches.set(id, held2);
+    count(held2, 1, visibleIn(id));
+  }
+
+  // Nothing is recounted branch by branch: the tree is thrown away and every
+  // flow still in the list is seated again under the new grouping.
+  function regroup() {
+    strip(treeEl);
+    groups.clear();
+    branches.clear();
+    if (scope) { scopeTo(scope); }
+    // One pass: what a row is seated under and whether it shows are decisions
+    // about that row alone, so neither waits on the rest of them.
+    rows.forEach(function (row, id) {
+      perch(id);
+      filterRow(row, id);
+    });
+    if (hostHunt !== '') { huntHosts(hostHunt); }
+    tally();
   }
 
   function unplace(id) {
@@ -984,6 +1060,7 @@ const SCRIPT: &str = r#"
     var text = needles.get(id) || '';
     if (needle !== '' && text.indexOf(needle) < 0) { return 0; }
     if (device !== '' && homes.get(id) !== device) { return 0; }
+    if (onlyBad && !bads.get(id)) { return 0; }
     return 1;
   }
 
@@ -1448,13 +1525,17 @@ const SCRIPT: &str = r#"
     caret.type = 'button';
     caret.title = 'Other things to copy';
     caret.setAttribute('aria-label', 'Other things to copy');
+    caret.setAttribute('aria-haspopup', 'menu');
+    caret.setAttribute('aria-expanded', 'false');
 
     var menu = el('div', 'menu');
+    menu.setAttribute('role', 'menu');
     menu.hidden = true;
 
     function item(label, make) {
       var entry = el('button', 'mitem', label);
       entry.type = 'button';
+      entry.setAttribute('role', 'menuitem');
       entry.addEventListener('click', function () {
         shut();
         copyWhat(mark, make);
@@ -1483,13 +1564,19 @@ const SCRIPT: &str = r#"
       shut();
       menu.hidden = !open;
       caret.classList.toggle('on', open);
+      caret.setAttribute('aria-expanded', open ? 'true' : 'false');
+      // Which menu is the open one is settled here rather than where it was
+      // built: the page holds more than one, and the last one built is not
+      // the one a click elsewhere has to close.
+      if (open) {
+        openMenu = menu;
+        openCaret = caret;
+      }
     });
 
     bar.appendChild(mark);
     bar.appendChild(caret);
     bar.appendChild(menu);
-    openMenu = menu;
-    openCaret = caret;
     return bar;
   }
 
@@ -1498,7 +1585,10 @@ const SCRIPT: &str = r#"
 
   function shut() {
     if (openMenu) { openMenu.hidden = true; }
-    if (openCaret) { openCaret.classList.remove('on'); }
+    if (openCaret) {
+      openCaret.classList.remove('on');
+      openCaret.setAttribute('aria-expanded', 'false');
+    }
   }
 
   document.addEventListener('click', shut);
@@ -1814,15 +1904,10 @@ const SCRIPT: &str = r#"
   function paintBooks() {
     strip(booksEl);
     var count = 0;
-    var showing = 0;
     for (var i = 0; i < books.length; i++) {
-      var found = keptFor(books[i]);
       count += (books[i].requests || []).length;
-      // While searching, a collection with nothing to show is not shown.
-      if (bookHunt !== '' && !found.length) { continue; }
-      showing += 1;
-      booksEl.appendChild(bookNode(books[i], found));
     }
+    var showing = bookGroup === 'book' ? byBook() : byField(bookGroup);
     noBooksEl.hidden = showing > 0;
     if (books.length && !showing) {
       noBooksEl.textContent = 'Nothing saved here answers that.';
@@ -1831,6 +1916,82 @@ const SCRIPT: &str = r#"
     }
     fillBookChoices();
     return count;
+  }
+
+  // The collections as they were saved: one branch per collection, holding
+  // whatever in it answers the search.
+  function byBook() {
+    var showing = 0;
+    for (var i = 0; i < books.length; i++) {
+      var found = keptFor(books[i]);
+      // While searching, a collection with nothing to show is not shown.
+      if (bookHunt !== '' && !found.length) { continue; }
+      showing += 1;
+      booksEl.appendChild(bookNode(books[i], found));
+    }
+    return showing;
+  }
+
+  /* Cut across the collections instead: by what the request does, or by what it
+     does it to. A collection is how requests were filed, which is not always
+     how they are looked for. */
+
+  function byField(field) {
+    var piles = new Map();
+    for (var i = 0; i < books.length; i++) {
+      var found = keptFor(books[i]);
+      for (var j = 0; j < found.length; j++) {
+        var spec = found[j].spec || {};
+        var label = field === 'method'
+          ? (str(spec.method) || 'GET').toUpperCase()
+          : hostOf(str(spec.url));
+        if (!piles.has(label)) { piles.set(label, []); }
+        piles.get(label).push({ book: books[i], saved: found[j] });
+      }
+    }
+    var labels = Array.from(piles.keys()).sort();
+    for (var k = 0; k < labels.length; k++) {
+      booksEl.appendChild(pileNode(labels[k], piles.get(labels[k])));
+    }
+    return labels.length;
+  }
+
+  /* A saved request holds whatever was typed into the URL box, which is not
+     always a URL yet. `api.example.com/v1` is a host to anyone reading it and
+     nothing at all to the parser, so the scheme it was saved without is
+     supplied before giving up on it. What is left after that is a line that
+     names no host, and it is filed under saying so rather than under a host
+     invented for it. */
+
+  function hostOf(url) {
+    var text = url.trim();
+    if (text === '') { return 'no host'; }
+    try { return new URL(text).host || 'no host'; }
+    catch (error) { /* try it as the host it looks like */ }
+    // Only where a scheme is missing rather than wrong: `ftp://x/y` parses,
+    // and `https://ftp://x/y` would be a second guess at an answered question.
+    if (text.indexOf('://') >= 0) { return 'no host'; }
+    try { return new URL('https://' + text).host || 'no host'; }
+    catch (error) { return 'no host'; }
+  }
+
+  function pileNode(label, held) {
+    var box = el('div', 'group host');
+    var line = el('div', 'gline');
+    var twist = el('span', 'twist', '▾');
+    line.appendChild(twist);
+    line.appendChild(el('span', 'gname', label));
+    line.appendChild(el('span', 'gcount', String(held.length)));
+    line.addEventListener('click', function () {
+      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+    });
+    var body = el('div', 'gbody');
+    for (var i = 0; i < held.length; i++) {
+      body.appendChild(keptNode(held[i].book, held[i].saved));
+    }
+    box.appendChild(line);
+    box.appendChild(body);
+    return box;
   }
 
   function bookNode(book, showing) {
@@ -2057,6 +2218,145 @@ const SCRIPT: &str = r#"
       run('');
     });
   }
+
+  /* The button beside each search: what the tree under it is cut by, and what
+     it leaves out. Both bars carry one, because both are trees that could be
+     read more than one way, and neither question is worth a row of controls
+     standing there all day to ask it. */
+
+  function siftBox(buttonId, build) {
+    var button = document.getElementById(buttonId);
+    var menu = el('div', 'menu');
+    menu.setAttribute('role', 'menu');
+    menu.hidden = true;
+    button.parentNode.appendChild(menu);
+
+    // The headings group the choices for the eye; the same grouping is spelled
+    // out for anything not reading with one.
+    var band = null;
+
+    function head(text) {
+      band = el('div', 'mband');
+      band.setAttribute('role', 'group');
+      band.setAttribute('aria-label', text);
+      band.appendChild(el('span', 'mhead', text));
+      menu.appendChild(band);
+    }
+
+    // One of a set rather than a switch of its own: what the tick says to the
+    // eye, the state says to a reader.
+    function pick(label, on, take) {
+      var entry = el('button', 'mitem');
+      entry.type = 'button';
+      entry.setAttribute('role', 'menuitemradio');
+      entry.setAttribute('aria-checked', on ? 'true' : 'false');
+      entry.appendChild(el('span', 'tick', on ? '✓' : ''));
+      entry.appendChild(el('span', null, label));
+      entry.addEventListener('click', function (event) {
+        // The bar it hangs off folds the section, which is not what was asked
+        // for, and the document listener would close the menu twice over.
+        event.stopPropagation();
+        shut();
+        take();
+        rememberSift();
+      });
+      (band || menu).appendChild(entry);
+    }
+
+    button.addEventListener('click', function (event) {
+      event.stopPropagation();
+      var open = menu.hidden;
+      shut();
+      if (!open) { return; }
+      // Built at every opening, so the ticks describe the state as it is now
+      // rather than as it was when the page loaded.
+      strip(menu);
+      band = null;
+      build(head, pick);
+      menu.hidden = false;
+      button.classList.add('on');
+      button.setAttribute('aria-expanded', 'true');
+      openMenu = menu;
+      openCaret = button;
+    });
+  }
+
+  siftBox('sift-live', function (head, pick) {
+    head('Group by');
+    pick('Host', liveGroup === 'host', function () { regroupLive('host'); });
+    pick('Device, then host', liveGroup === 'device', function () { regroupLive('device'); });
+    head('Show');
+    pick('Everything', !onlyBad, function () { showBad(false); });
+    pick('Failures only', onlyBad, function () { showBad(true); });
+  });
+
+  function regroupLive(how) {
+    if (liveGroup === how) { return; }
+    liveGroup = how;
+    dressSift();
+    regroup();
+  }
+
+  // The counts on the branches answer the same question the list does, so the
+  // tree is re-added up rather than left describing traffic nothing shows.
+  function showBad(only) {
+    if (onlyBad === only) { return; }
+    onlyBad = only;
+    dressSift();
+    rows.forEach(function (row, id) { filterRow(row, id); });
+    restack();
+    tally();
+  }
+
+  siftBox('sift-saved', function (head, pick) {
+    head('Group by');
+    pick('Collection', bookGroup === 'book', function () { regroupBooks('book'); });
+    pick('Method', bookGroup === 'method', function () { regroupBooks('method'); });
+    pick('Host', bookGroup === 'host', function () { regroupBooks('host'); });
+  });
+
+  function regroupBooks(how) {
+    if (bookGroup === how) { return; }
+    bookGroup = how;
+    dressSift();
+    paintBooks();
+  }
+
+  /* A cut through the traffic is a decision about how it is being read, and it
+     outlives the tab for the same reason the folds and the theme do. */
+
+  function rememberSift() {
+    try {
+      localStorage.setItem('proxima.sift', JSON.stringify({
+        live: liveGroup, bad: onlyBad, saved: bookGroup
+      }));
+    } catch (error) { /* not fatal */ }
+  }
+
+  function recallSift() {
+    var held;
+    try { held = JSON.parse(localStorage.getItem('proxima.sift') || '{}'); }
+    catch (error) { return; }
+    if (!held || typeof held !== 'object') { return; }
+    // Anything not one of ours is left at the default rather than trusted.
+    if (held.live === 'device') { liveGroup = 'device'; }
+    if (held.saved === 'method' || held.saved === 'host') { bookGroup = held.saved; }
+    onlyBad = held.bad === true;
+    dressSift();
+  }
+
+  /* Two things a button can be saying at once: that its menu is open, and that
+     something in that menu is set to other than the default. The first is the
+     class every menu here uses and is taken back the moment the menu closes,
+     so the second needs one of its own or it would close with it. */
+
+  function dressSift() {
+    document.getElementById('sift-live').classList
+      .toggle('set', onlyBad || liveGroup !== 'host');
+    document.getElementById('sift-saved').classList.toggle('set', bookGroup !== 'book');
+  }
+
+  recallSift();
 
   huntBox('hunt-live', 'live-hunt', huntHosts);
   huntBox('hunt-saved', 'saved-hunt', function (text) {
@@ -2690,6 +2990,182 @@ mod tests {
             boxes.contains("event.stopPropagation();"),
             "opening a search must not fold the section it searches"
         );
+    }
+
+    #[test]
+    fn each_tree_can_be_cut_a_second_way_from_the_bar_it_sits_on() {
+        for control in ["id=\"sift-live\"", "id=\"sift-saved\""] {
+            assert!(
+                BODY.contains(control),
+                "each tree needs a grouping button of its own: {control}"
+            );
+        }
+        // The button sits on a bar that folds, and inside a menu that a click
+        // anywhere else closes: the click that opens it must do neither.
+        let boxes = SCRIPT
+            .split_once("function siftBox(buttonId, build) {")
+            .expect("the script still builds grouping menus")
+            .1
+            .split_once("\n  siftBox(")
+            .expect("the grouping menus are still built by it")
+            .0;
+        assert_eq!(
+            boxes.matches("event.stopPropagation();").count(),
+            2,
+            "opening the menu and picking from it must each keep the click"
+        );
+        // Grouped by device the address is a whole segment above the host, so
+        // the scope test already reaches everything under it.
+        assert!(
+            SCRIPT.contains("key += '/' + spot.host;"),
+            "the device has to sit above the host as a branch, not beside it"
+        );
+        // Regrouping throws the tree away, so what it was built from has to
+        // outlive the flow that carried it.
+        let regroup = SCRIPT
+            .split_once("function regroup() {")
+            .expect("the script still regroups the tree")
+            .1;
+        for step in ["strip(treeEl);", "groups.clear();", "branches.clear();"] {
+            assert!(
+                regroup.contains(step),
+                "regrouping must build the tree again rather than patch it: {step}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("spots.set(flow.id, branch(flow));"),
+            "the tree has to keep where a flow belongs, or it cannot be rebuilt"
+        );
+        // A cap that evicts rows without evicting what was kept beside them is
+        // a leak the cap was there to prevent.
+        let trim = SCRIPT
+            .split_once("function trim() {")
+            .expect("the script still trims the list")
+            .1;
+        for gone in ["spots.delete(last.flowId);", "bads.delete(last.flowId);"] {
+            assert!(
+                trim.contains(gone),
+                "a trimmed row must take everything held under its id: {gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_menu_says_it_is_a_menu_and_whether_it_is_open() {
+        // A mark for a name and a tick for a state is all a menu here shows,
+        // and neither of them is anything to a reader that is not looking.
+        for control in ["id=\"sift-live\"", "id=\"sift-saved\""] {
+            let opens = BODY
+                .split_once(control)
+                .expect("the grouping buttons are still in the markup")
+                .1;
+            let button = opens.split_once('>').expect("the button still ends").0;
+            for said in ["aria-haspopup=\"menu\"", "aria-expanded=\"false\""] {
+                assert!(
+                    button.contains(said),
+                    "a button that opens a menu has to say so: {control} {said}"
+                );
+            }
+        }
+        assert_eq!(
+            SCRIPT.matches("setAttribute('aria-expanded', 'true')").count(),
+            1,
+            "one place opens a menu, and it is where the state is set"
+        );
+        let shut = SCRIPT
+            .split_once("function shut() {")
+            .expect("the script still closes menus")
+            .1;
+        assert!(
+            shut.contains("openCaret.setAttribute('aria-expanded', 'false');"),
+            "a menu closed by a click elsewhere has to stop saying it is open"
+        );
+        // The picks are one of a set rather than a switch each, which is what
+        // the tick beside them means and what the state has to say.
+        assert!(
+            SCRIPT.contains("entry.setAttribute('role', 'menuitemradio');")
+                && SCRIPT.contains("entry.setAttribute('aria-checked', on ? 'true' : 'false');"),
+            "an exclusive choice has to read as one"
+        );
+    }
+
+    #[test]
+    fn a_saved_url_is_filed_under_the_host_it_names() {
+        // The composer's own box takes what is typed, and what is typed is
+        // often a host without a scheme. Filed under a parse failure, most of
+        // a collection would end up in one heap called nothing in particular.
+        let host = SCRIPT
+            .split_once("function hostOf(url) {")
+            .expect("the script still reads a host out of a saved URL")
+            .1;
+        assert!(
+            host.contains("new URL('https://' + text).host"),
+            "a URL saved without a scheme still names a host"
+        );
+        assert!(
+            host.contains("if (text.indexOf('://') >= 0) { return 'no host'; }"),
+            "a scheme that is present and unusable must not be guessed at twice"
+        );
+        assert_eq!(
+            host.matches("'no host'").count(),
+            5,
+            "everything that names no host is filed as naming none"
+        );
+    }
+
+    #[test]
+    fn a_menu_left_open_is_the_one_a_click_elsewhere_closes() {
+        // Two menus on one page, and one pair of variables saying which is
+        // open. Set where a menu is built, they name the last one built rather
+        // than the open one, and the other is left on screen for good.
+        assert_eq!(
+            SCRIPT.matches("openMenu = menu;").count(),
+            2,
+            "each menu has to claim the open slot when it opens"
+        );
+        for opened in ["if (open) {", "menu.hidden = false;"] {
+            assert!(
+                SCRIPT.contains(opened),
+                "the slot is claimed on the way open, not on the way shut: {opened}"
+            );
+        }
+        // Closing takes back the class that says a menu is open, so what a
+        // button says about its own settings cannot be the same class.
+        assert!(
+            SCRIPT.contains("classList.toggle('set',"),
+            "a used menu and an open menu must not be the same mark"
+        );
+        assert!(
+            CSS.contains(".icon.set {"),
+            "the mark for a used menu has to be drawn"
+        );
+    }
+
+    #[test]
+    fn what_the_tree_is_cut_by_outlives_the_tab() {
+        assert!(
+            SCRIPT.contains("localStorage.setItem('proxima.sift', JSON.stringify({"),
+            "how the trees are grouped has to outlive the tab"
+        );
+        let recall = SCRIPT
+            .split_once("function recallSift() {")
+            .expect("the script still reads back the grouping")
+            .1;
+        assert!(
+            recall.contains("catch (error) { return; }"),
+            "unreadable or invented storage has to fall back rather than throw"
+        );
+        // Storage is not ours to trust: anything but a value this build knows
+        // leaves the tree grouped the way it starts out.
+        for guard in [
+            "if (held.live === 'device') { liveGroup = 'device'; }",
+            "held.bad === true",
+        ] {
+            assert!(
+                recall.contains(guard),
+                "a stored value has to be one of ours before it is used: {guard}"
+            );
+        }
     }
 
     #[test]
