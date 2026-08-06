@@ -1,6 +1,6 @@
 //! Runtime configuration and the rules deciding which connections get opened up.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,134 @@ impl Default for DecryptRules {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* rewriting                                                           */
+/* ------------------------------------------------------------------ */
+
+/// One change to make to a set of headers.
+///
+/// `Set` replaces every existing copy of the header rather than appending, which
+/// is what someone overriding an `Authorization` means. `Remove` takes all of
+/// them. Neither can be expressed as the other, and appending has no use case
+/// here that is not better served by editing and replaying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "action")]
+pub enum HeaderEdit {
+    Set { name: String, value: String },
+    Remove { name: String },
+}
+
+impl HeaderEdit {
+    pub fn name(&self) -> &str {
+        match self {
+            HeaderEdit::Set { name, .. } | HeaderEdit::Remove { name } => name,
+        }
+    }
+}
+
+/// Where a rule sends the request instead of where it was addressed.
+///
+/// The `Host` header still carries the authority the client asked for, because
+/// the point of pointing `api.example.com` at `127.0.0.1:3000` is to watch a
+/// local service answer as that origin. TLS, on the other hand, is negotiated
+/// with the target: a certificate for `api.example.com` is not what a local
+/// server is holding, so an HTTPS redirect usually wants `--insecure` too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DialTarget {
+    pub host: String,
+    pub port: Option<u16>,
+}
+
+/// A match and the edits to make when it matches.
+///
+/// Every condition left empty matches everything, so a rule with no conditions
+/// applies to all traffic. That is the common case: the reason to reach for this
+/// is usually "put my token on every request I am about to make".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewriteRule {
+    /// Exact hosts or `*.suffix` patterns, matched the same way `--skip` is.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// Matched against the path with its query string, as sent.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub request_headers: Vec<HeaderEdit>,
+    #[serde(default)]
+    pub response_headers: Vec<HeaderEdit>,
+    #[serde(default)]
+    pub to: Option<DialTarget>,
+}
+
+impl RewriteRule {
+    /// True when this rule applies to a request. `path` is the path and query
+    /// as sent, `host` has no port.
+    pub fn matches(&self, host: &str, method: &str, path: &str) -> bool {
+        if !self.hosts.is_empty() && !self.hosts.iter().any(|p| host_matches(host, p)) {
+            return false;
+        }
+        if !self.methods.is_empty()
+            && !self
+                .methods
+                .iter()
+                .any(|m| m.trim().eq_ignore_ascii_case(method))
+        {
+            return false;
+        }
+        match &self.path_prefix {
+            Some(prefix) => path.starts_with(prefix.as_str()),
+            None => true,
+        }
+    }
+
+    /// True when the rule would change nothing, which is worth catching at the
+    /// point it is configured rather than wondering later why nothing happened.
+    pub fn is_noop(&self) -> bool {
+        self.request_headers.is_empty() && self.response_headers.is_empty() && self.to.is_none()
+    }
+}
+
+/// The rules in order. Later rules win, because that is how someone reading a
+/// list top to bottom expects a list of overrides to behave.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RewriteRules {
+    pub rules: Vec<RewriteRule>,
+}
+
+impl RewriteRules {
+    pub fn is_empty(&self) -> bool {
+        self.rules.iter().all(RewriteRule::is_noop)
+    }
+
+    /// Every rule that applies to this request, in order.
+    pub fn matching(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+    ) -> impl Iterator<Item = &RewriteRule> + '_ {
+        let host = host.to_string();
+        let method = method.to_string();
+        let path = path.to_string();
+        self.rules
+            .iter()
+            .filter(move |rule| rule.matches(&host, &method, &path))
+    }
+
+    /// Where this request should actually be sent. The last matching rule that
+    /// names a target wins, consistent with how the header edits stack.
+    pub fn dial_target(&self, host: &str, method: &str, path: &str) -> Option<&DialTarget> {
+        self.matching(host, method, path)
+            .filter_map(|rule| rule.to.as_ref())
+            .last()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamHttp2 {
@@ -58,7 +186,13 @@ pub struct Config {
     pub max_body_bytes: u64,
     /// Total memory ceiling across all retained bodies.
     pub max_total_body_bytes: u64,
+    /// Where finished flows are recorded for later querying. `None` keeps
+    /// everything in memory, which is what a build without the `archive`
+    /// feature can do at all.
+    pub archive_path: Option<PathBuf>,
     pub decrypt: DecryptRules,
+    /// Changes made to traffic on the way through, in order.
+    pub rewrite: RewriteRules,
     pub upstream_http2: UpstreamHttp2,
     /// Accept invalid origin certificates instead of failing the flow.
     pub insecure_upstream: bool,
@@ -77,7 +211,9 @@ impl Default for Config {
             max_flows: 5000,
             max_body_bytes: 10 * 1024 * 1024,
             max_total_body_bytes: 512 * 1024 * 1024,
+            archive_path: None,
             decrypt: DecryptRules::default(),
+            rewrite: RewriteRules::default(),
             upstream_http2: UpstreamHttp2::Auto,
             insecure_upstream: false,
             setup_hosts: vec![
@@ -87,6 +223,11 @@ impl Default for Config {
             ],
         }
     }
+}
+
+/// Where the archive lives when one was asked for without a path.
+pub fn default_archive_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("capture.duckdb")
 }
 
 pub fn default_data_dir() -> PathBuf {

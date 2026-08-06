@@ -146,6 +146,7 @@ mod tests {
             comment: None,
             ws_messages: None,
             tunnel: None,
+            rewrites: Vec::new(),
         }
     }
 

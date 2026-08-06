@@ -14,6 +14,7 @@
 //! flow that has already been evicted is released rather than left for the
 //! global byte ceiling to find later.
 
+pub mod archive;
 pub mod bodies;
 pub mod decode;
 pub mod har;
@@ -33,6 +34,7 @@ use crate::types::{
     WsDirection, WsMessage,
 };
 
+pub use archive::{Archive, ArchiveRow, QueryResult};
 pub use bodies::{BodyStore, BodyWriter};
 pub use decode::{decode_body, is_textual};
 pub use har::flows_to_har;
@@ -76,6 +78,10 @@ pub struct FlowStore {
     bodies: BodyStore,
     max_flows: usize,
     max_body_bytes: u64,
+    /// Where finished flows go to outlive the ring buffer. `None` unless an
+    /// archive was configured, in which case the store behaves exactly as it
+    /// did before this existed.
+    archive: Option<Archive>,
 }
 
 struct Inner {
@@ -89,6 +95,10 @@ struct Inner {
 struct Stored {
     seq: u64,
     flow: Flow,
+    /// Set once this flow has been handed to the archive, so the two paths that
+    /// can archive it, reaching a terminal state and being evicted, cannot both
+    /// write it.
+    archived: bool,
 }
 
 impl FlowStore {
@@ -106,7 +116,20 @@ impl FlowStore {
             // created, which no configuration can plausibly want.
             max_flows: max_flows.max(1),
             max_body_bytes,
+            archive: None,
         }
+    }
+
+    /// Records finished flows to `archive` as well as holding them in memory.
+    /// Takes the store by value because it is wired once, at startup, before
+    /// the `Arc` that every connection shares is made.
+    pub fn with_archive(mut self, archive: Archive) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+
+    pub fn archive(&self) -> Option<&Archive> {
+        self.archive.as_ref()
     }
 
     /// A receiver for the live feed. Receivers that fall behind get
@@ -136,16 +159,25 @@ impl FlowStore {
             comment: None,
             ws_messages: None,
             tunnel: None,
+            rewrites: Vec::new(),
         };
         let summary = summarize(&flow);
 
         let mut orphaned_bodies = Vec::new();
+        let mut to_archive = Vec::new();
         {
             let mut inner = self.inner.lock();
             let seq = inner.next_seq;
             inner.next_seq = inner.next_seq.saturating_add(1);
             inner.order.push_back(id.clone());
-            inner.flows.insert(id.clone(), Stored { seq, flow });
+            inner.flows.insert(
+                id.clone(),
+                Stored {
+                    seq,
+                    flow,
+                    archived: false,
+                },
+            );
 
             while inner.flows.len() > self.max_flows {
                 let Some(oldest) = inner.order.pop_front() else {
@@ -153,6 +185,12 @@ impl FlowStore {
                 };
                 if let Some(evicted) = inner.flows.remove(&oldest) {
                     collect_body_ids(&evicted.flow, &mut orphaned_bodies);
+                    // A flow evicted before it finished is still the only record
+                    // that it happened, so it goes to the archive mid-flight
+                    // rather than being lost with its state as it stands.
+                    if self.archive.is_some() && !evicted.archived {
+                        to_archive.push(archive_row(&evicted.flow, evicted.seq));
+                    }
                 }
             }
         }
@@ -162,6 +200,7 @@ impl FlowStore {
         for body_id in &orphaned_bodies {
             self.bodies.remove(body_id);
         }
+        self.send_to_archive(to_archive);
         if !orphaned_bodies.is_empty() {
             debug!(
                 bodies = orphaned_bodies.len(),
@@ -230,6 +269,7 @@ impl FlowStore {
     /// Marks a flow complete. A flow that already failed keeps its state, since
     /// the transport closing cleanly after an error does not undo the error.
     pub fn finish(&self, id: &str) {
+        let mut row = None;
         let summary = {
             let mut inner = self.inner.lock();
             match inner.flows.get_mut(id) {
@@ -240,11 +280,16 @@ impl FlowStore {
                     if !matches!(stored.flow.state, FlowState::Error | FlowState::Aborted) {
                         stored.flow.state = FlowState::Complete;
                     }
+                    if self.archive.is_some() && !stored.archived {
+                        stored.archived = true;
+                        row = Some(archive_row(&stored.flow, stored.seq));
+                    }
                     Some(summarize(&stored.flow))
                 }
                 None => None,
             }
         };
+        self.send_to_archive(row);
         if let Some(summary) = summary {
             let _ = self.events.send(ProxyEvent::FlowDone {
                 flow: Box::new(summary),
@@ -254,6 +299,7 @@ impl FlowStore {
 
     pub fn fail(&self, id: &str, error: FlowError) {
         let message = error.message.clone();
+        let mut row = None;
         let summary = {
             let mut inner = self.inner.lock();
             match inner.flows.get_mut(id) {
@@ -263,11 +309,16 @@ impl FlowStore {
                     if stored.flow.timings.end.is_none() {
                         stored.flow.timings.end = Some(now_ms());
                     }
+                    if self.archive.is_some() && !stored.archived {
+                        stored.archived = true;
+                        row = Some(archive_row(&stored.flow, stored.seq));
+                    }
                     Some(summarize(&stored.flow))
                 }
                 None => None,
             }
         };
+        self.send_to_archive(row);
         match summary {
             Some(summary) => {
                 warn!(%id, host = %summary.authority, %message, "flow failed");
@@ -385,14 +436,39 @@ impl FlowStore {
             .collect()
     }
 
+    /// Empties the in-memory view. The archive is not touched: clearing the
+    /// list is how someone starts a fresh observation, not how they ask for
+    /// yesterday's statistics to be destroyed. Anything not archived yet is
+    /// written on the way out, so nothing vanishes without a trace.
     pub fn clear(&self) {
+        let mut to_archive = Vec::new();
         {
             let mut inner = self.inner.lock();
+            if self.archive.is_some() {
+                for stored in inner.flows.values().filter(|s| !s.archived) {
+                    to_archive.push(archive_row(&stored.flow, stored.seq));
+                }
+                // Oldest first, so the archive keeps the order the proxy saw.
+                to_archive.sort_by_key(|row| row.seq);
+            }
             inner.flows.clear();
             inner.order.clear();
         }
         self.bodies.clear();
+        self.send_to_archive(to_archive);
         let _ = self.events.send(ProxyEvent::Clear);
+    }
+
+    /// Hands rows over, if there is an archive at all. Always called outside
+    /// the store lock: the archive queue is bounded, and blocking on it while
+    /// holding the lock would stall every connection on the proxy.
+    fn send_to_archive<I: IntoIterator<Item = ArchiveRow>>(&self, rows: I) {
+        let Some(archive) = &self.archive else {
+            return;
+        };
+        for row in rows {
+            archive.record(row);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -551,6 +627,7 @@ fn tombstone_flow(id: &str) -> Flow {
         comment: None,
         ws_messages: None,
         tunnel: None,
+        rewrites: Vec::new(),
     }
 }
 
@@ -604,6 +681,78 @@ fn summarize(flow: &Flow) -> FlowSummary {
             .as_ref()
             .and_then(|e| e.likely_pinning)
             .unwrap_or(false),
+    }
+}
+
+/// Flattens a flow into the row the archive stores.
+///
+/// Bodies are represented by their size and content type only. Everything else
+/// a flow knows is either a scalar column or, for headers, a JSON array of
+/// `[name, value]` pairs that DuckDB can index into, which keeps one row per
+/// flow and avoids a join for the one question headers get asked: which flows
+/// carried this header.
+pub(crate) fn archive_row(flow: &Flow, seq: u64) -> ArchiveRow {
+    let summary = summarize(flow);
+    ArchiveRow {
+        seq,
+        id: flow.id.clone(),
+        kind: kind_name(flow.kind),
+        state: state_name(flow.state),
+        intercepted: flow.intercepted,
+        method: flow.request.method.clone(),
+        scheme: flow.request.scheme.as_str(),
+        host: flow.request.host.clone(),
+        port: flow.request.port,
+        authority: flow.request.authority.clone(),
+        path: flow.request.path.clone(),
+        url: flow.request.url.clone(),
+        http_version: version_name(flow.request.http_version),
+        status: summary.status,
+        content_type: summary.content_type,
+        request_bytes: summary.request_size,
+        response_bytes: summary.response_size,
+        started_ms: flow.timings.start,
+        duration_ms: summary.duration,
+        error: summary.error,
+        likely_pinning: summary.likely_pinning,
+        client: flow.client.address.clone(),
+        replay_of: flow.replay_of.clone(),
+        request_headers: headers_json(&flow.request.headers),
+        response_headers: flow.response.as_ref().map(|r| headers_json(&r.headers)),
+        ws_messages: flow.ws_messages.as_ref().map(|m| m.len() as u64),
+    }
+}
+
+/// Headers as a JSON array of pairs. Serialisation of a `Vec<(String, String)>`
+/// cannot fail, so a failure here would be a bug in serde_json rather than
+/// anything about this data, and an empty array keeps the column non-null.
+fn headers_json(headers: &[HeaderPair]) -> String {
+    serde_json::to_string(headers).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn kind_name(kind: FlowKind) -> &'static str {
+    match kind {
+        FlowKind::Http => "http",
+        FlowKind::Websocket => "websocket",
+        FlowKind::Tunnel => "tunnel",
+    }
+}
+
+fn state_name(state: FlowState) -> &'static str {
+    match state {
+        FlowState::Pending => "pending",
+        FlowState::Streaming => "streaming",
+        FlowState::Complete => "complete",
+        FlowState::Error => "error",
+        FlowState::Aborted => "aborted",
+    }
+}
+
+fn version_name(version: HttpVersion) -> &'static str {
+    match version {
+        HttpVersion::Http10 => "1.0",
+        HttpVersion::Http11 => "1.1",
+        HttpVersion::Http2 => "2.0",
     }
 }
 
