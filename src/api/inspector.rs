@@ -567,6 +567,10 @@ const SCRIPT: &str = r#"
 
   var rows = new Map();
   var needles = new Map();
+  // The most recent summary for every row, so an arriving event can be compared
+  // against what the pane below was actually built from.
+  var summaries = new Map();
+  var rendered = '';
   var groups = new Map();
   var branches = new Map();
   var homes = new Map();
@@ -691,8 +695,20 @@ const SCRIPT: &str = r#"
       str(flow.method), str(flow.authority), str(flow.path),
       statusLabel(flow), str(flow.error), str(flow.client)
     ].join(' ').toLowerCase());
+    summaries.set(flow.id, flow);
     settle(flow);
     filterRow(row, flow.id);
+  }
+
+  // Everything about a flow that the pane below spells out and that can still
+  // change after the row first appears. A response that lands while its flow is
+  // open changes this string, and that is the signal to rebuild the pane.
+  function signature(flow) {
+    if (!flow) { return ''; }
+    return [
+      str(flow.state), str(flow.status), str(flow.responseSize),
+      str(flow.duration), str(flow.error)
+    ].join(' ');
   }
 
   /* ---------------------------------------------------------------- */
@@ -793,6 +809,7 @@ const SCRIPT: &str = r#"
       unplace(last.flowId);
       forget(last.flowId);
       needles.delete(last.flowId);
+      summaries.delete(last.flowId);
       spots.delete(last.flowId);
       bads.delete(last.flowId);
       if (!last.hidden) { visible -= 1; }
@@ -804,6 +821,8 @@ const SCRIPT: &str = r#"
     strip(treeEl);
     rows.clear();
     needles.clear();
+    summaries.clear();
+    rendered = '';
     groups.clear();
     branches.clear();
     homes.clear();
@@ -1181,6 +1200,7 @@ const SCRIPT: &str = r#"
     // Both views carry the selection, so switching between them keeps it.
     if (selectedId) { highlight(selectedId, false); }
     selectedId = id;
+    rendered = signature(summaries.get(id));
     highlight(id, true);
 
     var token = ++detailToken;
@@ -1622,6 +1642,14 @@ const SCRIPT: &str = r#"
     if (event.type === 'flow:new' || event.type === 'flow:update' || event.type === 'flow:done') {
       upsert(event.flow, true);
       tally();
+      // The pane below is a snapshot taken when the row was clicked. A flow
+      // opened while it is still in flight has no response yet, and without
+      // this it would keep saying so for as long as it stays open: the body
+      // only appeared if you happened to click away and back.
+      if (event.flow && event.flow.id === selectedId &&
+          signature(event.flow) !== rendered) {
+        select(selectedId);
+      }
       return;
     }
     if (event.type === 'clear') { wipe(); return; }
@@ -1643,6 +1671,10 @@ const SCRIPT: &str = r#"
     // Events that land mid-fetch would otherwise be overwritten by the older
     // snapshot they raced.
     queue = [];
+    // Resynchronising is about the list having holes in it, not about the pane
+    // someone is reading. Whatever was open stays open as long as the flow
+    // survived the round trip.
+    var reopen = selectedId;
     try {
       var page = await getJson('/api/flows?limit=' + MAX_ROWS);
       wipe();
@@ -1655,6 +1687,7 @@ const SCRIPT: &str = r#"
     queue = null;
     for (var j = 0; j < pending.length; j++) { apply(pending[j]); }
     tally();
+    if (reopen && rows.has(reopen)) { select(reopen); }
   }
 
   function link(kind, text) {
@@ -3179,6 +3212,79 @@ mod tests {
                 "tearing the detail pane down must drop the frame list: {reset}"
             );
         }
+    }
+
+    /// A flow opened while it was still in flight used to keep showing "in
+    /// flight" and an empty response body until the row was clicked away from
+    /// and back, because the pane was only ever built by `select`.
+    #[test]
+    fn a_flow_that_finishes_while_it_is_open_redraws_its_own_pane() {
+        for line in [
+            "if (event.flow && event.flow.id === selectedId &&",
+            "signature(event.flow) !== rendered) {",
+            "select(selectedId);",
+            "rendered = signature(summaries.get(id));",
+            "summaries.set(flow.id, flow);",
+        ] {
+            assert!(
+                SCRIPT.contains(line),
+                "an update for the open flow has to reach the pane below: {line}"
+            );
+        }
+
+        // Every field the pane can show that a later event can change has to be
+        // in the signature, or the redraw never fires for it.
+        let body = SCRIPT
+            .split_once("function signature(flow) {")
+            .expect("the script still has a signature function")
+            .1
+            .split_once("\n  }")
+            .expect("signature has a body")
+            .0;
+        for field in ["state", "status", "responseSize", "duration", "error"] {
+            assert!(
+                body.contains(&format!("flow.{field}")),
+                "{field} changes after a row appears, so it belongs in the signature"
+            );
+        }
+    }
+
+    /// A resync exists because the list has holes in it. Dropping the pane
+    /// someone was reading is collateral damage, not part of the fix.
+    #[test]
+    fn resynchronising_the_list_reopens_whatever_was_selected() {
+        for line in [
+            "var reopen = selectedId;",
+            "if (reopen && rows.has(reopen)) { select(reopen); }",
+        ] {
+            assert!(
+                SCRIPT.contains(line),
+                "a reload must put the open flow back: {line}"
+            );
+        }
+    }
+
+    /// Bookkeeping that `wipe` forgets outlives the rows it describes, and the
+    /// signature check would then compare against a flow that is gone.
+    #[test]
+    fn clearing_the_list_forgets_the_summaries_it_kept() {
+        let body = SCRIPT
+            .split_once("function wipe() {")
+            .expect("the script still has a wipe function")
+            .1
+            .split_once("\n  }")
+            .expect("wipe has a body")
+            .0;
+        for reset in ["summaries.clear()", "rendered = ''"] {
+            assert!(
+                body.contains(reset),
+                "wiping the list must drop the bookkeeping behind the pane: {reset}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("summaries.delete(last.flowId);"),
+            "a trimmed row must not leave its summary behind"
+        );
     }
 
     #[test]
