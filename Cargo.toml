@@ -79,6 +79,13 @@ eframe = { version = "0.32", default-features = false, features = [
   "x11",
 ], optional = true }
 
+# The traffic archive. Optional and off by default for the same reason as the
+# window: `bundled` compiles DuckDB's C++ amalgamation, which is minutes of cold
+# build and tens of megabytes of binary. Someone who only wants to watch requests
+# go by should not pay that. `bundled` rather than a system library because the
+# alternative is asking every user to install a matching libduckdb first.
+duckdb = { version = "1.10505", features = ["bundled"], optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -93,6 +100,7 @@ codegen-units = 1
 
 [features]
 gui = ["dep:eframe"]
+archive = ["dep:duckdb"]
 
 [[bin]]
 name = "proxima"

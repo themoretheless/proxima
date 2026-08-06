@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use crate::api::{self, ApiState};
 use crate::ca::CertAuthority;
-use crate::capture::FlowStore;
+use crate::capture::{Archive, FlowStore};
 use crate::proxy::forward::Upstream;
 use crate::proxy::{ProxyDeps, ProxyServer};
 use crate::replay::ReplayEngine;
@@ -70,11 +70,20 @@ impl Servers {
             "certificate authority ready"
         );
 
-        let store = Arc::new(FlowStore::new(
+        let mut store = FlowStore::new(
             config.max_flows,
             config.max_body_bytes,
             config.max_total_body_bytes,
-        ));
+        );
+        if let Some(path) = &config.archive_path {
+            // A failure here stops the start. Someone who passed --archive and
+            // silently got no archive would only find out later, when the
+            // traffic they wanted to ask about was already gone.
+            let archive = Archive::open(path)
+                .with_context(|| format!("opening the traffic archive at {}", path.display()))?;
+            store = store.with_archive(archive);
+        }
+        let store = Arc::new(store);
         let upstream = Upstream::new(&config).context("preparing the upstream TLS settings")?;
         let replay = Arc::new(
             ReplayEngine::new(config.clone(), store.clone())

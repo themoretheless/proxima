@@ -33,6 +33,9 @@ const MAX_SEARCH_LEN: usize = 512;
 const MAX_FILTER_VALUES: usize = 64;
 const MAX_QUERY_PAIRS: usize = 256;
 const MAX_ID_LEN: usize = 128;
+/// Long enough for any hand-written analytical query, short enough that the
+/// endpoint cannot be used to push a payload at DuckDB's parser.
+const MAX_SQL_LEN: usize = 8_192;
 /// A browser tab that stopped reading must not pin a broadcast slot forever.
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -68,6 +71,8 @@ pub(super) fn build(state: ApiState) -> Router {
             post(send).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/api/har", get(get_har))
+        .route("/api/archive/query", post(query_archive))
+        .route("/api/archive/stats", get(archive_stats))
         .route(
             "/api/collections",
             get(list_collections).post(create_collection),
@@ -172,6 +177,69 @@ async fn get_flow(
         .get(&id)
         .ok_or_else(|| not_found("no flow with that id"))?;
     Ok(Json(flow).into_response())
+}
+
+/* ------------------------------------------------------------------ */
+/* archive                                                             */
+/* ------------------------------------------------------------------ */
+
+#[derive(serde::Deserialize)]
+struct QueryRequest {
+    sql: String,
+}
+
+/// Runs one read only statement against the archive.
+///
+/// Two failures are told apart on purpose. No archive is a 503 with the flag
+/// that turns it on, because nothing about the request was wrong. A statement
+/// the archive refused is a 400 carrying DuckDB's own message, which names the
+/// column or the syntax error, and is the only way anyone debugs a query.
+async fn query_archive(
+    State(state): State<ApiState>,
+    Json(request): Json<QueryRequest>,
+) -> Result<Response, ApiError> {
+    let archive = archive(&state)?;
+    if request.sql.len() > MAX_SQL_LEN {
+        return Err(bad_request(format!(
+            "that statement is {} characters, and the archive takes at most {MAX_SQL_LEN}",
+            request.sql.len()
+        )));
+    }
+    match archive.query(request.sql).await {
+        Ok(result) => Ok(Json(result).into_response()),
+        Err(err) => Err(archive_error(err)),
+    }
+}
+
+async fn archive_stats(State(state): State<ApiState>) -> Result<Response, ApiError> {
+    let archive = archive(&state)?;
+    match archive.stats().await {
+        Ok(stats) => Ok(Json(stats).into_response()),
+        Err(err) => Err(archive_error(err)),
+    }
+}
+
+/// Whose fault it was, as a status code. A saturated writer is not a bad
+/// request: nothing about it was wrong and the same one may work in a moment,
+/// so it says so rather than sending a client off to debug its own SQL.
+fn archive_error(error: crate::capture::QueryError) -> ApiError {
+    use crate::capture::QueryError;
+    let status = match error {
+        QueryError::Rejected(_) => StatusCode::BAD_REQUEST,
+        QueryError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        QueryError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError::new(status, error.to_string())
+}
+
+fn archive(state: &ApiState) -> Result<&crate::capture::Archive, ApiError> {
+    state.store.archive().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this run keeps no archive, so there is nothing to query. Start Proxima with \
+             --archive to record finished flows to disk.",
+        )
+    })
 }
 
 #[derive(Clone, Copy)]

@@ -85,6 +85,8 @@ pub fn status(state: &ApiState) -> ServerStatus {
         // Capture has no pause switch today; the field exists so the UI can
         // render one the moment it does.
         capturing: true,
+        archiving: state.store.archive().is_some(),
+        archive_dropped: state.store.archive().map(|a| a.dropped()).unwrap_or(0),
     }
 }
 

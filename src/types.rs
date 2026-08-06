@@ -245,6 +245,14 @@ pub struct Flow {
     pub ws_messages: Option<Vec<WsMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<TunnelInfo>,
+    /// What the rewrite rules changed on the way through, one note per change.
+    ///
+    /// A capture shows what went on the wire, so a header a rule added is
+    /// indistinguishable in the record from one the client sent. These notes are
+    /// how it can be told apart, and without them the honest capture becomes a
+    /// confusing one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewrites: Vec<String>,
 }
 
 /// Lightweight projection for the flow list. Excludes headers and bodies so a
@@ -310,6 +318,13 @@ pub struct ServerStatus {
     pub ca_not_after: String,
     pub flow_count: usize,
     pub capturing: bool,
+    /// Whether finished flows are being recorded to disk. The UI hides the
+    /// query panel when they are not, since there would be nothing to query.
+    pub archiving: bool,
+    /// Flows the archive could not keep up with. Surfaced rather than only
+    /// logged, because statistics with a silent hole in them are worse than
+    /// statistics that say how big the hole is.
+    pub archive_dropped: u64,
 }
 
 /* ------------------------------------------------------------------ */

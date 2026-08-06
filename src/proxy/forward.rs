@@ -34,7 +34,7 @@ use crate::types::{
     FlowState, HttpVersion, Scheme,
 };
 
-use super::{headers, websocket, ProxyDeps};
+use super::{headers, rewrite, websocket, ProxyDeps};
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -94,12 +94,23 @@ pub async fn forward(
     // client half of the WebSocket to.
     let client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
 
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let path = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
+
+    // Before the flow is recorded, so the capture shows what is actually sent.
+    // A record that disagrees with the wire is worse than no record at all.
+    let notes = rewrite::apply(
+        &deps.config.rewrite,
+        rewrite::Half::Request,
+        &ctx.host,
+        parts.method.as_str(),
+        &path,
+        &mut parts.headers,
+    );
 
     let id = deps.store.create(FlowInit {
         kind: if upgrading {
@@ -124,6 +135,9 @@ pub async fn forward(
         server: ctx.server.clone(),
         replay_of: None,
     });
+    if !notes.is_empty() {
+        deps.store.update(&id, |flow| flow.rewrites = notes);
+    }
 
     match exchange(parts, body, &ctx, &deps, &id, upgrading, client_upgrade).await {
         Ok(response) => response,
@@ -154,13 +168,36 @@ async fn exchange(
     upgrading: bool,
     client_upgrade: Option<ClientUpgrade>,
 ) -> Result<Response<ProxyBody>> {
+    let method = parts.method.as_str().to_string();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+
+    // Where this request actually goes, which is not always where it was
+    // addressed. The `Host` header is left alone by the redirect on purpose:
+    // pointing a name at a local service is only useful if the service still
+    // sees itself being addressed as that name.
+    let (dial_host, dial_port) = match deps.config.rewrite.dial_target(&ctx.host, &method, &path) {
+        Some(target) => {
+            let host = target.host.clone();
+            let port = target.port.unwrap_or(ctx.port);
+            let note = format!("sent to {host}:{port} instead of {}", ctx.authority);
+            deps.store.update(id, |flow| flow.rewrites.push(note.clone()));
+            debug!(%id, target = %format!("{host}:{port}"), "rule redirected the request");
+            (host, port)
+        }
+        None => (ctx.host.clone(), ctx.port),
+    };
+
     // The one and only socket to the origin. An HTTPS flow hands it to the TLS
     // handshake rather than dialling again: a second dial would leave the first
     // socket open and idle for the life of the request, and would double the
     // connection count every origin sees.
-    let stream = TcpStream::connect((ctx.host.as_str(), ctx.port))
+    let stream = TcpStream::connect((dial_host.as_str(), dial_port))
         .await
-        .with_context(|| format!("connecting to {}:{}", ctx.host, ctx.port))?;
+        .with_context(|| format!("connecting to {dial_host}:{dial_port}"))?;
     let _ = stream.set_nodelay(true);
     let connect_end = now_ms();
 
@@ -176,8 +213,12 @@ async fn exchange(
             (response, None, upgrade)
         }
         Scheme::Https => {
-            let tls = tls_handshake(deps, ctx, stream, allow_h2).await?;
-            let facts = tls_facts(&tls, &ctx.host);
+            // The handshake is with whoever answered, so the name verified is
+            // the one dialled. A redirect to a local service therefore needs
+            // --insecure, which is honest: that service is not holding a
+            // certificate for the origin it is standing in for.
+            let tls = tls_handshake(deps, &dial_host, stream, allow_h2).await?;
+            let facts = tls_facts(&tls, &dial_host);
             let h2 = facts.alpn.as_deref() == Some("h2");
             let (response, upgrade) = if h2 {
                 (send_http2(tls, parts, body, ctx, deps, id).await?, None)
@@ -189,13 +230,26 @@ async fn exchange(
     };
 
     let response_start = now_ms();
-    let (response_parts, response_body) = response.into_parts();
+    let (mut response_parts, response_body) = response.into_parts();
     let status = response_parts.status;
+
+    // Before the response is recorded, so what the inspector shows is what the
+    // client receives, the same way round as the request half.
+    let response_notes = rewrite::apply(
+        &deps.config.rewrite,
+        rewrite::Half::Response,
+        &ctx.host,
+        &method,
+        &path,
+        &mut response_parts.headers,
+    );
+
     let response_headers = headers::to_pairs(&response_parts.headers);
     let encoding = headers::content_encoding(&response_parts.headers);
     let mime = headers::content_type(&response_parts.headers);
 
     deps.store.update(id, |flow| {
+        flow.rewrites.extend(response_notes.iter().cloned());
         flow.state = FlowState::Streaming;
         flow.timings.connect_end = Some(connect_end);
         flow.timings.response_start = Some(response_start);
@@ -406,20 +460,20 @@ where
 /// is opened.
 async fn tls_handshake(
     deps: &Arc<ProxyDeps>,
-    ctx: &ForwardContext,
+    host: &str,
     stream: TcpStream,
     allow_h2: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let config = deps.upstream.client_config(allow_h2);
     // An IP literal is a valid TLS name of its own kind; anything unusable as a
     // name would fail verification anyway, so it fails here with a clear reason.
-    let name = ServerName::try_from(ctx.host.clone())
-        .with_context(|| format!("{} is not a usable TLS server name", ctx.host))?;
+    let name = ServerName::try_from(host.to_string())
+        .with_context(|| format!("{host} is not a usable TLS server name"))?;
 
     tokio_rustls::TlsConnector::from(config)
         .connect(name, stream)
         .await
-        .with_context(|| format!("TLS handshake with {}", ctx.host))
+        .with_context(|| format!("TLS handshake with {host}"))
 }
 
 /// What the origin's handshake revealed. Recorded per flow because it is per

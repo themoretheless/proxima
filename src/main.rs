@@ -13,7 +13,10 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
-use proxima::config::{default_data_dir, Config, DecryptMode, DecryptRules, UpstreamHttp2};
+use proxima::config::{
+    default_archive_path, default_data_dir, Config, DecryptMode, DecryptRules, DialTarget,
+    HeaderEdit, RewriteRule, RewriteRules, UpstreamHttp2,
+};
 use proxima::runtime::Servers;
 use proxima::types::ServerStatus;
 use tracing::warn;
@@ -59,6 +62,35 @@ struct Cli {
     #[arg(long, value_name = "n", default_value_t = 5000)]
     max_flows: usize,
 
+    /// record finished flows to <data-dir>/capture.duckdb for later querying
+    #[arg(long)]
+    archive: bool,
+
+    /// record finished flows to this file instead of the default one
+    #[arg(long, value_name = "path")]
+    archive_path: Option<PathBuf>,
+
+    /// set a request header on everything (repeatable), e.g. "authorization: Bearer x"
+    #[arg(long, value_name = "name: value")]
+    set_header: Vec<String>,
+
+    /// remove a request header from everything (repeatable)
+    #[arg(long, value_name = "name")]
+    remove_header: Vec<String>,
+
+    /// set a response header on everything (repeatable)
+    #[arg(long, value_name = "name: value")]
+    set_response_header: Vec<String>,
+
+    /// remove a response header from everything (repeatable)
+    #[arg(long, value_name = "name")]
+    remove_response_header: Vec<String>,
+
+    /// send requests for one host somewhere else (repeatable), e.g.
+    /// "api.example.com=127.0.0.1:3000"
+    #[arg(long, value_name = "host=target")]
+    map_host: Vec<String>,
+
     /// force HTTP/1.1 upstream
     #[arg(long)]
     no_http2: bool,
@@ -88,7 +120,8 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mut servers = Servers::start(config_from(&cli)).await?;
+    let config = config_from(&cli).map_err(|message| anyhow::anyhow!(message))?;
+    let mut servers = Servers::start(config).await?;
     print!(
         "{}",
         banner(
@@ -169,7 +202,166 @@ fn validate(cli: &Cli) -> std::result::Result<(), clap::Error> {
     Ok(())
 }
 
-fn config_from(cli: &Cli) -> Config {
+/* ------------------------------------------------------------------ */
+/* rewrite rules                                                       */
+/* ------------------------------------------------------------------ */
+
+/// Turns the rewrite flags into rules.
+///
+/// The header flags apply to every host. That is what they are for: the reason
+/// to reach for one is almost always "put my token on everything I am about to
+/// send". Scoping a rule to a host, a method or a path is expressible in
+/// [`RewriteRule`] and is what the API will offer; the command line stays
+/// unambiguous instead of growing a syntax for it.
+///
+/// Order matters and follows the flags: headers first, then the host mappings,
+/// so a later rule overriding an earlier one reads the way the list does.
+fn rewrite_from(cli: &Cli) -> std::result::Result<RewriteRules, String> {
+    let mut edits = RewriteRule::default();
+    for text in &cli.set_header {
+        edits.request_headers.push(parse_set("--set-header", text)?);
+    }
+    for text in &cli.remove_header {
+        edits.request_headers.push(parse_remove("--remove-header", text)?);
+    }
+    for text in &cli.set_response_header {
+        edits
+            .response_headers
+            .push(parse_set("--set-response-header", text)?);
+    }
+    for text in &cli.remove_response_header {
+        edits
+            .response_headers
+            .push(parse_remove("--remove-response-header", text)?);
+    }
+
+    let mut rules = Vec::new();
+    if !edits.is_noop() {
+        rules.push(edits);
+    }
+    for text in &cli.map_host {
+        rules.push(parse_map_host(text)?);
+    }
+    Ok(RewriteRules { rules })
+}
+
+/// `name: value`, the way the header reads on the wire.
+fn parse_set(flag: &str, text: &str) -> std::result::Result<HeaderEdit, String> {
+    // Split at the first colon only: values contain them, names cannot.
+    let (name, value) = text.split_once(':').ok_or_else(|| {
+        format!(
+            "{flag} takes \"name: value\", and {text:?} has no colon in it. \
+             For example: {flag} \"authorization: Bearer abc123\"."
+        )
+    })?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("{flag} was given a value with no header name: {text:?}"));
+    }
+    Ok(HeaderEdit::Set {
+        name: name.to_string(),
+        // Only the space after the colon is punctuation; the rest of the value
+        // is the value, trailing spaces included, because a header that is being
+        // set deliberately should arrive as it was typed.
+        value: value.strip_prefix(' ').unwrap_or(value).to_string(),
+    })
+}
+
+fn parse_remove(flag: &str, text: &str) -> std::result::Result<HeaderEdit, String> {
+    let name = text.trim();
+    if name.is_empty() {
+        return Err(format!("{flag} needs a header name"));
+    }
+    if name.contains(':') {
+        return Err(format!(
+            "{flag} takes a header name on its own, not \"name: value\": {text:?}"
+        ));
+    }
+    Ok(HeaderEdit::Remove {
+        name: name.to_string(),
+    })
+}
+
+/// `host=target`, where the target is `host`, `host:port`, or a bracketed IPv6
+/// address with or without a port.
+fn parse_map_host(text: &str) -> std::result::Result<RewriteRule, String> {
+    let (from, to) = text.split_once('=').ok_or_else(|| {
+        format!(
+            "--map-host takes \"host=target\", and {text:?} has no = in it. \
+             For example: --map-host api.example.com=127.0.0.1:3000."
+        )
+    })?;
+    let from = from.trim();
+    if from.is_empty() {
+        return Err(format!("--map-host was given no host to match: {text:?}"));
+    }
+    Ok(RewriteRule {
+        hosts: vec![from.to_string()],
+        to: Some(parse_target(to.trim())?),
+        ..RewriteRule::default()
+    })
+}
+
+fn parse_target(text: &str) -> std::result::Result<DialTarget, String> {
+    let target = parse_target_parts(text)?;
+    // A port with nothing in front of it, "=:3000", parses cleanly and then
+    // fails much later as a connection to the empty host, which reads as a 502
+    // from an origin rather than as the typo it is.
+    if target.host.is_empty() {
+        return Err(format!(
+            "--map-host was given a port with no host in front of it: {text:?}. \
+             Name where the traffic should go, for example 127.0.0.1:3000."
+        ));
+    }
+    Ok(target)
+}
+
+fn parse_target_parts(text: &str) -> std::result::Result<DialTarget, String> {
+    if text.is_empty() {
+        return Err("--map-host was given nothing to send the traffic to".to_string());
+    }
+
+    // A bare IPv6 address is full of colons, so the brackets are what separate
+    // the address from a port.
+    if let Some(rest) = text.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("{text:?} opens a bracket it never closes"))?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) => Some(parse_port(port)?),
+            None if tail.is_empty() => None,
+            None => return Err(format!("{text:?} has something other than a port after the ]")),
+        };
+        return Ok(DialTarget {
+            host: host.to_string(),
+            port,
+        });
+    }
+
+    match text.rsplit_once(':') {
+        // Several colons and no brackets is an unbracketed IPv6 address, which
+        // has no port on it.
+        Some((head, _)) if head.contains(':') => Ok(DialTarget {
+            host: text.to_string(),
+            port: None,
+        }),
+        Some((host, port)) => Ok(DialTarget {
+            host: host.to_string(),
+            port: Some(parse_port(port)?),
+        }),
+        None => Ok(DialTarget {
+            host: text.to_string(),
+            port: None,
+        }),
+    }
+}
+
+fn parse_port(text: &str) -> std::result::Result<u16, String> {
+    text.parse::<u16>()
+        .map_err(|_| format!("{text:?} is not a port number"))
+}
+
+fn config_from(cli: &Cli) -> std::result::Result<Config, String> {
     let allow = host_list(&cli.only);
     let deny = host_list(&cli.skip);
     let mode = if cli.no_decrypt {
@@ -180,12 +372,23 @@ fn config_from(cli: &Cli) -> Config {
         DecryptMode::Allowlist
     };
 
-    Config {
+    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    // Naming a file is asking for an archive, so --archive-path on its own is
+    // enough and nobody has to pass both.
+    let archive_path = match (&cli.archive_path, cli.archive) {
+        (Some(path), _) => Some(path.clone()),
+        (None, true) => Some(default_archive_path(&data_dir)),
+        (None, false) => None,
+    };
+
+    Ok(Config {
         proxy_port: cli.port,
         ui_port: cli.ui_port,
-        data_dir: cli.data_dir.clone().unwrap_or_else(default_data_dir),
+        data_dir,
         max_flows: cli.max_flows,
+        archive_path,
         decrypt: DecryptRules { mode, allow, deny },
+        rewrite: rewrite_from(cli)?,
         upstream_http2: if cli.no_http2 {
             UpstreamHttp2::Never
         } else {
@@ -193,7 +396,7 @@ fn config_from(cli: &Cli) -> Config {
         },
         insecure_upstream: cli.insecure,
         ..Config::default()
-    }
+    })
 }
 
 /// Splits the comma separated host lists, dropping the empty entries a trailing
@@ -293,12 +496,45 @@ fn notes(status: &ServerStatus, config: &Config) -> String {
     if config.insecure_upstream {
         notes.push("Not verifying origin certificates.".to_string());
     }
+    if let Some(path) = &config.archive_path {
+        notes.push(format!("Recording finished flows to {}.", path.display()));
+    }
+    // Traffic being altered on the way through is the one thing here that makes
+    // the capture stop describing what the app would have done on its own, so it
+    // is never left to be discovered from a config file.
+    if !config.rewrite.is_empty() {
+        notes.push(format!("Rewriting traffic: {}.", rewrite_summary(config)));
+    }
 
     if notes.is_empty() {
         return String::new();
     }
     let body: String = notes.iter().map(|note| format!("  {note}\n")).collect();
     format!("\n{body}")
+}
+
+/// Every change the rules make, named. Header names rather than their values:
+/// the values are usually tokens, and a banner is the last place to print one.
+fn rewrite_summary(config: &Config) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for rule in &config.rewrite.rules {
+        if let Some(target) = &rule.to {
+            let host = rule.hosts.join(", ");
+            let port = match target.port {
+                Some(port) => format!(":{port}"),
+                None => String::new(),
+            };
+            parts.push(format!("{host} to {}{port}", target.host));
+        }
+        for edit in rule.request_headers.iter().chain(&rule.response_headers) {
+            let verb = match edit {
+                HeaderEdit::Set { .. } => "setting",
+                HeaderEdit::Remove { .. } => "removing",
+            };
+            parts.push(format!("{verb} {}", edit.name()));
+        }
+    }
+    parts.join(", ")
 }
 
 /// `host:port`, with an IPv6 literal bracketed so the line can be pasted into
@@ -328,6 +564,11 @@ mod tests {
         Cli::try_parse_from(argv).expect("these flags should parse")
     }
 
+    /// The config these flags produce, for the cases where it should build.
+    fn config_of(args: &[&str]) -> Config {
+        config_from(&cli(args)).expect("these flags should build a config")
+    }
+
     fn status(addresses: &[&str]) -> ServerStatus {
         ServerStatus {
             proxy_port: 54321,
@@ -337,12 +578,14 @@ mod tests {
             ca_not_after: "2035-08-05T00:00:00Z".to_string(),
             flow_count: 0,
             capturing: true,
+            archiving: false,
+            archive_dropped: 0,
         }
     }
 
     #[test]
     fn only_switches_decryption_to_an_allowlist() {
-        let config = config_from(&cli(&["--only", "api.example.com, *.foo.com"]));
+        let config = config_of(&["--only", "api.example.com, *.foo.com"]);
         assert_eq!(config.decrypt.mode, DecryptMode::Allowlist);
         assert_eq!(
             config.decrypt.allow,
@@ -354,14 +597,14 @@ mod tests {
     #[test]
     fn no_decrypt_turns_decryption_off_entirely() {
         assert_eq!(
-            config_from(&cli(&["--no-decrypt"])).decrypt.mode,
+            config_of(&["--no-decrypt"]).decrypt.mode,
             DecryptMode::None
         );
     }
 
     #[test]
     fn skip_fills_the_deny_list_and_leaves_the_mode_alone() {
-        let config = config_from(&cli(&["--skip", "*.bank.com,"]));
+        let config = config_of(&["--skip", "*.bank.com,"]);
         assert_eq!(config.decrypt.mode, DecryptMode::All);
         assert_eq!(
             config.decrypt.deny,
@@ -372,7 +615,7 @@ mod tests {
 
     #[test]
     fn the_remaining_flags_reach_the_config() {
-        let config = config_from(&cli(&[
+        let config = config_of(&[
             "--port",
             "1080",
             "--ui-port",
@@ -383,7 +626,7 @@ mod tests {
             "--insecure",
             "--data-dir",
             "/tmp/proxima-test",
-        ]));
+        ]);
         assert_eq!(config.proxy_port, 1080);
         assert_eq!(config.ui_port, 1081);
         assert_eq!(config.max_flows, 7);
@@ -401,6 +644,212 @@ mod tests {
             text.contains("--no-decrypt") && text.contains("--only"),
             "the error names neither flag, so nobody can act on it: {text}"
         );
+    }
+
+    #[test]
+    fn the_archive_is_off_unless_it_is_asked_for() {
+        assert_eq!(config_of(&[]).archive_path, None);
+
+        let default_place = config_of(&["--archive", "--data-dir", "/tmp/pd"]);
+        assert_eq!(
+            default_place.archive_path,
+            Some(PathBuf::from("/tmp/pd/capture.duckdb")),
+            "the bare flag has to land under the data directory it was given"
+        );
+
+        let named = config_of(&["--archive-path", "/tmp/one.duckdb"]);
+        assert_eq!(
+            named.archive_path,
+            Some(PathBuf::from("/tmp/one.duckdb")),
+            "naming a file is asking for an archive, so --archive should not also be needed"
+        );
+    }
+
+    /// The single rule the header flags collapse into, for the tests that only
+    /// care what ended up in it.
+    fn header_rule(args: &[&str]) -> RewriteRule {
+        config_of(args)
+            .rewrite
+            .rules
+            .first()
+            .cloned()
+            .expect("the header flags should have produced a rule")
+    }
+
+    #[test]
+    fn header_flags_become_one_rule_that_matches_everything() {
+        let rule = header_rule(&[
+            "--set-header",
+            "authorization: Bearer abc123",
+            "--remove-header",
+            "cookie",
+            "--set-response-header",
+            "access-control-allow-origin: *",
+            "--remove-response-header",
+            "set-cookie",
+        ]);
+
+        assert!(
+            rule.hosts.is_empty() && rule.methods.is_empty() && rule.path_prefix.is_none(),
+            "the header flags are meant to apply to everything"
+        );
+        assert_eq!(
+            rule.request_headers,
+            vec![
+                HeaderEdit::Set {
+                    name: "authorization".into(),
+                    value: "Bearer abc123".into(),
+                },
+                HeaderEdit::Remove {
+                    name: "cookie".into()
+                },
+            ]
+        );
+        assert_eq!(
+            rule.response_headers,
+            vec![
+                HeaderEdit::Set {
+                    name: "access-control-allow-origin".into(),
+                    value: "*".into(),
+                },
+                HeaderEdit::Remove {
+                    name: "set-cookie".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_space_after_the_colon_is_punctuation() {
+        // A value with colons in it, which is what a header full of URLs or a
+        // timestamp looks like, must survive whole.
+        let rule = header_rule(&["--set-header", "x-target: https://api.example.com:8443/v1"]);
+        assert_eq!(
+            rule.request_headers[0],
+            HeaderEdit::Set {
+                name: "x-target".into(),
+                value: "https://api.example.com:8443/v1".into(),
+            },
+            "the value was split on a colon that belonged to it"
+        );
+
+        // No space after the colon is just as legal.
+        let tight = header_rule(&["--set-header", "x-a:b"]);
+        assert_eq!(
+            tight.request_headers[0],
+            HeaderEdit::Set {
+                name: "x-a".into(),
+                value: "b".into()
+            }
+        );
+    }
+
+    #[test]
+    fn no_rewrite_flags_means_no_rules_at_all() {
+        assert!(
+            config_of(&[]).rewrite.is_empty(),
+            "a default run must not carry a rule that changes nothing"
+        );
+    }
+
+    #[test]
+    fn map_host_scopes_its_rule_to_the_host_it_names() {
+        let config = config_of(&["--map-host", "api.example.com=127.0.0.1:3000"]);
+        let rule = &config.rewrite.rules[0];
+        assert_eq!(rule.hosts, vec!["api.example.com"]);
+        assert_eq!(
+            rule.to,
+            Some(DialTarget {
+                host: "127.0.0.1".into(),
+                port: Some(3000),
+            })
+        );
+
+        // No port keeps whatever port the request was already going to.
+        let no_port = config_of(&["--map-host", "api.example.com=staging.internal"]);
+        assert_eq!(
+            no_port.rewrite.rules[0].to,
+            Some(DialTarget {
+                host: "staging.internal".into(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn an_ipv6_target_is_read_by_its_brackets() {
+        let bracketed = config_of(&["--map-host", "api.example.com=[::1]:3000"]);
+        assert_eq!(
+            bracketed.rewrite.rules[0].to,
+            Some(DialTarget {
+                host: "::1".into(),
+                port: Some(3000),
+            })
+        );
+
+        // Unbracketed, the colons are all address and there is no port.
+        let bare = config_of(&["--map-host", "api.example.com=fd00::1"]);
+        assert_eq!(
+            bare.rewrite.rules[0].to,
+            Some(DialTarget {
+                host: "fd00::1".into(),
+                port: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_rewrite_flag_says_what_it_wanted() {
+        let err = config_from(&cli(&["--set-header", "authorization"]))
+            .expect_err("a header with no colon cannot be a header");
+        assert!(err.contains("--set-header") && err.contains("name: value"), "{err}");
+
+        let err = config_from(&cli(&["--remove-header", "authorization: Bearer x"]))
+            .expect_err("removing takes a name, not a pair");
+        assert!(err.contains("not \"name: value\""), "{err}");
+
+        let err = config_from(&cli(&["--map-host", "api.example.com"]))
+            .expect_err("a mapping with no target is not a mapping");
+        assert!(err.contains("host=target"), "{err}");
+
+        let err = config_from(&cli(&["--map-host", "api.example.com=127.0.0.1:notaport"]))
+            .expect_err("that is not a port");
+        assert!(err.contains("not a port"), "{err}");
+    }
+
+    #[test]
+    fn a_target_with_no_host_is_refused_at_the_flag_rather_than_at_the_socket() {
+        // Each of these parses into something shaped like a target and would
+        // otherwise only fail on connect, surfacing as a 502 that looks like the
+        // origin's fault rather than like the typo it is.
+        for text in [
+            "api.example.com=:3000",
+            "api.example.com=",
+            "api.example.com=[]:3000",
+        ] {
+            let err = config_from(&cli(&["--map-host", text]))
+                .expect_err(&format!("{text:?} names nowhere to send the traffic"));
+            assert!(
+                err.contains("--map-host"),
+                "the error does not name the flag that was wrong: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_banner_says_what_is_being_rewritten() {
+        let config = config_of(&[
+            "--set-header",
+            "authorization: Bearer x",
+            "--map-host",
+            "api.example.com=127.0.0.1:3000",
+        ]);
+        let text = banner(&status(&["192.168.1.24"]), Path::new("/tmp/ca.crt"), &config);
+        assert!(
+            text.contains("Rewriting"),
+            "traffic is being altered and the banner does not say so: {text}"
+        );
+        assert!(text.contains("api.example.com"), "{text}");
     }
 
     #[test]
@@ -464,7 +913,7 @@ mod tests {
 
     #[test]
     fn the_banner_says_what_is_not_being_decrypted() {
-        let config = config_from(&cli(&["--skip", "*.bank.com", "--insecure"]));
+        let config = config_of(&["--skip", "*.bank.com", "--insecure"]);
         let text = banner(&status(&["192.168.1.24"]), Path::new("/tmp/ca.crt"), &config);
         assert!(text.contains("Not decrypting *.bank.com."));
         assert!(text.contains("Not verifying origin certificates."));

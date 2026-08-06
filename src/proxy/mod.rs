@@ -16,6 +16,7 @@ mod tunnel;
 
 pub mod forward;
 pub mod headers;
+pub mod rewrite;
 pub mod websocket;
 
 use std::convert::Infallible;

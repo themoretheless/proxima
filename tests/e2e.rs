@@ -16,7 +16,9 @@ use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use proxima::ca::CertAuthority;
 use proxima::capture::FlowStore;
-use proxima::config::{Config, DecryptMode, DecryptRules};
+use proxima::config::{
+    Config, DecryptMode, DecryptRules, HeaderEdit, RewriteRule, RewriteRules,
+};
 use proxima::proxy::{ProxyDeps, ProxyServer, SetupHandler};
 use proxima::types::{FlowKind, FlowState};
 use tokio::net::TcpListener;
@@ -50,6 +52,10 @@ impl Harness {
 }
 
 async fn start(deny: Vec<String>) -> Harness {
+    start_with(deny, RewriteRules::default()).await
+}
+
+async fn start_with(deny: Vec<String>, rewrite: RewriteRules) -> Harness {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let (origin_addr, origin_pem) = start_origin().await;
@@ -73,6 +79,7 @@ async fn start(deny: Vec<String>) -> Harness {
             allow: Vec::new(),
             deny,
         },
+        rewrite,
         ..Config::default()
     });
 
@@ -154,6 +161,16 @@ async fn handle_origin(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
+    // Echoed back so a test can assert on what actually arrived here, which is
+    // the only way to tell a header the proxy claims to have set apart from one
+    // it only recorded.
+    let seen: String = req
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            format!("{}: {}\n", name.as_str(), String::from_utf8_lossy(value.as_bytes()))
+        })
+        .collect();
     let body = req
         .into_body()
         .collect()
@@ -167,6 +184,12 @@ async fn handle_origin(
             .header("content-type", "application/json")
             .body(Full::new(body))
             .expect("echo response"),
+        (_, "/headers") => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain")
+            .header("x-origin-sent", "original")
+            .body(Full::new(Bytes::from(seen)))
+            .expect("headers response"),
         (_, "/hello") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain")
@@ -248,6 +271,179 @@ async fn https_through_the_proxy_is_decrypted_and_recorded() {
     // The point of terminating TLS ourselves is seeing these.
     assert!(flow.server.tls_version.is_some(), "no upstream TLS version recorded");
     assert!(flow.server.cert_fingerprint.is_some(), "no origin fingerprint recorded");
+}
+
+#[tokio::test]
+async fn rewrite_rules_reach_the_origin_and_the_client_and_are_recorded_as_sent() {
+    let harness = start_with(
+        Vec::new(),
+        RewriteRules {
+            rules: vec![RewriteRule {
+                request_headers: vec![
+                    HeaderEdit::Set {
+                        name: "x-injected".into(),
+                        value: "by the proxy".into(),
+                    },
+                    HeaderEdit::Set {
+                        name: "user-agent".into(),
+                        value: "Proxima/test".into(),
+                    },
+                    HeaderEdit::Remove {
+                        name: "x-strip-me".into(),
+                    },
+                ],
+                response_headers: vec![
+                    HeaderEdit::Set {
+                        name: "x-added-on-the-way-back".into(),
+                        value: "yes".into(),
+                    },
+                    HeaderEdit::Remove {
+                        name: "x-origin-sent".into(),
+                    },
+                ],
+                ..RewriteRule::default()
+            }],
+        },
+    )
+    .await;
+
+    let response = client(&harness)
+        .get(harness.origin_url("/headers"))
+        .header("x-strip-me", "please do")
+        .header("user-agent", "the app's own")
+        .send()
+        .await
+        .expect("request through the proxy");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-added-on-the-way-back")
+            .map(|v| v.to_str().unwrap()),
+        Some("yes"),
+        "a response header the rules add never reached the client"
+    );
+    assert!(
+        !response.headers().contains_key("x-origin-sent"),
+        "a response header the rules remove still reached the client"
+    );
+
+    // What the origin actually received, in its own words.
+    let seen = response.text().await.expect("body");
+    assert!(
+        seen.contains("x-injected: by the proxy"),
+        "the injected header never reached the origin:\n{seen}"
+    );
+    assert!(
+        !seen.contains("x-strip-me"),
+        "the removed header still reached the origin:\n{seen}"
+    );
+    assert!(
+        seen.contains("user-agent: Proxima/test") && !seen.contains("the app's own"),
+        "an overridden header must replace the original, not sit beside it:\n{seen}"
+    );
+
+    settle().await;
+    let flows = harness.store.all(&Default::default());
+    let flow = flows
+        .iter()
+        .find(|f| f.request.path == "/headers")
+        .expect("the request was never captured");
+
+    let header = |name: &str| {
+        flow.request
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        header("x-injected").as_deref(),
+        Some("by the proxy"),
+        "the capture shows the request as the client sent it, not as it went out"
+    );
+    assert!(
+        header("x-strip-me").is_none(),
+        "the capture kept a header that never left this machine"
+    );
+
+    let recorded_response = flow.response.as_ref().expect("no response recorded");
+    assert!(
+        recorded_response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-added-on-the-way-back")),
+        "the capture shows the response as the origin sent it, not as the client got it"
+    );
+
+    // The capture is honest about the wire, so the notes are the only thing
+    // separating a header the app sent from one this proxy invented.
+    assert!(
+        flow.rewrites.iter().any(|note| note.contains("x-injected")),
+        "nothing on the flow says the proxy altered it: {:?}",
+        flow.rewrites
+    );
+    assert!(flow
+        .rewrites
+        .iter()
+        .any(|note| note.contains("x-added-on-the-way-back")));
+}
+
+#[tokio::test]
+async fn a_mapped_host_is_answered_by_the_target_while_still_being_addressed_as_itself() {
+    // The origin listens on 127.0.0.1 and holds a certificate for "localhost".
+    // Nothing resolves api.example.test at all, which is the point: the client
+    // only ever names it, and the proxy is what decides where that goes.
+    let (origin_addr, origin_pem) = start_origin().await;
+    let harness = start_with(
+        Vec::new(),
+        RewriteRules {
+            rules: vec![RewriteRule {
+                hosts: vec!["api.example.test".into()],
+                to: Some(proxima::config::DialTarget {
+                    host: "127.0.0.1".into(),
+                    port: Some(origin_addr.port()),
+                }),
+                ..RewriteRule::default()
+            }],
+        },
+    )
+    .await;
+    let _ = origin_pem;
+
+    let response = client(&harness)
+        .get("https://api.example.test/headers")
+        .send()
+        .await
+        .expect("request through the proxy");
+    assert_eq!(response.status(), 200);
+
+    let seen = response.text().await.expect("body");
+    assert!(
+        seen.contains("host: api.example.test"),
+        "the target has to see the name the client asked for, or standing in for an origin is \
+         useless:\n{seen}"
+    );
+
+    settle().await;
+    let flows = harness.store.all(&Default::default());
+    let flow = flows
+        .iter()
+        .find(|f| f.request.path == "/headers")
+        .expect("the request was never captured");
+
+    assert_eq!(
+        flow.request.host, "api.example.test",
+        "the capture should record what was asked for"
+    );
+    assert!(
+        flow.rewrites
+            .iter()
+            .any(|note| note.contains(&format!("127.0.0.1:{}", origin_addr.port()))),
+        "nothing on the flow says where the request actually went: {:?}",
+        flow.rewrites
+    );
 }
 
 #[tokio::test]
