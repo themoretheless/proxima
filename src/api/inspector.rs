@@ -123,7 +123,8 @@ const BODY: &str = r#"<header>
         <span class="twist">▾</span><span class="shelf-name">Requests</span>
         <button id="hunt-live" class="icon" type="button" title="Search hosts and paths" aria-label="Search hosts and paths">⌕</button>
         <span class="sift"><button id="sift-live" class="icon" type="button"
-              title="Grouping and filters" aria-label="Grouping and filters">▽</button></span>
+              title="Grouping and filters" aria-label="Grouping and filters"
+              aria-haspopup="menu" aria-expanded="false">▽</button></span>
       </div>
       <input id="live-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
              placeholder="Host or path" aria-label="Search hosts and paths" hidden>
@@ -135,7 +136,8 @@ const BODY: &str = r#"<header>
         <span class="twist">▾</span><span class="shelf-name">Saved requests</span>
         <button id="hunt-saved" class="icon" type="button" title="Search saved requests" aria-label="Search saved requests">⌕</button>
         <span class="sift"><button id="sift-saved" class="icon" type="button"
-              title="Grouping" aria-label="Grouping">▽</button></span>
+              title="Grouping" aria-label="Grouping"
+              aria-haspopup="menu" aria-expanded="false">▽</button></span>
         <button id="new-book" class="icon" type="button" title="New collection" aria-label="New collection">+</button>
       </div>
       <input id="saved-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
@@ -479,7 +481,7 @@ main.composing.flat > #composer { grid-column: 1; }
   padding: 5px 9px 2px; color: var(--dim); font-size: 11px;
   letter-spacing: .06em; text-transform: uppercase;
 }
-.mhead + .mitem { margin-top: 0; }
+.mband { display: flex; flex-direction: column; }
 .mitem .tick { display: inline-block; width: 1.1rem; color: var(--accent); }
 .dmethod { font-weight: 700; color: var(--accent); }
 .durl { word-break: break-all; font-size: 12px; }
@@ -1033,8 +1035,12 @@ const SCRIPT: &str = r#"
     groups.clear();
     branches.clear();
     if (scope) { scopeTo(scope); }
-    rows.forEach(function (row, id) { perch(id); });
-    rows.forEach(function (row, id) { filterRow(row, id); });
+    // One pass: what a row is seated under and whether it shows are decisions
+    // about that row alone, so neither waits on the rest of them.
+    rows.forEach(function (row, id) {
+      perch(id);
+      filterRow(row, id);
+    });
     if (hostHunt !== '') { huntHosts(hostHunt); }
     tally();
   }
@@ -1519,13 +1525,17 @@ const SCRIPT: &str = r#"
     caret.type = 'button';
     caret.title = 'Other things to copy';
     caret.setAttribute('aria-label', 'Other things to copy');
+    caret.setAttribute('aria-haspopup', 'menu');
+    caret.setAttribute('aria-expanded', 'false');
 
     var menu = el('div', 'menu');
+    menu.setAttribute('role', 'menu');
     menu.hidden = true;
 
     function item(label, make) {
       var entry = el('button', 'mitem', label);
       entry.type = 'button';
+      entry.setAttribute('role', 'menuitem');
       entry.addEventListener('click', function () {
         shut();
         copyWhat(mark, make);
@@ -1554,6 +1564,7 @@ const SCRIPT: &str = r#"
       shut();
       menu.hidden = !open;
       caret.classList.toggle('on', open);
+      caret.setAttribute('aria-expanded', open ? 'true' : 'false');
       // Which menu is the open one is settled here rather than where it was
       // built: the page holds more than one, and the last one built is not
       // the one a click elsewhere has to close.
@@ -1574,7 +1585,10 @@ const SCRIPT: &str = r#"
 
   function shut() {
     if (openMenu) { openMenu.hidden = true; }
-    if (openCaret) { openCaret.classList.remove('on'); }
+    if (openCaret) {
+      openCaret.classList.remove('on');
+      openCaret.setAttribute('aria-expanded', 'false');
+    }
   }
 
   document.addEventListener('click', shut);
@@ -1942,11 +1956,23 @@ const SCRIPT: &str = r#"
     return labels.length;
   }
 
-  // A saved request holds whatever was typed into the URL box, which is not
-  // always a URL yet.
+  /* A saved request holds whatever was typed into the URL box, which is not
+     always a URL yet. `api.example.com/v1` is a host to anyone reading it and
+     nothing at all to the parser, so the scheme it was saved without is
+     supplied before giving up on it. What is left after that is a line that
+     names no host, and it is filed under saying so rather than under a host
+     invented for it. */
+
   function hostOf(url) {
-    try { return new URL(url).host || 'unknown host'; }
-    catch (error) { return 'unknown host'; }
+    var text = url.trim();
+    if (text === '') { return 'no host'; }
+    try { return new URL(text).host || 'no host'; }
+    catch (error) { /* try it as the host it looks like */ }
+    // Only where a scheme is missing rather than wrong: `ftp://x/y` parses,
+    // and `https://ftp://x/y` would be a second guess at an answered question.
+    if (text.indexOf('://') >= 0) { return 'no host'; }
+    try { return new URL('https://' + text).host || 'no host'; }
+    catch (error) { return 'no host'; }
   }
 
   function pileNode(label, held) {
@@ -2201,14 +2227,29 @@ const SCRIPT: &str = r#"
   function siftBox(buttonId, build) {
     var button = document.getElementById(buttonId);
     var menu = el('div', 'menu');
+    menu.setAttribute('role', 'menu');
     menu.hidden = true;
     button.parentNode.appendChild(menu);
 
-    function head(text) { menu.appendChild(el('span', 'mhead', text)); }
+    // The headings group the choices for the eye; the same grouping is spelled
+    // out for anything not reading with one.
+    var band = null;
 
+    function head(text) {
+      band = el('div', 'mband');
+      band.setAttribute('role', 'group');
+      band.setAttribute('aria-label', text);
+      band.appendChild(el('span', 'mhead', text));
+      menu.appendChild(band);
+    }
+
+    // One of a set rather than a switch of its own: what the tick says to the
+    // eye, the state says to a reader.
     function pick(label, on, take) {
       var entry = el('button', 'mitem');
       entry.type = 'button';
+      entry.setAttribute('role', 'menuitemradio');
+      entry.setAttribute('aria-checked', on ? 'true' : 'false');
       entry.appendChild(el('span', 'tick', on ? '✓' : ''));
       entry.appendChild(el('span', null, label));
       entry.addEventListener('click', function (event) {
@@ -2219,7 +2260,7 @@ const SCRIPT: &str = r#"
         take();
         rememberSift();
       });
-      menu.appendChild(entry);
+      (band || menu).appendChild(entry);
     }
 
     button.addEventListener('click', function (event) {
@@ -2230,9 +2271,11 @@ const SCRIPT: &str = r#"
       // Built at every opening, so the ticks describe the state as it is now
       // rather than as it was when the page loaded.
       strip(menu);
+      band = null;
       build(head, pick);
       menu.hidden = false;
       button.classList.add('on');
+      button.setAttribute('aria-expanded', 'true');
       openMenu = menu;
       openCaret = button;
     });
@@ -3005,6 +3048,69 @@ mod tests {
                 "a trimmed row must take everything held under its id: {gone}"
             );
         }
+    }
+
+    #[test]
+    fn a_menu_says_it_is_a_menu_and_whether_it_is_open() {
+        // A mark for a name and a tick for a state is all a menu here shows,
+        // and neither of them is anything to a reader that is not looking.
+        for control in ["id=\"sift-live\"", "id=\"sift-saved\""] {
+            let opens = BODY
+                .split_once(control)
+                .expect("the grouping buttons are still in the markup")
+                .1;
+            let button = opens.split_once('>').expect("the button still ends").0;
+            for said in ["aria-haspopup=\"menu\"", "aria-expanded=\"false\""] {
+                assert!(
+                    button.contains(said),
+                    "a button that opens a menu has to say so: {control} {said}"
+                );
+            }
+        }
+        assert_eq!(
+            SCRIPT.matches("setAttribute('aria-expanded', 'true')").count(),
+            1,
+            "one place opens a menu, and it is where the state is set"
+        );
+        let shut = SCRIPT
+            .split_once("function shut() {")
+            .expect("the script still closes menus")
+            .1;
+        assert!(
+            shut.contains("openCaret.setAttribute('aria-expanded', 'false');"),
+            "a menu closed by a click elsewhere has to stop saying it is open"
+        );
+        // The picks are one of a set rather than a switch each, which is what
+        // the tick beside them means and what the state has to say.
+        assert!(
+            SCRIPT.contains("entry.setAttribute('role', 'menuitemradio');")
+                && SCRIPT.contains("entry.setAttribute('aria-checked', on ? 'true' : 'false');"),
+            "an exclusive choice has to read as one"
+        );
+    }
+
+    #[test]
+    fn a_saved_url_is_filed_under_the_host_it_names() {
+        // The composer's own box takes what is typed, and what is typed is
+        // often a host without a scheme. Filed under a parse failure, most of
+        // a collection would end up in one heap called nothing in particular.
+        let host = SCRIPT
+            .split_once("function hostOf(url) {")
+            .expect("the script still reads a host out of a saved URL")
+            .1;
+        assert!(
+            host.contains("new URL('https://' + text).host"),
+            "a URL saved without a scheme still names a host"
+        );
+        assert!(
+            host.contains("if (text.indexOf('://') >= 0) { return 'no host'; }"),
+            "a scheme that is present and unusable must not be guessed at twice"
+        );
+        assert_eq!(
+            host.matches("'no host'").count(),
+            5,
+            "everything that names no host is filed as naming none"
+        );
     }
 
     #[test]
