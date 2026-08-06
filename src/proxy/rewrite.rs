@@ -100,14 +100,11 @@ fn apply_one(half: Half, edit: &HeaderEdit, headers: &mut HeaderMap) -> Option<S
             }
         }
         HeaderEdit::Remove { .. } => {
-            let count = headers.get_all(&name).iter().count();
-            if count == 0 {
-                return None;
-            }
-            headers.remove(&name);
-            // remove() takes one copy at a time, and a header can repeat.
-            while headers.remove(&name).is_some() {}
-            Some(format!("{} header {} removed", half.name(), name))
+            // remove() takes every value under the name, not just the first,
+            // which matters for the headers that repeat: Set-Cookie, Via.
+            headers
+                .remove(&name)
+                .map(|_| format!("{} header {} removed", half.name(), name))
         }
     }
 }

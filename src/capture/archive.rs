@@ -77,6 +77,36 @@ pub struct ArchiveRow {
     pub ws_messages: Option<u64>,
 }
 
+/// Why a query did not produce an answer.
+///
+/// Split by whose fault it is, because the caller has to turn this into a
+/// status code and the three cases do not mean the same thing to a client: one
+/// says fix the statement, one says try again, one says something here broke.
+#[derive(Debug)]
+pub enum QueryError {
+    /// The statement was refused, or the engine could not run it. The message
+    /// is the reason, and is meant to be read by whoever typed it.
+    Rejected(String),
+    /// The writer is saturated and queries are queued behind it. Nothing is
+    /// wrong with the request and the same one may work a moment later.
+    Busy,
+    /// The archive itself failed or went away.
+    Failed(String),
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryError::Rejected(message) | QueryError::Failed(message) => f.write_str(message),
+            QueryError::Busy => f.write_str(
+                "the archive is busy writing and cannot answer a query right now. Try again.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {}
+
 /// The answer to a query: column names, rows of JSON values, and whether the
 /// result was cut off at [`MAX_QUERY_ROWS`].
 #[derive(Debug, Clone, Serialize)]
@@ -143,11 +173,11 @@ mod imp {
 
         pub fn record(&self, _row: ArchiveRow) {}
 
-        pub async fn query(&self, _sql: String) -> Result<QueryResult> {
+        pub async fn query(&self, _sql: String) -> Result<QueryResult, QueryError> {
             unreachable!("an Archive cannot be constructed without the archive feature")
         }
 
-        pub async fn stats(&self) -> Result<serde_json::Value> {
+        pub async fn stats(&self) -> Result<serde_json::Value, QueryError> {
             unreachable!("an Archive cannot be constructed without the archive feature")
         }
 
@@ -170,7 +200,7 @@ mod imp {
 
     use std::path::PathBuf;
 
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{Context, Result};
     use duckdb::types::Value as DuckValue;
     use duckdb::{params, AccessMode, Config as DuckConfig, Connection};
     use serde_json::{json, Value};
@@ -310,33 +340,43 @@ mod imp {
             }
         }
 
-        /// Runs a read only statement. Rejects anything else without going near
-        /// the database, see [`is_read_only`].
-        pub async fn query(&self, sql: String) -> Result<QueryResult> {
+        /// Runs a read only statement.
+        ///
+        /// The keyword check in front is for the error message. What actually
+        /// keeps a write out is that the statement runs on a read-only
+        /// connection; see [`is_read_only`].
+        pub async fn query(&self, sql: String) -> Result<QueryResult, QueryError> {
             if !is_read_only(&sql) {
-                return Err(anyhow!(
-                    "the archive answers one read only statement at a time: SELECT, WITH, \
-                     DESCRIBE, SUMMARIZE, EXPLAIN or SHOW."
+                return Err(QueryError::Rejected(
+                    "the archive answers one read only statement at a time: SELECT, WITH, FROM, \
+                     TABLE, DESCRIBE, SUMMARIZE, EXPLAIN or SHOW."
+                        .to_string(),
                 ));
             }
             let (reply, answer) = oneshot::channel();
             self.submit(Job::Query { sql, reply })?;
             match answer.await {
                 Ok(Ok(result)) => Ok(result),
-                Ok(Err(message)) => Err(anyhow!(message)),
-                Err(_) => Err(anyhow!("the archive stopped before answering")),
+                Ok(Err(message)) => Err(QueryError::Rejected(message)),
+                Err(_) => Err(QueryError::Failed(
+                    "the archive stopped before answering".to_string(),
+                )),
             }
         }
 
         /// The canned report: totals, busiest hosts, status classes, slowest
         /// paths. What most people want the archive for, without writing SQL.
-        pub async fn stats(&self) -> Result<Value> {
+        pub async fn stats(&self) -> Result<Value, QueryError> {
             let (reply, answer) = oneshot::channel();
             self.submit(Job::Stats { reply })?;
             match answer.await {
                 Ok(Ok(value)) => Ok(value),
-                Ok(Err(message)) => Err(anyhow!(message)),
-                Err(_) => Err(anyhow!("the archive stopped before answering")),
+                // Nobody typed these queries, so a failure in one is this
+                // module's fault rather than the caller's.
+                Ok(Err(message)) => Err(QueryError::Failed(message)),
+                Err(_) => Err(QueryError::Failed(
+                    "the archive stopped before answering".to_string(),
+                )),
             }
         }
 
@@ -357,10 +397,8 @@ mod imp {
         /// was recorded before them. A full queue means the writer is saturated,
         /// and waiting behind thousands of pending inserts would look like a
         /// hang, so this refuses instead.
-        fn submit(&self, job: Job) -> Result<()> {
-            self.inner.jobs.try_send(job).map_err(|_| {
-                anyhow!("the archive is busy writing and cannot answer a query right now")
-            })
+        fn submit(&self, job: Job) -> Result<(), QueryError> {
+            self.inner.jobs.try_send(job).map_err(|_| QueryError::Busy)
         }
     }
 

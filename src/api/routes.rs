@@ -207,7 +207,7 @@ async fn query_archive(
     }
     match archive.query(request.sql).await {
         Ok(result) => Ok(Json(result).into_response()),
-        Err(err) => Err(bad_request(err.to_string())),
+        Err(err) => Err(archive_error(err)),
     }
 }
 
@@ -215,8 +215,21 @@ async fn archive_stats(State(state): State<ApiState>) -> Result<Response, ApiErr
     let archive = archive(&state)?;
     match archive.stats().await {
         Ok(stats) => Ok(Json(stats).into_response()),
-        Err(err) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+        Err(err) => Err(archive_error(err)),
     }
+}
+
+/// Whose fault it was, as a status code. A saturated writer is not a bad
+/// request: nothing about it was wrong and the same one may work in a moment,
+/// so it says so rather than sending a client off to debug its own SQL.
+fn archive_error(error: crate::capture::QueryError) -> ApiError {
+    use crate::capture::QueryError;
+    let status = match error {
+        QueryError::Rejected(_) => StatusCode::BAD_REQUEST,
+        QueryError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        QueryError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    ApiError::new(status, error.to_string())
 }
 
 fn archive(state: &ApiState) -> Result<&crate::capture::Archive, ApiError> {

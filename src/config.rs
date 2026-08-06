@@ -137,23 +137,29 @@ impl RewriteRules {
     }
 
     /// Every rule that applies to this request, in order.
-    pub fn matching(
-        &self,
-        host: &str,
-        method: &str,
-        path: &str,
-    ) -> impl Iterator<Item = &RewriteRule> + '_ {
-        let host = host.to_string();
-        let method = method.to_string();
-        let path = path.to_string();
+    ///
+    /// One lifetime across the borrows and the returned iterator, so the filter
+    /// can hold the strings it was given. Copying them into the closure instead
+    /// would allocate three times on a path that runs twice per flow.
+    pub fn matching<'a>(
+        &'a self,
+        host: &'a str,
+        method: &'a str,
+        path: &'a str,
+    ) -> impl Iterator<Item = &'a RewriteRule> + 'a {
         self.rules
             .iter()
-            .filter(move |rule| rule.matches(&host, &method, &path))
+            .filter(move |rule| rule.matches(host, method, path))
     }
 
     /// Where this request should actually be sent. The last matching rule that
     /// names a target wins, consistent with how the header edits stack.
-    pub fn dial_target(&self, host: &str, method: &str, path: &str) -> Option<&DialTarget> {
+    pub fn dial_target<'a>(
+        &'a self,
+        host: &'a str,
+        method: &'a str,
+        path: &'a str,
+    ) -> Option<&'a DialTarget> {
         self.matching(host, method, path)
             .filter_map(|rule| rule.to.as_ref())
             .last()

@@ -34,7 +34,7 @@ use crate::types::{
     WsDirection, WsMessage,
 };
 
-pub use archive::{Archive, ArchiveRow, QueryResult};
+pub use archive::{Archive, ArchiveRow, QueryError, QueryResult};
 pub use bodies::{BodyStore, BodyWriter};
 pub use decode::{decode_body, is_textual};
 pub use har::flows_to_har;
