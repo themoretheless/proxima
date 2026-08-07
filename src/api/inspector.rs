@@ -154,6 +154,16 @@ const BODY: &str = r#"<header>
       </div>
       <p id="no-books" class="pad hint">Nothing saved yet. Drag a live request here, copy one into a collection, or compose and save.</p>
     </div>
+    <div id="recent" class="part">
+      <div class="shelf" data-part="recent">
+        <span class="twist">▾</span><span class="shelf-name">Recent</span>
+        <button id="clear-recent" class="icon" type="button" title="Clear send history" aria-label="Clear send history">×</button>
+      </div>
+      <div class="tree-scroll">
+        <div id="recent-list" role="list" aria-label="Recent sends"></div>
+      </div>
+      <p id="no-recent" class="pad hint">Nothing sent yet. Compose and Send to fill this list.</p>
+    </div>
     <div id="tree-grip" role="separator" aria-orientation="vertical" aria-label="Resize tree" title="Drag to resize"></div>
   </section>
   <section id="list">
@@ -176,6 +186,8 @@ const BODY: &str = r#"<header>
         <option value="">No environment</option>
       </select>
       <button id="c-save" class="btn" type="button">Save</button>
+      <button id="c-history" class="btn" type="button"
+              title="Previous versions of this saved request">History</button>
     </div>
     <div class="c-line">
       <select id="c-method" aria-label="Method">
@@ -232,6 +244,17 @@ const BODY: &str = r#"<header>
       </button>
       <div class="c-fold-body" id="c-body-panel">
         <textarea id="c-body" spellcheck="false" aria-label="Body"></textarea>
+      </div>
+    </section>
+    <section class="c-fold" id="c-versions-wrap">
+      <button type="button" class="c-fold-bar" id="c-versions-toggle"
+              aria-expanded="true" aria-controls="c-versions">
+        <span class="twist">▾</span>
+        <span class="c-fold-name">History</span>
+        <span class="c-fold-meta" id="c-versions-meta"></span>
+      </button>
+      <div class="c-fold-body" id="c-versions">
+        <p class="hint">Open a saved request and Save a change to keep versions here.</p>
       </div>
     </section>
     <section class="c-fold" id="c-out-wrap">
@@ -392,6 +415,8 @@ const CSS: &str = r#"
   --line: light-dark(#e2dfd4, #3d3d3a);
   --hover: light-dark(#eeece3, #333331);
   --ink: light-dark(#1f1e1d, #f0eee6);
+  /* Strongest text: pure white on dark (base URL host/path). Dark near-black on light. */
+  --bright: light-dark(#141413, #ffffff);
   --dim: light-dark(#73716a, #a09d94);
   --accent: light-dark(#c96442, #d97757);
   --good: light-dark(#3d7f56, #7bc08d);
@@ -531,17 +556,30 @@ main.archiving.flat > #archiver { grid-column: 1; }
 .url-field > #c-url::placeholder {
   color: var(--dim); -webkit-text-fill-color: var(--dim); opacity: 1;
 }
-/* Token colours for the URL mirror. Separators stay dim so keys and host read first. */
-.url-mirror .u-scheme { color: var(--dim); }
-.url-mirror .u-sep { color: var(--dim); }
-.url-mirror .u-user { color: var(--warn); }
-.url-mirror .u-host { color: var(--accent); }
-.url-mirror .u-port { color: var(--dim); }
-.url-mirror .u-path { color: var(--ink); }
-.url-mirror .u-key { color: var(--info); }
-.url-mirror .u-val { color: var(--good); }
-.url-mirror .u-frag { color: var(--warn); }
-.url-mirror .u-var { color: var(--warn); }
+/* Token colours for coloured URLs: composer mirror, detail head, list path.
+   Base URL (host + path) is the whitest; query keys/values keep colour. */
+.url-mirror .u-scheme, .durl .u-scheme, .row .path .u-scheme { color: var(--dim); }
+.url-mirror .u-sep, .durl .u-sep, .row .path .u-sep { color: var(--dim); }
+.url-mirror .u-user, .durl .u-user, .row .path .u-user { color: var(--warn); }
+.url-mirror .u-host, .durl .u-host, .row .path .u-host {
+  color: var(--bright); font-weight: 600;
+}
+.url-mirror .u-port, .durl .u-port, .row .path .u-port { color: var(--dim); }
+.url-mirror .u-path, .durl .u-path, .row .path .u-path { color: var(--bright); }
+.url-mirror .u-key, .durl .u-key, .row .path .u-key { color: var(--info); }
+.url-mirror .u-val, .durl .u-val, .row .path .u-val { color: var(--good); }
+.url-mirror .u-frag, .durl .u-frag, .row .path .u-frag { color: var(--warn); }
+.url-mirror .u-var, .durl .u-var, .row .path .u-var { color: var(--warn); }
+/* Query key+value pair: hover or click selects both ends together. */
+.u-pair {
+  border-radius: 3px; cursor: default;
+  padding: 0 1px; margin: 0 -1px;
+}
+.u-pair:hover { background: var(--hover); }
+.u-pair.on {
+  background: var(--pick);
+  box-shadow: inset 0 -1px 0 var(--accent);
+}
 /* Composer folds: full-bleed under the URL row. Bar on --card with accent
    titles; editor body on --field so header and inputs are two clear layers. */
 .c-fold {
@@ -611,9 +649,38 @@ main.archiving.flat > #archiver { grid-column: 1; }
 }
 .c-params .c-params-x:hover { color: var(--bad); background: var(--hover); }
 .c-params tr.off td input[type="text"] { color: var(--dim); background: var(--bg); }
+/* Hover or focus on a param row lights key and value together. */
+.c-params tbody tr:hover td { background: var(--hover); }
+.c-params tbody tr:hover td input[type="text"] { background: var(--hover); }
+.c-params tbody tr:focus-within td,
+.c-params tbody tr.on td { background: var(--pick); }
+.c-params tbody tr:focus-within td input[type="text"],
+.c-params tbody tr.on td input[type="text"] { background: var(--pick); }
+.c-params tbody tr:focus-within td input[type="text"]:focus {
+  background: var(--bg); box-shadow: inset 0 0 0 1px var(--accent);
+}
+.c-params tbody tr.off:hover td input[type="text"],
+.c-params tbody tr.off:focus-within td input[type="text"],
+.c-params tbody tr.off.on td input[type="text"] { color: var(--dim); }
 /* Read-only query breakdown on a captured request (Request tab). */
 .qparams { margin: 0 0 12px; }
-.qparams .headers { margin-top: 4px; }
+.qparams .headers {
+  margin-top: 4px;
+  display: flex; flex-direction: column; gap: 1px;
+}
+/* Real rows (not display:contents) so hover/select can paint key+value as one. */
+.qparams .hrow {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 1px 10px;
+  padding: 3px 6px; margin: 0 -6px; border-radius: 5px;
+  cursor: default;
+}
+.qparams .hrow:hover { background: var(--hover); }
+.qparams .hrow.on {
+  background: var(--pick);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .qparams .hname { color: var(--info); }
 .qparams .hval { color: var(--good); }
 #composer select, #composer input, #composer textarea,
@@ -780,9 +847,19 @@ main.archiving.flat > #archiver { grid-column: 1; }
 .row:hover { background: var(--hover); }
 .row.on { background: var(--pick); }
 .row.pinned { box-shadow: inset 3px 0 0 var(--warn); }
-.row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Clip at the cell, not each nested token (path is painted as u-* spans). */
+.row > span, .row .hostname, .row .status {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.row .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .path > span { overflow: visible; text-overflow: clip; }
+.row .method { font-weight: 700; color: var(--accent); }
+.row .method.m-GET, .row .method.m-HEAD, .row .method.m-OPTIONS { color: var(--good); }
+.row .method.m-POST { color: var(--info); }
+.row .method.m-PUT, .row .method.m-PATCH { color: var(--warn); }
+.row .method.m-DELETE { color: var(--bad); }
 .row .host { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
-.row .hostname { min-width: 0; }
+.row .hostname { min-width: 0; color: var(--bright); font-weight: 600; }
 .pin {
   flex: none; display: inline-block; padding: 0 4px; border-radius: 3px;
   background: var(--warn); color: var(--pin-ink); font-size: 10px; font-weight: 700;
@@ -827,7 +904,7 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 /* Vertical scroll on the half. The tree is always the panel width: long names
    ellipsis rather than a sticky count rail that painted over the shelf buttons. */
 #live {
-  flex: 0 1 auto; max-height: 66%; min-height: 0;
+  flex: 0 1 auto; max-height: 50%; min-height: 0;
   overflow-x: hidden; overflow-y: auto;
 }
 #saved {
@@ -835,9 +912,15 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
   overflow-x: hidden; overflow-y: auto;
   border-top: 1px solid var(--line);
 }
-/* Folded live is only its shelf (border-bottom). Drop #saved's top edge or the
-   two rules stack into a double line under REQUESTS. */
-#live.shut + #saved {
+#recent {
+  flex: 0 1 auto; max-height: 33%; min-height: 0;
+  overflow-x: hidden; overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+/* Folded live is only its shelf (border-bottom). Drop the next part's top edge
+   or the two rules stack into a double line under REQUESTS. */
+#live.shut + #saved,
+#saved.shut + #recent {
   border-top: none;
 }
 .tree-scroll {
@@ -849,11 +932,31 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 /* Written against the ids on purpose: the shares above are set that way too,
    and a class alone loses to them, which leaves a folded half still holding
    the room it was given. Folded halves stack at the top instead. */
-#live.shut, #saved.shut { flex: none; max-height: none; overflow: hidden; }
+#live.shut, #saved.shut, #recent.shut { flex: none; max-height: none; overflow: hidden; }
 /* When live is folded, saved may use the rest of the column. Do not expand live
    when saved is folded: that pushed the SAVED REQUESTS bar to the bottom with
    a void under a short host list. */
 #tree:has(> #live.shut) > #saved:not(.shut) { flex: 1 1 0%; }
+/* Status badge on a Recent row (after the name, before the kill control). */
+.smeta {
+  flex: none; color: var(--dim); font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+/* Version rows inside the composer fold. */
+.vitem {
+  display: flex; gap: 8px; align-items: baseline;
+  padding: 4px 2px; cursor: default; font-size: 12px;
+  border-radius: 5px;
+}
+.vitem:hover { background: var(--hover); }
+.vwhen {
+  flex: none; width: 3.2rem; color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
+}
+.vname {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* Panel-wide content. --d tracks nest depth so indented rows still span the
    full right edge (count column stays put while the name indents). */
 #hosts {
@@ -1404,10 +1507,17 @@ const SCRIPT: &str = r#"
   }
 
   function paint(row, flow) {
-    row.querySelector('.method').textContent = str(flow.method);
+    var methodEl = row.querySelector('.method');
+    var method = str(flow.method);
+    methodEl.textContent = method;
+    // Method colour class (m-GET, m-POST, …); unknown verbs keep .method accent.
+    methodEl.className = 'method' + (method
+      ? (' m-' + method.toUpperCase().replace(/[^A-Z0-9+-]/g, ''))
+      : '');
     row.querySelector('.hostname').textContent = str(flow.authority);
     row.querySelector('.pin').hidden = !flow.likelyPinning;
-    row.querySelector('.path').textContent = str(flow.path);
+    // Same path/query token colours as the detail URL and composer field.
+    fillUrlTokens(row.querySelector('.path'), str(flow.path));
     row.querySelector('.mock').hidden = !flow.mocked;
     row.querySelector('.status').textContent = statusLabel(flow);
     row.querySelector('.size').textContent = size(flow.responseSize);
@@ -2143,7 +2253,9 @@ const SCRIPT: &str = r#"
     // Method only in the head: HTTP version lives under Info (and in the list
     // tooltip), not glued to GET as "GET 2.0".
     head.appendChild(el('span', 'dmethod', str(request.method)));
-    var durl = el('span', 'durl mono', str(request.url));
+    // Same token colours as the composer URL field (scheme/host/path/query).
+    var durl = el('span', 'durl mono');
+    fillUrlTokens(durl, str(request.url));
     // Same drag source as list rows: pull the detail URL onto a collection.
     if (flow.id && request.url) {
       durl.title = 'Drag onto a collection to save';
@@ -2300,6 +2412,14 @@ const SCRIPT: &str = r#"
       var line = el('div', 'hrow');
       line.appendChild(el('span', 'hname', str(rows[i].key)));
       line.appendChild(el('span', 'hval', str(rows[i].value)));
+      line.title = 'Highlight this parameter';
+      line.addEventListener('click', function (event) {
+        var row = event.currentTarget;
+        var was = row.classList.contains('on');
+        var sibs = grid.querySelectorAll('.hrow.on');
+        for (var s = 0; s < sibs.length; s++) { sibs[s].classList.remove('on'); }
+        if (!was) { row.classList.add('on'); }
+      });
       grid.appendChild(line);
     }
     block.appendChild(grid);
@@ -4368,17 +4488,57 @@ const SCRIPT: &str = r#"
   var urlIn = document.getElementById('c-url');
   var urlMirror = document.getElementById('c-url-mirror');
 
+  /* Paint scheme, host, path and query as coloured spans. Used by the
+     composer mirror, detail head and list path. Spans only: text never
+     reaches the HTML parser. Query key[=value] groups into .u-pair so
+     hover/click lights the parameter and its value together. */
+  function fillUrlTokens(into, text) {
+    if (!into) { return; }
+    strip(into);
+    if (!text) { return; }
+    var parts = tokenizeUrl(text);
+    var i = 0;
+    while (i < parts.length) {
+      if (parts[i].cls === 'u-key') {
+        var pair = el('span', 'u-pair');
+        pair.appendChild(el('span', parts[i].cls, parts[i].text));
+        i += 1;
+        // Optional =value right after the key.
+        if (i < parts.length && parts[i].cls === 'u-sep' && parts[i].text === '=') {
+          pair.appendChild(el('span', parts[i].cls, parts[i].text));
+          i += 1;
+          if (i < parts.length && parts[i].cls === 'u-val') {
+            pair.appendChild(el('span', parts[i].cls, parts[i].text));
+            i += 1;
+          }
+        }
+        wireUrlPair(pair, into);
+        into.appendChild(pair);
+        continue;
+      }
+      into.appendChild(el('span', parts[i].cls, parts[i].text));
+      i += 1;
+    }
+  }
+
+  // Click selects one pair at a time inside its URL cell; second click clears.
+  function wireUrlPair(pair, root) {
+    pair.title = 'Highlight this parameter';
+    pair.addEventListener('click', function (event) {
+      // Keep the list row from changing selection when picking a query param.
+      event.stopPropagation();
+      var was = pair.classList.contains('on');
+      var all = root.querySelectorAll('.u-pair.on');
+      for (var j = 0; j < all.length; j++) { all[j].classList.remove('on'); }
+      if (!was) { pair.classList.add('on'); }
+    });
+  }
+
   /* Paint scheme, host, path and query parameters under the transparent URL
      input. Spans only: captured or typed text never reaches the HTML parser. */
   function paintUrlMirror() {
     if (!urlMirror || !urlIn) { return; }
-    strip(urlMirror);
-    var text = urlIn.value;
-    if (!text) { return; }
-    var parts = tokenizeUrl(text);
-    for (var i = 0; i < parts.length; i++) {
-      urlMirror.appendChild(el('span', parts[i].cls, parts[i].text));
-    }
+    fillUrlTokens(urlMirror, urlIn.value);
     urlMirror.scrollLeft = urlIn.scrollLeft;
   }
 
@@ -4731,6 +4891,20 @@ const SCRIPT: &str = r#"
       writeUrlFromParams();
     }
 
+    // Clicking the row (not only an input) marks it so key and value stay lit.
+    tr.addEventListener('click', function (event) {
+      if (event.target === drop || (event.target && event.target.classList
+          && event.target.classList.contains('c-params-x'))) {
+        return;
+      }
+      var was = tr.classList.contains('on');
+      if (paramsBody) {
+        var lit = paramsBody.querySelectorAll('tr.on');
+        for (var s = 0; s < lit.length; s++) { lit[s].classList.remove('on'); }
+      }
+      if (!was) { tr.classList.add('on'); }
+    });
+
     function dropBtnFor(node) {
       if (node.querySelector('.c-params-x')) { return; }
       var cell = node.querySelector('td.c-params-drop');
@@ -4834,6 +5008,7 @@ const SCRIPT: &str = r#"
   var paramsFold = null;
   var headersFold = null;
   var bodyFold = null;
+  var versionsFold = null;
   var outFold = null;
 
   function wireFold(wrapId, storageKey) {
@@ -4912,6 +5087,7 @@ const SCRIPT: &str = r#"
   paramsFold = wireFold('c-params-wrap', 'proxima.compose.params-shut');
   headersFold = wireFold('c-headers-wrap', 'proxima.compose.headers-shut');
   bodyFold = wireFold('c-body-wrap', 'proxima.compose.body-shut');
+  versionsFold = wireFold('c-versions-wrap', 'proxima.compose.versions-shut');
   outFold = wireFold('c-out-wrap', 'proxima.compose.out-shut');
   dressParamsMeta();
   dressHeadersMeta();
@@ -5246,6 +5422,8 @@ const SCRIPT: &str = r#"
       } else {
         pre.textContent = shown;
       }
+      // Successful send is recorded server-side; refresh the Recent shelf.
+      loadRecent();
     } catch (error) {
       strip(outEl);
       dressOutMeta('error');
@@ -5289,6 +5467,9 @@ const SCRIPT: &str = r#"
      that sends anything. */
 
   var books = [];
+  // Id of the saved request currently open in the composer. Empty means the
+  // next Save is a new entry; non-empty means overwrite that one in place.
+  var editingSavedId = '';
 
   async function loadBooks() {
     try {
@@ -5299,6 +5480,7 @@ const SCRIPT: &str = r#"
     }
     paintBooks();
     loadEnvironments();
+    paintVersions();
   }
 
   var environments = [];
@@ -5532,13 +5714,21 @@ const SCRIPT: &str = r#"
     });
     item.appendChild(kill);
 
-    item.addEventListener('click', function () { openSaved(saved); });
+    item.addEventListener('click', function () { openSaved(book, saved); });
     return item;
   }
 
-  // Straight into the composer, which is where a saved request is of any use.
-  function openSaved(saved) {
-    var spec = saved.spec || {};
+  // Fill composer fields from a name + SendSpec-shaped object.
+  // `opts.savedId` (string|''): set editingSavedId; omit to leave it alone.
+  // `opts.bookId`: select that collection in #c-book.
+  // `opts.clearOut` (default true): wipe the response pane.
+  function fillComposer(name, spec, opts) {
+    opts = opts || {};
+    spec = spec || {};
+    if (opts.savedId !== undefined) { editingSavedId = str(opts.savedId); }
+    if (opts.bookId) {
+      document.getElementById('c-book').value = opts.bookId;
+    }
     document.getElementById('c-method').value = str(spec.method) || 'GET';
     // urlIn is #c-url; paint + params table after so both match the value.
     urlIn.value = str(spec.url);
@@ -5552,16 +5742,113 @@ const SCRIPT: &str = r#"
     }
     if (bodyIn) { bodyIn.value = body; }
     else { document.getElementById('c-body').value = body; }
-    document.getElementById('c-name').value = str(saved.name);
+    document.getElementById('c-name').value = str(name);
+    if (spec.environmentId != null && document.getElementById('c-env')) {
+      document.getElementById('c-env').value = str(spec.environmentId);
+    }
     dressHeadersMeta();
     dressBodyMeta();
-    // The answer on screen belongs to the request that was open a moment ago.
-    // Left up, it reads as the answer to this one, and it is convincing: same
-    // shape, same pane, only the URL above it has changed.
-    strip(outEl);
-    dressOutMeta('');
-    outEl.appendChild(el('p', 'hint', 'Send a request to see the response here.'));
+    if (opts.clearOut !== false) {
+      // The answer on screen belongs to the request that was open a moment ago.
+      // Left up, it reads as the answer to this one, and it is convincing: same
+      // shape, same pane, only the URL above it has changed.
+      strip(outEl);
+      dressOutMeta('');
+      outEl.appendChild(el('p', 'hint', 'Send a request to see the response here.'));
+    }
+    paintVersions();
     composing(true);
+  }
+
+  // Straight into the composer, which is where a saved request is of any use.
+  function openSaved(book, saved) {
+    fillComposer(str(saved.name), saved.spec || {}, {
+      savedId: str(saved.id),
+      bookId: book && book.id ? book.id : ''
+    });
+  }
+
+  function findEditingSaved() {
+    if (!editingSavedId) { return null; }
+    for (var i = 0; i < books.length; i++) {
+      var reqs = books[i].requests || [];
+      for (var r = 0; r < reqs.length; r++) {
+        if (reqs[r].id === editingSavedId) { return reqs[r]; }
+      }
+    }
+    return null;
+  }
+
+  function formatVersionWhen(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) { return '--:--'; }
+    var d = new Date(n);
+    var hh = d.getHours();
+    var mm = d.getMinutes();
+    return (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+  }
+
+  function paintVersions() {
+    var box = document.getElementById('c-versions');
+    var meta = document.getElementById('c-versions-meta');
+    var histBtn = document.getElementById('c-history');
+    if (!box) { return; }
+    strip(box);
+    var saved = findEditingSaved();
+    var history = saved && Array.isArray(saved.history) ? saved.history : [];
+    var n = history.length;
+    if (meta) {
+      meta.textContent = n
+        ? (n + (n === 1 ? ' version' : ' versions'))
+        : '';
+    }
+    // History button next to Save: same count, always clickable (opens the fold).
+    if (histBtn) {
+      histBtn.textContent = n ? ('History (' + n + ')') : 'History';
+      if (!editingSavedId) {
+        histBtn.title = 'Open a saved request to see its history';
+      } else if (!n) {
+        histBtn.title = 'No previous versions yet; Save a change to keep one';
+      } else {
+        histBtn.title = n + ' previous version' + (n === 1 ? '' : 's');
+      }
+    }
+    if (!editingSavedId) {
+      box.appendChild(el('p', 'hint',
+        'Open a saved request and Save a change to keep versions here.'));
+      return;
+    }
+    if (!history.length) {
+      box.appendChild(el('p', 'hint',
+        'No versions yet. Save a change to keep the previous one here.'));
+      return;
+    }
+    for (var i = 0; i < history.length; i++) {
+      (function (rev) {
+        var spec = rev.spec || {};
+        var item = el('div', 'vitem');
+        item.appendChild(el('span', 'vwhen', formatVersionWhen(rev.atMs)));
+        var label = str(rev.name) || (str(spec.method) + ' ' + str(spec.url));
+        item.appendChild(el('span', 'vname', label));
+        item.title = 'Load this version into the composer';
+        item.addEventListener('click', function () {
+          // Keep editingSavedId so the next Save overwrites current and the
+          // store pushes that current into history.
+          fillComposer(str(rev.name), spec, { savedId: editingSavedId });
+        });
+        box.appendChild(item);
+      })(history[i]);
+    }
+  }
+
+  // History button: open the versions fold and bring it into view.
+  function showHistory() {
+    paintVersions();
+    if (versionsFold) { versionsFold.open(); }
+    var wrap = document.getElementById('c-versions-wrap');
+    if (wrap && wrap.scrollIntoView) {
+      wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
   }
 
   function fillBookChoices() {
@@ -5582,12 +5869,34 @@ const SCRIPT: &str = r#"
     if (!choose.value) { choose.value = books.length ? books[0].id : ''; }
   }
 
+  // History is owned by the store. Only id/name/spec go on the wire so a
+  // client-side empty history array cannot wipe revisions on the server.
+  function bookForPut(book) {
+    var requests = [];
+    var all = book.requests || [];
+    for (var i = 0; i < all.length; i++) {
+      requests.push({
+        id: all[i].id || '',
+        name: all[i].name || '',
+        spec: all[i].spec || {}
+      });
+    }
+    return {
+      id: book.id || '',
+      name: book.name || '',
+      requests: requests
+    };
+  }
+
   async function putBook(book) {
-    var url = book.id ? '/api/collections/' + encodeURIComponent(book.id) : '/api/collections';
+    var payload = bookForPut(book);
+    var url = payload.id
+      ? '/api/collections/' + encodeURIComponent(payload.id)
+      : '/api/collections';
     var response = await fetch(url, {
-      method: book.id ? 'PUT' : 'POST',
+      method: payload.id ? 'PUT' : 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(book),
+      body: JSON.stringify(payload),
       cache: 'no-store'
     });
     if (!response.ok) { throw new Error('the server answered ' + response.status); }
@@ -5605,8 +5914,8 @@ const SCRIPT: &str = r#"
 
     var bodyText = document.getElementById('c-body').value;
     var saved = {
-      // The store mints the id: an empty one is its word for new.
-      id: '',
+      // Empty id = new; a known id replaces that request instead of appending.
+      id: editingSavedId || '',
       name: document.getElementById('c-name').value.trim() || url,
       spec: {
         method: document.getElementById('c-method').value,
@@ -5622,13 +5931,59 @@ const SCRIPT: &str = r#"
       if (books[i].id === chosen) { book = books[i]; }
     }
     if (!book) { book = { id: '', name: 'Saved requests', requests: [] }; }
-    book.requests = (book.requests || []).concat([saved]);
+
+    var requests = (book.requests || []).slice();
+    var replaced = false;
+    if (saved.id) {
+      for (var r = 0; r < requests.length; r++) {
+        if (requests[r].id === saved.id) {
+          requests[r] = saved;
+          replaced = true;
+          break;
+        }
+      }
+      // Id known but not in this collection: drop it from every other book so
+      // Save with a different collection selected moves rather than clones.
+      if (!replaced) {
+        for (var b = 0; b < books.length; b++) {
+          if (books[b].id === book.id) { continue; }
+          var others = books[b].requests || [];
+          var kept = [];
+          var moved = false;
+          for (var o = 0; o < others.length; o++) {
+            if (others[o].id === saved.id) { moved = true; }
+            else { kept.push(others[o]); }
+          }
+          if (moved) {
+            books[b].requests = kept;
+            try { await putBook(books[b]); } catch (error) { /* best effort */ }
+          }
+        }
+        requests.push(saved);
+        replaced = true;
+      }
+    }
+    if (!replaced) { requests.push(saved); }
+    book.requests = requests;
 
     strip(out);
     try {
-      await putBook(book);
+      var result = await putBook(book);
       await loadBooks();
-      out.appendChild(el('p', 'hint', 'Saved as ' + saved.name + '.'));
+      // Keep editing the same request so a second Save overwrites, not clones.
+      editingSavedId = saved.id;
+      if (!editingSavedId && result && Array.isArray(result.requests)) {
+        for (var j = result.requests.length - 1; j >= 0; j--) {
+          if (result.requests[j].name === saved.name) {
+            editingSavedId = str(result.requests[j].id);
+            break;
+          }
+        }
+      }
+      paintVersions();
+      out.appendChild(el('p', 'hint', replaced && saved.id
+        ? ('Updated ' + saved.name + '.')
+        : ('Saved as ' + saved.name + '.')));
     } catch (error) {
       out.appendChild(el('p', 'hint', 'Could not save it: ' + error.message));
     }
@@ -6299,6 +6654,10 @@ const SCRIPT: &str = r#"
   }
 
   document.getElementById('c-save').addEventListener('click', saveComposed);
+  var historyBtn = document.getElementById('c-history');
+  if (historyBtn) {
+    historyBtn.addEventListener('click', showHistory);
+  }
   document.getElementById('new-book').addEventListener('click', async function (event) {
     // The bar it sits on folds the section, which is not what was asked for.
     event.stopPropagation();
@@ -6310,7 +6669,104 @@ const SCRIPT: &str = r#"
       noBooksEl.textContent = 'Could not add a collection: ' + error.message;
     }
   });
+
+  /* ---------------------------------------------------------------- */
+  /* recent sends (composer history)                                   */
+  /* ---------------------------------------------------------------- */
+
+  var recentSends = [];
+  var recentListEl = document.getElementById('recent-list');
+  var noRecentEl = document.getElementById('no-recent');
+
+  async function loadRecent() {
+    try {
+      var got = await getJson('/api/send-history');
+      recentSends = Array.isArray(got) ? got : [];
+    } catch (error) {
+      recentSends = [];
+    }
+    paintRecent();
+  }
+
+  function paintRecent() {
+    if (!recentListEl) { return; }
+    strip(recentListEl);
+    if (noRecentEl) { noRecentEl.hidden = recentSends.length > 0; }
+    for (var i = 0; i < recentSends.length; i++) {
+      recentListEl.appendChild(recentNode(recentSends[i]));
+    }
+  }
+
+  function recentNode(entry) {
+    var spec = entry.spec || {};
+    var item = el('div', 'sitem');
+    item.appendChild(el('span', 'smethod', str(spec.method) || 'GET'));
+    item.appendChild(el('span', 'sname', str(entry.name) || str(spec.url)));
+    if (entry.status != null && entry.status !== '') {
+      item.appendChild(el('span', 'smeta', str(entry.status)));
+    }
+    var kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = 'Remove from recent';
+    kill.setAttribute('aria-label', 'Remove from recent');
+    kill.addEventListener('click', function (event) {
+      event.stopPropagation();
+      dropRecent(entry);
+    });
+    item.appendChild(kill);
+    item.addEventListener('click', function () { openRecent(entry); });
+    return item;
+  }
+
+  function openRecent(entry) {
+    // A past send is a draft, not an overwrite of whatever saved request was open.
+    fillComposer(str(entry.name), entry.spec || {}, { savedId: '' });
+  }
+
+  async function dropRecent(entry) {
+    if (!entry || !entry.id) { return; }
+    try {
+      var response = await fetch('/api/send-history/' + encodeURIComponent(entry.id), {
+        method: 'DELETE',
+        cache: 'no-store'
+      });
+      if (!response.ok) { throw new Error('the server answered ' + response.status); }
+      await loadRecent();
+    } catch (error) {
+      if (noRecentEl) {
+        noRecentEl.hidden = false;
+        noRecentEl.textContent = 'Could not remove that: ' + error.message;
+      }
+    }
+  }
+
+  async function clearRecent() {
+    try {
+      var response = await fetch('/api/send-history', {
+        method: 'DELETE',
+        cache: 'no-store'
+      });
+      if (!response.ok) { throw new Error('the server answered ' + response.status); }
+      await loadRecent();
+    } catch (error) {
+      if (noRecentEl) {
+        noRecentEl.hidden = false;
+        noRecentEl.textContent = 'Could not clear recent: ' + error.message;
+      }
+    }
+  }
+
+  var clearRecentBtn = document.getElementById('clear-recent');
+  if (clearRecentBtn) {
+    clearRecentBtn.addEventListener('click', function (event) {
+      event.stopPropagation();
+      clearRecent();
+    });
+  }
+
   loadBooks();
+  loadRecent();
+  paintVersions();
   loadRules();
   loadPauses();
 
@@ -6455,7 +6911,7 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 23] = [
+    const KNOWN_PATHS: [&str; 25] = [
         "/api/flows",
         "/api/flows?",
         "/api/flows/",
@@ -6463,6 +6919,8 @@ mod tests {
         "/api/json/view",
         "/api/stream",
         "/api/send",
+        "/api/send-history",
+        "/api/send-history/",
         "/api/collections",
         "/api/collections/",
         "/api/environments",
@@ -6882,7 +7340,11 @@ mod tests {
 
     #[test]
     fn both_halves_of_the_column_carry_a_bar_and_fold_away() {
-        for shelf in ["data-part=\"live\"", "data-part=\"saved\""] {
+        for shelf in [
+            "data-part=\"live\"",
+            "data-part=\"saved\"",
+            "data-part=\"recent\"",
+        ] {
             assert!(
                 BODY.contains(shelf),
                 "each half of the column needs a bar of its own: {shelf}"
@@ -6897,7 +7359,7 @@ mod tests {
         // as well. A class alone loses, and the folded half goes on holding the
         // room it was given, which is a bar with a hole under it.
         assert!(
-            CSS.contains("#live.shut, #saved.shut { flex: none;"),
+            CSS.contains("#live.shut, #saved.shut, #recent.shut { flex: none;"),
             "a folded half must give its share of the column back"
         );
         // Panel-wide rows; absolute count rail; star replaces digit on pin hover.
@@ -7282,6 +7744,8 @@ mod tests {
 
     /// Composer URL box paints scheme, host, path and query under a transparent
     /// input so the caret stays real while tokens take colour. Mirror spans only.
+    /// The detail head reuses the same tokenizer so a selected flow's URL is
+    /// coloured the same way (not plain mono).
     #[test]
     fn composer_url_field_paints_tokens_under_a_transparent_input() {
         assert!(
@@ -7296,10 +7760,52 @@ mod tests {
             "URL mirror token colours and transparent input text must stay wired"
         );
         assert!(
+            CSS.contains(".durl .u-host")
+                && CSS.contains(".durl .u-key")
+                && CSS.contains(".durl .u-val"),
+            "detail head URL must share the same token colours as the composer"
+        );
+        assert!(
+            CSS.contains(".row .path .u-host")
+                && CSS.contains(".row .path .u-key")
+                && CSS.contains(".row .path .u-val"),
+            "list path column must share the same token colours as the composer"
+        );
+        assert!(
+            CSS.contains(".row .method.m-GET")
+                && CSS.contains(".row .hostname")
+                && CSS.contains("color: var(--accent)"),
+            "list method and host must be coloured, not plain mono ink"
+        );
+        assert!(
             SCRIPT.contains("function tokenizeUrl(raw)")
                 && SCRIPT.contains("function paintUrlMirror()")
+                && SCRIPT.contains("function fillUrlTokens(into, text)")
                 && SCRIPT.contains("paintUrlMirror();"),
             "typing and openSaved must repaint the URL mirror from tokenizeUrl"
+        );
+        assert!(
+            SCRIPT.contains("fillUrlTokens(durl, str(request.url))"),
+            "detail head must paint the request URL through the shared tokenizer"
+        );
+        assert!(
+            SCRIPT.contains("fillUrlTokens(row.querySelector('.path'), str(flow.path))")
+                || SCRIPT.contains("fillUrlTokens(row.querySelector(\".path\"), str(flow.path))"),
+            "list paint must colour the path column through the shared tokenizer"
+        );
+        assert!(
+            SCRIPT.contains("u-pair")
+                && SCRIPT.contains("function wireUrlPair(pair, root)")
+                && CSS.contains(".u-pair:hover")
+                && CSS.contains(".u-pair.on"),
+            "query key=value must group into hover/select pairs"
+        );
+        assert!(
+            CSS.contains(".c-params tbody tr:hover")
+                && CSS.contains(".c-params tbody tr:focus-within")
+                && CSS.contains(".qparams .hrow:hover")
+                && CSS.contains(".qparams .hrow.on"),
+            "query-parameter tables must light key and value on hover or select"
         );
         // {{var}} and query keys/values are the reason this is more than host colour.
         assert!(
@@ -7340,14 +7846,14 @@ mod tests {
                 && SCRIPT.contains("function buildQueryString(rows)"),
             "URL and table must round-trip through parse/build helpers"
         );
-        // openSaved loads a URL that may already carry a query; the table has to
-        // fill without waiting for a keystroke.
-        let open = SCRIPT
-            .split_once("function openSaved(saved) {")
-            .expect("the script still opens a saved request")
+        // fillComposer (used by openSaved) loads a URL that may already carry a
+        // query; the table has to fill without waiting for a keystroke.
+        let fill = SCRIPT
+            .split_once("function fillComposer(name, spec, opts) {")
+            .expect("the script still fills the composer from a saved or recent request")
             .1;
         assert!(
-            open.contains("syncParamsFromUrl();"),
+            fill.contains("syncParamsFromUrl();"),
             "opening a saved request must fill the params table from its URL"
         );
         // {{var}} must survive encode for environment send.
@@ -7374,28 +7880,99 @@ mod tests {
             );
         }
         assert!(
-            SCRIPT.contains("id: '',"),
-            "the store mints request ids, and an empty one is how it is asked to"
+            SCRIPT.contains("id: editingSavedId || '',")
+                || SCRIPT.contains("id: editingSavedId || \"\","),
+            "save must reuse the open request's id when set, else empty for the store to mint"
         );
-        let open = SCRIPT
-            .split_once("function openSaved(saved) {")
-            .expect("the script still opens a saved request")
+        assert!(
+            SCRIPT.contains("var editingSavedId"),
+            "composer must remember which saved request is open so Save can overwrite"
+        );
+        assert!(
+            SCRIPT.contains("function openSaved(book, saved) {")
+                && SCRIPT.contains("fillComposer(str(saved.name), saved.spec || {}, {"),
+            "openSaved must load the saved request through fillComposer"
+        );
+        let fill = SCRIPT
+            .split_once("function fillComposer(name, spec, opts) {")
+            .expect("the script still fills the composer")
             .1;
         for filled in ["c-method", "c-url", "c-headers", "c-body"] {
             assert!(
-                open.contains(filled),
+                fill.contains(filled),
                 "opening a saved request has to fill {filled}"
             );
         }
         assert!(
-            open.contains("composing(true);"),
+            fill.contains("editingSavedId") || SCRIPT.contains("savedId: str(saved.id)"),
+            "opening a saved request must record its id for the next Save"
+        );
+        assert!(
+            fill.contains("composing(true);"),
             "a saved request is only of use in the composer, so open it there"
         );
         // An answer left over from the request that was open a moment ago reads
         // as this one's: same shape, same pane, only the URL above it changed.
         assert!(
-            open.contains("strip(outEl);"),
+            fill.contains("strip(outEl);"),
             "opening another request must take the last one's answer down with it"
+        );
+        // Save must replace by id when editing, not always concat a new entry.
+        let save = SCRIPT
+            .split_once("async function saveComposed() {")
+            .expect("the script still saves a composed request")
+            .1;
+        assert!(
+            save.contains("requests[r] = saved") || save.contains("requests[r]=saved"),
+            "Save of an open request must overwrite that entry in the collection"
+        );
+        assert!(
+            save.contains("if (!replaced)") || save.contains("if(!replaced)"),
+            "only a brand-new save should append; re-saves replace"
+        );
+        // Put body must not round-trip client history (server owns revisions).
+        assert!(
+            SCRIPT.contains("function bookForPut(book)"),
+            "collections PUT must strip history before send"
+        );
+        let put = SCRIPT
+            .split_once("function bookForPut(book) {")
+            .expect("bookForPut still defined")
+            .1;
+        assert!(
+            !put.split("function ").next().unwrap_or("").contains("history"),
+            "bookForPut must not include history on the wire"
+        );
+        // History button next to Save + fold + Recent shelf surface change/send history.
+        assert!(
+            BODY.contains("id=\"c-history\"")
+                && BODY.contains(">History</button>")
+                && SCRIPT.contains("function showHistory()")
+                && SCRIPT.contains("historyBtn.addEventListener('click', showHistory)"),
+            "composer must put a History button next to Save that opens the versions fold"
+        );
+        assert!(
+            BODY.contains("id=\"c-versions\"")
+                && BODY.contains("c-fold-name\">History</span>")
+                && SCRIPT.contains("function paintVersions()"),
+            "composer must expose a History fold for saved-request revisions"
+        );
+        assert!(
+            SCRIPT.contains("histBtn.textContent")
+                || SCRIPT.contains("History (' + n + ')'"),
+            "History button label must reflect the version count when present"
+        );
+        assert!(
+            BODY.contains("id=\"recent\"")
+                && BODY.contains("id=\"recent-list\"")
+                && SCRIPT.contains("function loadRecent()")
+                && SCRIPT.contains("function openRecent(entry)"),
+            "left column must list recent sends and open them in the composer"
+        );
+        assert!(
+            SCRIPT.contains("'/api/send-history'")
+                || SCRIPT.contains("\"/api/send-history\""),
+            "Recent shelf talks to /api/send-history"
         );
     }
 

@@ -44,7 +44,9 @@ use crate::types::{
     FlowState, FlowTimings, HeaderPair, HttpVersion, Scheme,
 };
 
-pub use collections::{Collection, CollectionStore, Environment, SavedRequest};
+pub use collections::{
+    Collection, CollectionStore, Environment, RequestRevision, SavedRequest, SendHistoryEntry,
+};
 pub use curl::to_curl;
 pub use ws::{
     execute_live, inject_error_message, is_injectable_opcode, plan_frames, parse_directions,

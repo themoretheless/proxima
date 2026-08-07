@@ -84,6 +84,11 @@ pub(super) fn build(state: ApiState) -> Router {
             "/api/send",
             post(send).layer(DefaultBodyLimit::max(body_limit)),
         )
+        .route(
+            "/api/send-history",
+            get(list_send_history).delete(clear_send_history),
+        )
+        .route("/api/send-history/{id}", axum::routing::delete(delete_send_history))
         .route("/api/har", get(get_har))
         .route("/api/archive/query", post(query_archive))
         .route("/api/archive/stats", get(archive_stats))
@@ -669,8 +674,59 @@ fn ws_send_payload(request: &WsSendRequest) -> Result<Vec<u8>, ApiError> {
 
 async fn send(State(state): State<ApiState>, body: Bytes) -> Result<Response, ApiError> {
     let spec: crate::replay::SendSpec = parse_json_body(&body)?;
+    let for_history = spec.clone();
     let result = state.replay.send(spec).await.map_err(upstream)?;
+    // Best-effort: a failed history write must not turn a good send into an error.
+    let entry = crate::replay::SendHistoryEntry {
+        id: String::new(),
+        at_ms: crate::types::now_ms(),
+        name: send_history_name(&for_history),
+        spec: send_spec_history_value(&for_history),
+        status: Some(result.status),
+        flow_id: Some(result.flow_id.clone()),
+    };
+    if let Err(error) = state.replay.collections().push_send_history(entry) {
+        tracing::debug!(%error, "could not record send history");
+    }
     Ok(Json(result).into_response())
+}
+
+fn send_history_name(spec: &crate::replay::SendSpec) -> String {
+    let method = spec.method.as_deref().unwrap_or("GET");
+    let mut url = spec.url.clone().unwrap_or_default();
+    if url.len() > 80 {
+        url.truncate(77);
+        url.push_str("...");
+    }
+    format!("{method} {url}")
+}
+
+/// Opaque JSON the composer can load back into its fields. Mirrors what the
+/// inspector already stores under a saved request's `spec`.
+fn send_spec_history_value(spec: &crate::replay::SendSpec) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(ref method) = spec.method {
+        map.insert("method".into(), json!(method));
+    }
+    if let Some(ref url) = spec.url {
+        map.insert("url".into(), json!(url));
+    }
+    if let Some(ref headers) = spec.headers {
+        map.insert("headers".into(), json!(headers));
+    }
+    match &spec.body_base64 {
+        Some(Some(body)) => {
+            map.insert("bodyBase64".into(), json!(body));
+        }
+        Some(None) => {
+            map.insert("bodyBase64".into(), serde_json::Value::Null);
+        }
+        None => {}
+    }
+    if let Some(ref env) = spec.environment_id {
+        map.insert("environmentId".into(), json!(env));
+    }
+    serde_json::Value::Object(map)
 }
 
 /* ------------------------------------------------------------------ */
@@ -938,6 +994,35 @@ async fn get_har(
  * The store answers an upsert with the stored value, whose id it may have just
  * generated, so that is what goes back rather than an echo of the request.
  */
+
+async fn list_send_history(State(state): State<ApiState>) -> Result<Response, ApiError> {
+    Ok(Json(state.replay.collections().send_history()).into_response())
+}
+
+async fn clear_send_history(State(state): State<ApiState>) -> Result<Response, ApiError> {
+    state
+        .replay
+        .collections()
+        .clear_send_history()
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+async fn delete_send_history(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = validate_id(&id)?;
+    let removed = state
+        .replay
+        .collections()
+        .delete_send_history(&id)
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    if !removed {
+        return Err(not_found("no send-history entry with that id"));
+    }
+    Ok(Json(json!({ "ok": true })).into_response())
+}
 
 async fn list_collections(State(state): State<ApiState>) -> Result<Response, ApiError> {
     Ok(Json(state.replay.collections().collections()).into_response())
@@ -3964,6 +4049,100 @@ mod tests {
         let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(page["total"], 1);
         assert_eq!(page["flows"][0]["id"], ok_get);
+    }
+
+    #[tokio::test]
+    async fn send_history_lists_and_deletes_through_the_api() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let api = state(dir.path());
+        api.replay
+            .collections()
+            .push_send_history(crate::replay::SendHistoryEntry {
+                id: "s1".into(),
+                at_ms: 1,
+                name: "GET https://example.test/".into(),
+                spec: json!({ "method": "GET", "url": "https://example.test/" }),
+                status: Some(200),
+                flow_id: Some("f1".into()),
+            })
+            .expect("seed send history");
+        let address = serve(api).await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/send-history", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(list.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(list[0]["id"], "s1");
+        assert_eq!(list[0]["status"], 200);
+
+        let (status, _, _) = request_with_body(
+            address,
+            "DELETE",
+            "/api/send-history/s1",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/send-history", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(list.as_array().map(|a| a.len()), Some(0));
+
+        let (status, _, _) =
+            request_with_body(address, "DELETE", "/api/send-history", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn overwriting_a_collection_request_returns_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let create = Bytes::from(
+            r#"{"id":"book","name":"Book","requests":[{"id":"req","name":"v1","spec":{"method":"GET","url":"https://a.test/"}}]}"#
+                .as_bytes()
+                .to_vec(),
+        );
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            "/api/collections",
+            &[("content-type", "application/json")],
+            create,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(first["requests"][0]["history"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
+
+        let update = Bytes::from(
+            r#"{"id":"book","name":"Book","requests":[{"id":"req","name":"v2","spec":{"method":"POST","url":"https://b.test/"}}]}"#
+                .as_bytes()
+                .to_vec(),
+        );
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/collections/book",
+            &[("content-type", "application/json")],
+            update,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let second: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let history = second["requests"][0]["history"]
+            .as_array()
+            .expect("history array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["name"], "v1");
+        assert_eq!(history[0]["spec"]["url"], "https://a.test/");
     }
 
     /// Archive stats is always routed. Without `--archive` (and without the

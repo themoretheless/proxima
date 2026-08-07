@@ -17,6 +17,20 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 const FILE_NAME: &str = "collections.json";
+/// Previous specs kept when a saved request is overwritten. Bounded so
+/// `collections.json` cannot grow without limit from body copies.
+const MAX_REQUEST_HISTORY: usize = 30;
+/// Composer sends kept for the Recent shelf. Newest first.
+const MAX_SEND_HISTORY: usize = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRevision {
+    pub at_ms: u64,
+    pub name: String,
+    /// Same opaque SendSpec-shaped value as [`SavedRequest::spec`].
+    pub spec: serde_json::Value,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedRequest {
@@ -25,6 +39,11 @@ pub struct SavedRequest {
     /// A [`crate::replay::SendSpec`] shaped value, kept opaque here so the
     /// composer can grow fields without a migration of everybody's saved work.
     pub spec: serde_json::Value,
+    /// Prior name+spec snapshots, newest first. Owned by the store on upsert:
+    /// the client may omit this field; the server rebuilds it from the previous
+    /// on-disk request when content changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<RequestRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +60,21 @@ pub struct Environment {
     pub variables: HashMap<String, String>,
 }
 
-/// The whole file. `#[serde(default)]` on both fields means a file written by
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendHistoryEntry {
+    pub id: String,
+    pub at_ms: u64,
+    pub name: String,
+    /// SendSpec-shaped value (method, url, headers, bodyBase64, …).
+    pub spec: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_id: Option<String>,
+}
+
+/// The whole file. `#[serde(default)]` on list fields means a file written by
 /// an older build that only knew about collections still loads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Persisted {
@@ -52,6 +85,9 @@ struct Persisted {
     /// Environment applied by default when a send omits `environmentId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_environment_id: Option<String>,
+    /// Successful composer sends, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    send_history: Vec<SendHistoryEntry>,
 }
 
 pub struct CollectionStore {
@@ -114,6 +150,10 @@ impl CollectionStore {
 
     /// Inserts or replaces by id. An empty id means "new", and the generated id
     /// comes back in the returned value so the caller can address it later.
+    ///
+    /// Request `history` is rebuilt here from the previous on-disk request with
+    /// the same id: the client's history field is ignored so a put that only
+    /// carries `{ id, name, spec }` cannot wipe revisions.
     pub fn upsert_collection(&self, mut c: Collection) -> Result<Collection> {
         if c.id.trim().is_empty() {
             c.id = new_id();
@@ -128,8 +168,16 @@ impl CollectionStore {
         let snapshot = {
             let mut state = self.state.lock();
             match state.collections.iter_mut().find(|e| e.id == c.id) {
-                Some(existing) => *existing = c.clone(),
-                None => state.collections.push(c.clone()),
+                Some(existing) => {
+                    merge_request_histories(&existing.requests, &mut c.requests);
+                    *existing = c.clone();
+                }
+                None => {
+                    for request in &mut c.requests {
+                        request.history.clear();
+                    }
+                    state.collections.push(c.clone());
+                }
             }
             state.clone()
         };
@@ -228,6 +276,59 @@ impl CollectionStore {
             .unwrap_or_default()
     }
 
+    pub fn send_history(&self) -> Vec<SendHistoryEntry> {
+        self.state.lock().send_history.clone()
+    }
+
+    /// Prepends one send and truncates to [`MAX_SEND_HISTORY`]. Empty id is minted.
+    pub fn push_send_history(&self, mut entry: SendHistoryEntry) -> Result<SendHistoryEntry> {
+        if entry.id.trim().is_empty() {
+            entry.id = new_id();
+        }
+        if entry.at_ms == 0 {
+            entry.at_ms = crate::types::now_ms();
+        }
+        let _writing = self.writes.lock();
+        let snapshot = {
+            let mut state = self.state.lock();
+            state.send_history.insert(0, entry.clone());
+            if state.send_history.len() > MAX_SEND_HISTORY {
+                state.send_history.truncate(MAX_SEND_HISTORY);
+            }
+            state.clone()
+        };
+        self.persist(&snapshot)?;
+        Ok(entry)
+    }
+
+    pub fn clear_send_history(&self) -> Result<()> {
+        let _writing = self.writes.lock();
+        let snapshot = {
+            let mut state = self.state.lock();
+            if state.send_history.is_empty() {
+                return Ok(());
+            }
+            state.send_history.clear();
+            state.clone()
+        };
+        self.persist(&snapshot)?;
+        Ok(())
+    }
+
+    pub fn delete_send_history(&self, id: &str) -> Result<bool> {
+        let _writing = self.writes.lock();
+        let (removed, snapshot) = {
+            let mut state = self.state.lock();
+            let before = state.send_history.len();
+            state.send_history.retain(|e| e.id != id);
+            (state.send_history.len() != before, state.clone())
+        };
+        if removed {
+            self.persist(&snapshot)?;
+        }
+        Ok(removed)
+    }
+
     /// Writes a sibling temporary file, flushes it to the platter and renames
     /// it over the real one. Rename within a directory is atomic, so a crash
     /// mid-write leaves either the previous file or the new one, never a
@@ -289,6 +390,35 @@ fn new_id() -> String {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// For each incoming request, rebuild `history` from the previous request with
+/// the same id. Client-supplied history is discarded.
+fn merge_request_histories(previous: &[SavedRequest], incoming: &mut [SavedRequest]) {
+    let old_by_id: HashMap<&str, &SavedRequest> =
+        previous.iter().map(|r| (r.id.as_str(), r)).collect();
+    for request in incoming.iter_mut() {
+        match old_by_id.get(request.id.as_str()) {
+            None => request.history.clear(),
+            Some(old) => {
+                if old.name == request.name && old.spec == request.spec {
+                    request.history = old.history.clone();
+                } else {
+                    let mut history = Vec::with_capacity(old.history.len().saturating_add(1));
+                    history.push(RequestRevision {
+                        at_ms: crate::types::now_ms(),
+                        name: old.name.clone(),
+                        spec: old.spec.clone(),
+                    });
+                    history.extend(old.history.iter().cloned());
+                    if history.len() > MAX_REQUEST_HISTORY {
+                        history.truncate(MAX_REQUEST_HISTORY);
+                    }
+                    request.history = history;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,11 +427,16 @@ mod tests {
         Collection {
             id: id.to_string(),
             name: name.to_string(),
-            requests: vec![SavedRequest {
-                id: String::new(),
-                name: "list users".to_string(),
-                spec: serde_json::json!({ "method": "GET", "url": "https://api.test/users" }),
-            }],
+            requests: vec![saved_request("", "list users", "GET", "https://api.test/users")],
+        }
+    }
+
+    fn saved_request(id: &str, name: &str, method: &str, url: &str) -> SavedRequest {
+        SavedRequest {
+            id: id.to_string(),
+            name: name.to_string(),
+            spec: serde_json::json!({ "method": method, "url": url }),
+            history: Vec::new(),
         }
     }
 
@@ -436,5 +571,176 @@ mod tests {
         store.upsert_collection(collection("fresh", "Fresh")).unwrap();
         let reopened = CollectionStore::open(dir.path()).unwrap();
         assert_eq!(reopened.collections().len(), 1);
+    }
+
+    #[test]
+    fn overwriting_a_request_pushes_the_previous_spec_into_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CollectionStore::open(dir.path()).unwrap();
+
+        let first = store
+            .upsert_collection(Collection {
+                id: "book".into(),
+                name: "Book".into(),
+                requests: vec![saved_request("req", "v1", "GET", "https://api.test/v1")],
+            })
+            .unwrap();
+        assert!(first.requests[0].history.is_empty());
+
+        let second = store
+            .upsert_collection(Collection {
+                id: "book".into(),
+                name: "Book".into(),
+                // Client omits history on purpose; the store must still keep it.
+                requests: vec![saved_request("req", "v2", "POST", "https://api.test/v2")],
+            })
+            .unwrap();
+        assert_eq!(second.requests[0].name, "v2");
+        assert_eq!(second.requests[0].history.len(), 1);
+        assert_eq!(second.requests[0].history[0].name, "v1");
+        assert_eq!(
+            second.requests[0].history[0].spec["url"],
+            "https://api.test/v1"
+        );
+
+        // Identical content must not stack another revision.
+        let again = store
+            .upsert_collection(Collection {
+                id: "book".into(),
+                name: "Book".into(),
+                requests: vec![SavedRequest {
+                    id: "req".into(),
+                    name: "v2".into(),
+                    spec: second.requests[0].spec.clone(),
+                    history: vec![], // client tries to wipe; store must refuse
+                }],
+            })
+            .unwrap();
+        assert_eq!(again.requests[0].history.len(), 1);
+    }
+
+    #[test]
+    fn request_history_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CollectionStore::open(dir.path()).unwrap();
+
+        store
+            .upsert_collection(Collection {
+                id: "book".into(),
+                name: "Book".into(),
+                requests: vec![saved_request("req", "n0", "GET", "https://api.test/0")],
+            })
+            .unwrap();
+
+        for i in 1..=(MAX_REQUEST_HISTORY + 5) {
+            store
+                .upsert_collection(Collection {
+                    id: "book".into(),
+                    name: "Book".into(),
+                    requests: vec![saved_request(
+                        "req",
+                        &format!("n{i}"),
+                        "GET",
+                        &format!("https://api.test/{i}"),
+                    )],
+                })
+                .unwrap();
+        }
+
+        let history = &store.collections()[0].requests[0].history;
+        assert_eq!(history.len(), MAX_REQUEST_HISTORY);
+        // Newest previous first: last overwrite was n{MAX+5}, so head is n{MAX+4}.
+        assert_eq!(
+            history[0].name,
+            format!("n{}", MAX_REQUEST_HISTORY + 4)
+        );
+    }
+
+    #[test]
+    fn send_history_prepends_caps_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CollectionStore::open(dir.path()).unwrap();
+        assert!(store.send_history().is_empty());
+
+        let a = store
+            .push_send_history(SendHistoryEntry {
+                id: String::new(),
+                at_ms: 1,
+                name: "GET /a".into(),
+                spec: serde_json::json!({ "url": "https://a" }),
+                status: Some(200),
+                flow_id: Some("f1".into()),
+            })
+            .unwrap();
+        assert!(!a.id.is_empty());
+
+        let b = store
+            .push_send_history(SendHistoryEntry {
+                id: String::new(),
+                at_ms: 2,
+                name: "GET /b".into(),
+                spec: serde_json::json!({ "url": "https://b" }),
+                status: Some(201),
+                flow_id: None,
+            })
+            .unwrap();
+
+        let list = store.send_history();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, b.id, "newest first");
+        assert_eq!(list[1].id, a.id);
+
+        assert!(store.delete_send_history(&a.id).unwrap());
+        assert!(!store.delete_send_history(&a.id).unwrap());
+        assert_eq!(store.send_history().len(), 1);
+
+        store.clear_send_history().unwrap();
+        assert!(store.send_history().is_empty());
+    }
+
+    #[test]
+    fn send_history_cap_drops_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CollectionStore::open(dir.path()).unwrap();
+        for i in 0..(MAX_SEND_HISTORY + 3) {
+            store
+                .push_send_history(SendHistoryEntry {
+                    id: format!("s{i}"),
+                    at_ms: i as u64,
+                    name: format!("n{i}"),
+                    spec: serde_json::json!({}),
+                    status: None,
+                    flow_id: None,
+                })
+                .unwrap();
+        }
+        let list = store.send_history();
+        assert_eq!(list.len(), MAX_SEND_HISTORY);
+        assert_eq!(list[0].id, format!("s{}", MAX_SEND_HISTORY + 2));
+    }
+
+    #[test]
+    fn old_file_without_history_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            br#"{
+              "collections": [{
+                "id": "c1",
+                "name": "Old",
+                "requests": [{
+                  "id": "r1",
+                  "name": "get",
+                  "spec": { "method": "GET", "url": "https://old.test/" }
+                }]
+              }],
+              "environments": []
+            }"#,
+        )
+        .unwrap();
+        let store = CollectionStore::open(dir.path()).unwrap();
+        assert_eq!(store.collections().len(), 1);
+        assert!(store.collections()[0].requests[0].history.is_empty());
+        assert!(store.send_history().is_empty());
     }
 }
