@@ -148,6 +148,7 @@ const BODY: &str = r#"<header>
       <div id="books" role="tree" aria-label="Saved requests"></div>
       <p id="no-books" class="pad hint">Nothing saved yet. Drag a live request here, copy one into a collection, or compose and save.</p>
     </div>
+    <div id="tree-grip" role="separator" aria-orientation="vertical" aria-label="Resize tree" title="Drag to resize"></div>
   </section>
   <section id="list">
     <div id="scope" class="idle">
@@ -313,10 +314,12 @@ header {
 .btn:hover { background: var(--btn-hover); }
 /* The tree stands beside both panes, and the request sits under the list it
    was picked from rather than off to one side of it: header lines and bodies
-   are wide things, and a column beside the list is not. */
+   are wide things, and a column beside the list is not. Width is a choice,
+   not a constant: the edge can be dragged, and --tree-w is what remembers. */
 main {
   flex: 1; min-height: 0; display: grid;
-  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  --tree-w: 15rem;
+  grid-template-columns: var(--tree-w) minmax(0, 1fr);
   grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr);
 }
 #tree { grid-column: 1; grid-row: 1 / span 2; }
@@ -439,9 +442,20 @@ main.rewriting.flat > #rewriter { grid-column: 1; }
 /* Two trees, one column. What came in is above, what was kept is below: they
    are read the same way and neither is worth a pane of its own. */
 #tree {
+  position: relative;
   min-height: 0; display: flex; flex-direction: column; overflow: hidden;
   border-right: 1px solid var(--line);
 }
+/* The right edge of the tree is a grip, not a second border: drag it and the
+   column grows or shrinks, and the list takes whatever is left. */
+#tree-grip {
+  position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
+  cursor: col-resize; z-index: 3; touch-action: none;
+}
+#tree-grip:hover, body.tree-sizing #tree-grip {
+  background: var(--accent); opacity: 0.35;
+}
+body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
 /* Both halves carry the same bar and fold away the same way. A folded one
    keeps only its bar, and the space it was using goes to the other. */
 .part { display: flex; flex-direction: column; min-height: 0; }
@@ -1423,6 +1437,61 @@ const SCRIPT: &str = r#"
     viewBtn.textContent = off ? 'Tree' : 'Hide tree';
   });
 
+  /* How wide the tree is is a habit, not a one-shot: drag the edge, and the
+     next visit starts where this one left off. Bounds keep the list usable. */
+
+  var TREE_W_MIN = 160;
+  var TREE_W_MAX = 640;
+  var TREE_W_DEFAULT = 240;
+
+  function readTreeWidth() {
+    try {
+      var held = parseFloat(localStorage.getItem('proxima.tree-w'));
+      if (!isFinite(held) || held < TREE_W_MIN || held > TREE_W_MAX) {
+        return TREE_W_DEFAULT;
+      }
+      return held;
+    } catch (error) {
+      return TREE_W_DEFAULT;
+    }
+  }
+
+  function wearTreeWidth(px) {
+    var w = Math.max(TREE_W_MIN, Math.min(TREE_W_MAX, px));
+    // Half the main pane is as far as the tree may go: past that the list is
+    // no longer a list you can read.
+    var room = mainEl.clientWidth;
+    if (room > 0) {
+      w = Math.min(w, Math.max(TREE_W_MIN, Math.floor(room * 0.55)));
+    }
+    mainEl.style.setProperty('--tree-w', w + 'px');
+    return w;
+  }
+
+  var treeWidth = wearTreeWidth(readTreeWidth());
+  var treeGrip = document.getElementById('tree-grip');
+  var treeDrag = null;
+
+  treeGrip.addEventListener('pointerdown', function (event) {
+    if (event.button !== 0) { return; }
+    event.preventDefault();
+    treeDrag = { x: event.clientX, w: treeWidth };
+    document.body.classList.add('tree-sizing');
+    treeGrip.setPointerCapture(event.pointerId);
+  });
+  treeGrip.addEventListener('pointermove', function (event) {
+    if (!treeDrag) { return; }
+    treeWidth = wearTreeWidth(treeDrag.w + (event.clientX - treeDrag.x));
+  });
+  function endTreeDrag() {
+    if (!treeDrag) { return; }
+    treeDrag = null;
+    document.body.classList.remove('tree-sizing');
+    try { localStorage.setItem('proxima.tree-w', String(treeWidth)); } catch (error) { /* not fatal */ }
+  }
+  treeGrip.addEventListener('pointerup', endTreeDrag);
+  treeGrip.addEventListener('pointercancel', endTreeDrag);
+
   /* ---------------------------------------------------------------- */
   /* the detail view                                                   */
   /* ---------------------------------------------------------------- */
@@ -1485,14 +1554,9 @@ const SCRIPT: &str = r#"
     // One line, and the copy sits at the head of it: it acts on the URL beside
     // it, and a row of its own for a single control was a row of mostly nothing.
     head.appendChild(copyBar(flow, request, response));
-    // HTTP/2 and HTTP/3 sit on multiplexed sessions; surface the version next
-    // to the method so H2/H3 are obvious without opening Info. HTTP/1 stays
-    // as method alone.
-    var methodLabel = str(request.method);
-    if (request.httpVersion === '2.0' || request.httpVersion === '3.0') {
-      methodLabel = methodLabel + '  ' + str(request.httpVersion);
-    }
-    head.appendChild(el('span', 'dmethod', methodLabel));
+    // Method only in the head: HTTP version lives under Info (and in the list
+    // tooltip), not glued to GET as "GET 2.0".
+    head.appendChild(el('span', 'dmethod', str(request.method)));
     var durl = el('span', 'durl mono', str(request.url));
     // Same drag source as list rows: pull the detail URL onto a collection.
     if (flow.id && request.url) {
@@ -4989,6 +5053,41 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_column_can_be_resized_and_remembers() {
+        // A fixed 15rem column is fine until a long host name needs more room,
+        // or the list needs it back. The edge has to move, and the choice has
+        // to outlive the tab the same way theme and grouping do.
+        assert!(
+            BODY.contains("id=\"tree-grip\""),
+            "the tree needs an edge to drag"
+        );
+        assert!(
+            CSS.contains("--tree-w"),
+            "the tree width has to be a thing the page can change"
+        );
+        assert!(
+            CSS.contains("cursor: col-resize"),
+            "the edge has to look like something that moves a column"
+        );
+        assert!(
+            SCRIPT.contains("localStorage.setItem('proxima.tree-w'"),
+            "how wide the tree is has to outlive the tab"
+        );
+        let read = SCRIPT
+            .split_once("function readTreeWidth() {")
+            .expect("the script still reads back the tree width")
+            .1;
+        assert!(
+            read.contains("catch (error)") && read.contains("return TREE_W_DEFAULT"),
+            "unreadable or invented storage has to fall back rather than throw"
+        );
+        assert!(
+            SCRIPT.contains("TREE_W_MIN") && SCRIPT.contains("TREE_W_MAX"),
+            "a dragged edge has to stop before the list disappears"
+        );
+    }
+
+    #[test]
     fn the_event_socket_reconnects_on_its_own_with_a_bounded_backoff() {
         for line in [
             "socket.addEventListener('close', retry);",
@@ -5991,10 +6090,14 @@ mod tests {
             CSS.contains("button.flink"),
             "connection filter control needs distinct styling"
         );
-        // Detail head marks HTTP/2 and HTTP/3 without inventing a transport label.
+        // Detail head is method alone; version is not glued on as "GET 2.0".
         assert!(
-            SCRIPT.contains("request.httpVersion === '2.0' || request.httpVersion === '3.0'"),
-            "detail method line must surface 2.0 and 3.0 versions"
+            SCRIPT.contains("head.appendChild(el('span', 'dmethod', str(request.method)));"),
+            "detail method line must show method only"
+        );
+        assert!(
+            !SCRIPT.contains("methodLabel + '  ' + str(request.httpVersion)"),
+            "detail method must not append httpVersion"
         );
         // Filter box copy mentions connection so the shared key is discoverable.
         assert!(
