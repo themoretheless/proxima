@@ -1,7 +1,8 @@
-//! Applying the configured rewrite rules to traffic on the way through.
+//! Applying the configured rewrite rules to traffic on the way through, and the
+//! live rule hub the inspector mutates without restarting the process.
 //!
 //! The rules themselves live in [`crate::config`], which is where the decision
-//! of what to change belongs. This module is only the part that touches a
+//! of what to change belongs. This module is the part that touches a
 //! [`HeaderMap`], because manipulating headers on the wire is the proxy's job
 //! and pulling `http` types into the configuration to do it would be backwards.
 //!
@@ -19,9 +20,12 @@
 //! Both record a note per change on the flow, so a header nobody typed is
 //! traceable to the rule that put it there.
 
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use std::sync::Arc;
 
-use crate::config::{HeaderEdit, RewriteRules};
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use parking_lot::Mutex;
+
+use crate::config::{HeaderEdit, RewriteRules, RewriteRulesBody};
 
 /// Which half of the exchange is being edited. Only used to word the note left
 /// on the flow, but a note that does not say which half is nearly useless.
@@ -106,6 +110,43 @@ fn apply_one(half: Half, edit: &HeaderEdit, headers: &mut HeaderMap) -> Option<S
                 .remove(&name)
                 .map(|_| format!("{} header {} removed", half.name(), name))
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* live rule hub                                                       */
+/* ------------------------------------------------------------------ */
+
+/// Mutable rewrite rules (headers, map-host, map-local) for the running proxy.
+///
+/// Seeded from the startup config; the inspector and REST replace the list
+/// without restarting. Lookups clone the current rules under a short lock.
+#[derive(Debug, Default)]
+pub struct RewriteHub {
+    inner: Mutex<RewriteRules>,
+}
+
+impl RewriteHub {
+    pub fn new(rules: RewriteRules) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(rules),
+        })
+    }
+
+    pub fn empty() -> Arc<Self> {
+        Self::new(RewriteRules::default())
+    }
+
+    pub fn snapshot(&self) -> RewriteRules {
+        self.inner.lock().clone()
+    }
+
+    pub fn rules_body(&self) -> RewriteRulesBody {
+        self.snapshot().into()
+    }
+
+    pub fn set_rules(&self, body: RewriteRulesBody) {
+        *self.inner.lock() = body.into();
     }
 }
 

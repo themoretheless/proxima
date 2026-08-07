@@ -14,10 +14,13 @@
 
 mod tunnel;
 
+pub mod breakpoint;
 pub mod forward;
 pub mod headers;
 pub mod rewrite;
 pub mod websocket;
+pub mod ws_deflate;
+pub mod ws_rewrite;
 
 use std::convert::Infallible;
 use std::io;
@@ -43,7 +46,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::ca::{CertAuthority, SniResolver};
-use crate::capture::FlowStore;
+use crate::capture::{new_id, FlowStore};
 use crate::config::{host_matches, should_decrypt, strip_port, Config};
 use crate::types::{FlowClient, FlowError, FlowServer, Scheme, TunnelInfo};
 
@@ -73,6 +76,14 @@ pub struct ProxyDeps {
     pub store: Arc<FlowStore>,
     pub upstream: forward::Upstream,
     pub setup: Arc<dyn SetupHandler>,
+    /// Live upgraded WebSockets, shared with the inspector API for inject.
+    pub ws_registry: Arc<websocket::WsRegistry>,
+    /// Breakpoint rules and held pauses, shared with the inspector API.
+    pub pauses: Arc<breakpoint::PauseHub>,
+    /// WebSocket frame rewrite/drop rules, shared with the inspector API.
+    pub ws_rewrite: Arc<ws_rewrite::WsRewriteHub>,
+    /// HTTP rewrite / map-host / map-local rules, shared with the inspector API.
+    pub rewrite: Arc<rewrite::RewriteHub>,
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +208,19 @@ macro_rules! drive_connection {
 /* Connection handling                                                 */
 /* ------------------------------------------------------------------ */
 
+/// Mint a Proxima multiplex session id when the client negotiated H2 ALPN.
+///
+/// Shared by every stream on that TLS session as [`crate::types::Flow::connection_id`].
+/// HTTP/1.x and unknown ALPN leave `None` so ordinary TCP JSON stays quiet.
+/// The value is a Proxima UUID, not a wire TLS session id or HTTP/2 stream id.
+fn multiplex_session_id_for_client_alpn(alpn: Option<&str>) -> Option<String> {
+    if alpn == Some("h2") {
+        Some(new_id())
+    } else {
+        None
+    }
+}
+
 /// Everything a request needs to know about the connection it arrived on.
 struct ConnCtx {
     deps: Arc<ProxyDeps>,
@@ -206,6 +230,10 @@ struct ConnCtx {
     /// Host and port from the CONNECT line, set only inside a terminated tunnel.
     connect_authority: Option<(String, u16)>,
     server: FlowServer,
+    /// Proxima multiplex session id for client H2 over this TLS connection.
+    /// Shared by every request stream on the session; `None` for HTTP/1.x and
+    /// plain (non-intercepted) connections. Not a wire stream id.
+    connection_id: Option<String>,
     shutdown: watch::Receiver<bool>,
     drain: mpsc::Sender<()>,
 }
@@ -231,6 +259,7 @@ async fn serve_client(
         intercepted: false,
         connect_authority: None,
         server: FlowServer::default(),
+        connection_id: None,
         shutdown: shutdown.clone(),
         drain,
     });
@@ -418,6 +447,12 @@ async fn intercept<S>(
     };
     debug!(%host, port, alpn = ?alpn, sni = ?server.sni, "TLS handshake completed");
 
+    // One Proxima UUID per client TLS session when ALPN is h2 so multiplexed
+    // streams share Flow::connection_id. stream_id stays unset until a real
+    // wire id is available (do not invent RFC 9113-looking numbers). H1 leaves
+    // connection_id None so ordinary TCP JSON stays quiet.
+    let connection_id = multiplex_session_id_for_client_alpn(alpn.as_deref());
+
     let ctx = Arc::new(ConnCtx {
         deps,
         client,
@@ -425,6 +460,7 @@ async fn intercept<S>(
         intercepted: true,
         connect_authority: Some((host.clone(), port)),
         server,
+        connection_id,
         shutdown: shutdown.clone(),
         drain,
     });
@@ -564,6 +600,7 @@ async fn dispatch(req: Request<Incoming>, ctx: Arc<ConnCtx>) -> Response<ProxyBo
         client: ctx.client.clone(),
         server: ctx.server.clone(),
         intercepted: ctx.intercepted,
+        connection_id: ctx.connection_id.clone(),
     };
     forward::forward(Request::from_parts(parts, body), forward_ctx, ctx.deps.clone()).await
 }
@@ -807,6 +844,26 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn h2_alpn_mints_multiplex_session_id_h1_leaves_none() {
+        // Shared H2+H3 contract: TCP H2 gets a Proxima session UUID; H1/tunnels
+        // stay None so connectionId is omitted from JSON.
+        let h2 = multiplex_session_id_for_client_alpn(Some("h2"));
+        assert!(h2.is_some(), "h2 ALPN must mint a session id");
+        assert!(!h2.as_deref().unwrap().is_empty());
+
+        let h2_again = multiplex_session_id_for_client_alpn(Some("h2"));
+        assert_ne!(
+            h2, h2_again,
+            "each TLS session mints a fresh UUID, not a reused wire CID"
+        );
+
+        assert_eq!(multiplex_session_id_for_client_alpn(Some("http/1.1")), None);
+        assert_eq!(multiplex_session_id_for_client_alpn(Some("h3")), None);
+        assert_eq!(multiplex_session_id_for_client_alpn(None), None);
+        assert_eq!(multiplex_session_id_for_client_alpn(Some("")), None);
+    }
 
     #[test]
     fn authority_splitting_covers_the_shapes_a_client_sends() {

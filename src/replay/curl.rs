@@ -23,6 +23,9 @@ pub fn to_curl(flow: &Flow, body: Option<&[u8]>) -> String {
     if request.http_version == HttpVersion::Http2 {
         args.push("--http2".to_string());
     }
+    if request.http_version == HttpVersion::Http3 {
+        args.push("--http3".to_string());
+    }
 
     for (name, value) in &request.headers {
         // Hop-by-hop headers describe the connection we captured, not the
@@ -147,6 +150,11 @@ mod tests {
             ws_messages: None,
             tunnel: None,
             rewrites: Vec::new(),
+            mocked: false,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         }
     }
 

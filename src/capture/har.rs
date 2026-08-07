@@ -57,11 +57,32 @@ fn entry(flow: &Flow, bodies: &BodyStore) -> Value {
     if let Some(address) = &flow.server.address {
         entry["serverIPAddress"] = json!(address);
     }
+    // HAR 1.2 `connection` groups multiplexed streams (H2 or H3). Use the
+    // Proxima session UUID from Flow::connection_id, not a wire QUIC CID.
+    // Mapping is protocol-agnostic: same keys for TCP H2 and QUIC H3.
+    if let Some(conn) = &flow.connection_id {
+        entry["connection"] = json!(conn);
+    }
+    if let Some(transport) = flow.transport {
+        entry["_transport"] = json!(match transport {
+            crate::types::Transport::Tcp => "tcp",
+            crate::types::Transport::Quic => "quic",
+        });
+    }
+    if let Some(sid) = flow.stream_id {
+        entry["_streamId"] = json!(sid);
+    }
+    if let Some(usid) = flow.upstream_stream_id {
+        entry["_upstreamStreamId"] = json!(usid);
+    }
     if let Some(comment) = &flow.comment {
         entry["comment"] = json!(comment);
     }
     if let Some(error) = &flow.error {
         entry["_error"] = json!(error.message);
+        if let Some(code) = &error.code {
+            entry["_errorCode"] = json!(code);
+        }
     }
     if let Some(replay_of) = &flow.replay_of {
         entry["_replayOf"] = json!(replay_of);
@@ -509,11 +530,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 fn http_version(version: HttpVersion) -> &'static str {
-    match version {
-        HttpVersion::Http10 => "HTTP/1.0",
-        HttpVersion::Http11 => "HTTP/1.1",
-        HttpVersion::Http2 => "HTTP/2",
-    }
+    version.as_har()
 }
 
 fn timings_json(timings: &FlowTimings) -> Value {
@@ -575,6 +592,10 @@ fn ws_messages_json(messages: &[crate::types::WsMessage]) -> Value {
                 }
                 if message.truncated {
                     value["_truncated"] = json!(true);
+                }
+                if message.compressed {
+                    // Display data is inflated; `_size` remains the wire length.
+                    value["_compressed"] = json!(true);
                 }
                 value
             })
@@ -666,6 +687,11 @@ mod tests {
             ws_messages: None,
             tunnel: None,
             rewrites: Vec::new(),
+            mocked: false,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         }
     }
 
@@ -886,6 +912,8 @@ mod tests {
             truncated: false,
             text: Some("hello".into()),
             body_id: None,
+            injected: false,
+            compressed: false,
         }]);
 
         let har = flows_to_har(&[tunnel, socket], &bodies);
@@ -900,9 +928,168 @@ mod tests {
         assert_eq!(messages[0]["type"], "send");
         assert_eq!(messages[0]["data"], "hello");
         assert!(
+            messages[0]["_compressed"].is_null(),
+            "uncompressed frames omit _compressed"
+        );
+        assert!(
             entries[0]["_webSocketMessagesDropped"].is_null(),
             "nothing was dropped from this socket"
         );
+    }
+
+    #[test]
+    fn compressed_websocket_export_marks_inflated_display() {
+        let bodies = BodyStore::new(1024);
+        let mut socket = sample_flow();
+        socket.kind = FlowKind::Websocket;
+        socket.response = Some(FlowResponse {
+            status: 101,
+            status_text: "Switching Protocols".into(),
+            http_version: HttpVersion::Http11,
+            headers: vec![("upgrade".into(), "websocket".into())],
+            body: None,
+        });
+        // Display text is inflated; _size stays the on-wire payload length.
+        socket.ws_messages = Some(vec![WsMessage {
+            at: 1_700_000_000_300,
+            direction: WsDirection::Recv,
+            opcode: 1,
+            size: 18,
+            truncated: false,
+            text: Some("hello inflated".into()),
+            body_id: None,
+            injected: false,
+            compressed: true,
+        }]);
+
+        let har = flows_to_har(&[socket], &bodies);
+        let messages = har["log"]["entries"][0]["_webSocketMessages"]
+            .as_array()
+            .expect("websocket frames");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["data"], "hello inflated");
+        assert_eq!(messages[0]["_size"], 18);
+        assert_eq!(messages[0]["_compressed"], true);
+    }
+
+    #[test]
+    fn http3_quic_export_sets_connection_and_multiplex_customs() {
+        let bodies = BodyStore::new(1024);
+        let mut flow = sample_flow();
+        flow.request.http_version = HttpVersion::Http3;
+        flow.request.method = "POST".into();
+        flow.transport = Some(crate::types::Transport::Quic);
+        flow.connection_id = Some("conn-h3-1".into());
+        flow.stream_id = Some(0);
+        flow.upstream_stream_id = Some(4);
+        flow.response = Some(FlowResponse {
+            status: 200,
+            status_text: "OK".into(),
+            http_version: HttpVersion::Http3,
+            headers: vec![],
+            body: None,
+        });
+
+        let har = flows_to_har(&[flow], &bodies);
+        let entry = &har["log"]["entries"][0];
+        assert_eq!(entry["request"]["httpVersion"], "HTTP/3");
+        assert_eq!(entry["connection"], "conn-h3-1");
+        assert_eq!(entry["_transport"], "quic");
+        assert_eq!(entry["_streamId"], 0);
+        assert_eq!(entry["_upstreamStreamId"], 4);
+        assert_eq!(entry["_flowId"], "flow-1");
+    }
+
+    #[test]
+    fn http2_tcp_export_uses_same_connection_and_stream_keys() {
+        // No protocol fork: H2 multiplex maps to HAR connection/_streamId
+        // without requiring _transport or inventing a separate field set.
+        let bodies = BodyStore::new(1024);
+        let mut flow = sample_flow();
+        flow.request.http_version = HttpVersion::Http2;
+        flow.transport = None;
+        flow.connection_id = Some("conn-h2-tls".into());
+        flow.stream_id = Some(3);
+        flow.upstream_stream_id = None;
+        flow.response = Some(FlowResponse {
+            status: 200,
+            status_text: "OK".into(),
+            http_version: HttpVersion::Http2,
+            headers: vec![],
+            body: None,
+        });
+
+        let har = flows_to_har(&[flow], &bodies);
+        let entry = &har["log"]["entries"][0];
+        assert_eq!(entry["request"]["httpVersion"], "HTTP/2");
+        assert_eq!(entry["connection"], "conn-h2-tls");
+        assert_eq!(entry["_streamId"], 3);
+        let obj = entry.as_object().expect("entry object");
+        assert!(
+            !obj.contains_key("_transport"),
+            "TCP H2 omits _transport the same way Flow omits transport"
+        );
+        assert!(
+            !obj.contains_key("_upstreamStreamId"),
+            "no origin stream when upstream is not reopened multiplex"
+        );
+    }
+
+    #[test]
+    fn plain_tcp_export_omits_multiplex_and_transport_customs() {
+        // H1 / non-multiplex TCP: same omit rules as Flow JSON. HAR must not
+        // invent connection, _streamId, or _transport when Flow leaves them None.
+        let bodies = BodyStore::new(1024);
+        let mut flow = sample_flow();
+        flow.request.http_version = HttpVersion::Http11;
+        flow.transport = None;
+        flow.connection_id = None;
+        flow.stream_id = None;
+        flow.upstream_stream_id = None;
+        flow.response = Some(FlowResponse {
+            status: 204,
+            status_text: "No Content".into(),
+            http_version: HttpVersion::Http11,
+            headers: vec![],
+            body: None,
+        });
+
+        let har = flows_to_har(&[flow], &bodies);
+        let entry = &har["log"]["entries"][0];
+        let obj = entry.as_object().expect("entry object");
+        assert_eq!(entry["request"]["httpVersion"], "HTTP/1.1");
+        assert!(!obj.contains_key("connection"));
+        assert!(!obj.contains_key("_streamId"));
+        assert!(!obj.contains_key("_upstreamStreamId"));
+        assert!(!obj.contains_key("_transport"));
+    }
+
+    #[test]
+    fn h2_connection_only_exports_connection_without_stream_customs() {
+        // Proxy reality: connectionId minted per TLS session, streamId still
+        // None until a wire id exists. HAR follows the same optional mapping.
+        let bodies = BodyStore::new(1024);
+        let mut flow = sample_flow();
+        flow.request.http_version = HttpVersion::Http2;
+        flow.connection_id = Some("tls-session-only".into());
+        flow.stream_id = None;
+        flow.upstream_stream_id = None;
+        flow.transport = None;
+        flow.response = Some(FlowResponse {
+            status: 200,
+            status_text: "OK".into(),
+            http_version: HttpVersion::Http2,
+            headers: vec![],
+            body: None,
+        });
+
+        let har = flows_to_har(&[flow], &bodies);
+        let entry = &har["log"]["entries"][0];
+        let obj = entry.as_object().expect("entry object");
+        assert_eq!(entry["connection"], "tls-session-only");
+        assert!(!obj.contains_key("_streamId"));
+        assert!(!obj.contains_key("_upstreamStreamId"));
+        assert!(!obj.contains_key("_transport"));
     }
 
     #[test]
@@ -920,6 +1107,8 @@ mod tests {
                 truncated: true,
                 text: Some("9000 earlier messages discarded".into()),
                 body_id: None,
+                injected: false,
+                compressed: false,
             },
             WsMessage {
                 at: 1_700_000_000_300,
@@ -929,6 +1118,8 @@ mod tests {
                 truncated: false,
                 text: Some("hello".into()),
                 body_id: None,
+                injected: false,
+                compressed: false,
             },
         ]);
 

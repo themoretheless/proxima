@@ -31,7 +31,7 @@ use crate::config::host_matches;
 use crate::types::{
     now_ms, Flow, FlowClient, FlowError, FlowId, FlowKind, FlowQuery, FlowRequest, FlowResponse,
     FlowServer, FlowState, FlowSummary, FlowTimings, HeaderPair, HttpVersion, ProxyEvent, Scheme,
-    WsDirection, WsMessage,
+    Transport, WsDirection, WsMessage,
 };
 
 pub use archive::{Archive, ArchiveRow, QueryError, QueryResult};
@@ -70,6 +70,19 @@ pub struct FlowInit {
     pub client: FlowClient,
     pub server: FlowServer,
     pub replay_of: Option<FlowId>,
+    /// Wire transport. TCP producers leave this `None`; H3 producers set
+    /// [`Transport::Quic`]. Orthogonal to multiplex identity below.
+    pub transport: Option<Transport>,
+    /// Client multiplex session id (Proxima UUID per H2 TLS session or H3 QUIC
+    /// connection). See [`Flow::connection_id`]. HTTP/1.x and tunnels leave
+    /// `None`.
+    pub connection_id: Option<String>,
+    /// Client-leg stream key when known (H3 QUIC id; H2 wire id if exposed).
+    /// Prefer `None` over inventing numbers. See [`Flow::stream_id`].
+    pub stream_id: Option<u64>,
+    /// Origin-leg stream id only when MITM reopens a multiplexed upstream
+    /// (H3 reverse today). Never set equal to [`Self::stream_id`] by fiat.
+    pub upstream_stream_id: Option<u64>,
 }
 
 pub struct FlowStore {
@@ -139,6 +152,14 @@ impl FlowStore {
         self.events.subscribe()
     }
 
+    /// Publishes a live event on the same broadcast the inspector stream uses.
+    ///
+    /// Used for pause hit/resolved (and anything else that is not a flow mutation
+    /// but still belongs on `/api/stream`).
+    pub fn publish(&self, event: ProxyEvent) {
+        let _ = self.events.send(event);
+    }
+
     pub fn create(&self, init: FlowInit) -> FlowId {
         let id = new_id();
         let flow = Flow {
@@ -160,6 +181,11 @@ impl FlowStore {
             ws_messages: None,
             tunnel: None,
             rewrites: Vec::new(),
+            mocked: false,
+            transport: init.transport,
+            connection_id: init.connection_id,
+            stream_id: init.stream_id,
+            upstream_stream_id: init.upstream_stream_id,
         };
         let summary = summarize(&flow);
 
@@ -546,6 +572,8 @@ fn ws_drop_marker(dropped: u64, at: u64, direction: WsDirection) -> WsMessage {
             "{dropped} earlier messages discarded, keeping the most recent {MAX_WS_MESSAGES}"
         )),
         body_id: None,
+        injected: false,
+        compressed: false,
     }
 }
 
@@ -628,6 +656,11 @@ fn tombstone_flow(id: &str) -> Flow {
         ws_messages: None,
         tunnel: None,
         rewrites: Vec::new(),
+        mocked: false,
+        transport: None,
+        connection_id: None,
+        stream_id: None,
+        upstream_stream_id: None,
     }
 }
 
@@ -681,6 +714,9 @@ fn summarize(flow: &Flow) -> FlowSummary {
             .as_ref()
             .and_then(|e| e.likely_pinning)
             .unwrap_or(false),
+        transport: flow.transport,
+        connection_id: flow.connection_id.clone(),
+        stream_id: flow.stream_id,
     }
 }
 
@@ -749,11 +785,7 @@ fn state_name(state: FlowState) -> &'static str {
 }
 
 fn version_name(version: HttpVersion) -> &'static str {
-    match version {
-        HttpVersion::Http10 => "1.0",
-        HttpVersion::Http11 => "1.1",
-        HttpVersion::Http2 => "2.0",
-    }
+    version.as_label()
 }
 
 fn matches_query(flow: &Flow, q: &FlowQuery) -> bool {
@@ -803,10 +835,18 @@ fn matches_query(flow: &Flow, q: &FlowQuery) -> bool {
                 .map(|r| r.status.to_string())
                 .unwrap_or_default();
             let content_type = content_type_of(flow).unwrap_or_default();
+            // connection_id is the shared H2+H3 multiplex session key; matching
+            // it lets REST and the inspector filter sibling streams together.
+            let connection = flow
+                .connection_id
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             let hit = flow.request.method.to_ascii_lowercase().contains(&needle)
                 || flow.request.url.to_ascii_lowercase().contains(&needle)
                 || status.contains(&needle)
-                || content_type.to_ascii_lowercase().contains(&needle);
+                || content_type.to_ascii_lowercase().contains(&needle)
+                || (!connection.is_empty() && connection.contains(&needle));
             if !hit {
                 return false;
             }
@@ -843,6 +883,10 @@ mod tests {
             },
             server: FlowServer::default(),
             replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         }
     }
 
@@ -904,6 +948,84 @@ mod tests {
             Ok(ProxyEvent::FlowNew { flow }) => assert_eq!(flow.id, id),
             other => panic!("expected flow:new, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_preserves_h2_multiplex_identity_without_transport() {
+        // Shared H2+H3 contract: TCP H2 fills connection_id (and stream_id when
+        // known); transport stays None so JSON omits it.
+        let store = FlowStore::new(10, 1024, 4096);
+        let mut init = init("GET", "api.example.com", "/h2");
+        init.request.http_version = HttpVersion::Http2;
+        init.connection_id = Some("tls-session-1".into());
+        init.stream_id = None;
+        init.upstream_stream_id = None;
+        init.transport = None;
+
+        let id = store.create(init);
+        let flow = store.get(&id).expect("flow stored");
+        assert_eq!(flow.request.http_version, HttpVersion::Http2);
+        assert_eq!(flow.connection_id.as_deref(), Some("tls-session-1"));
+        assert_eq!(flow.stream_id, None);
+        assert_eq!(flow.upstream_stream_id, None);
+        assert_eq!(flow.transport, None);
+
+        let (page, _) = store.query(&FlowQuery::default());
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].connection_id.as_deref(), Some("tls-session-1"));
+        assert_eq!(page[0].stream_id, None);
+        assert_eq!(page[0].transport, None);
+        assert_eq!(page[0].http_version, HttpVersion::Http2);
+    }
+
+    #[test]
+    fn sibling_h2_streams_share_connection_id_and_keep_distinct_stream_ids() {
+        // Two requests on one client multiplex session group by connection_id;
+        // client stream keys differ when known; summary never carries upstream.
+        let store = FlowStore::new(10, 1024, 4096);
+        let conn = "tls-siblings";
+
+        let mut a = init("GET", "api.example.com", "/a");
+        a.request.http_version = HttpVersion::Http2;
+        a.connection_id = Some(conn.into());
+        a.stream_id = Some(1);
+        a.upstream_stream_id = None;
+
+        let mut b = init("GET", "api.example.com", "/b");
+        b.request.http_version = HttpVersion::Http2;
+        b.connection_id = Some(conn.into());
+        b.stream_id = Some(3);
+        // Full Flow may record an origin stream later; siblings still share
+        // only the client session key for list grouping.
+        b.upstream_stream_id = Some(99);
+
+        let id_a = store.create(a);
+        let id_b = store.create(b);
+
+        let fa = store.get(&id_a).expect("a");
+        let fb = store.get(&id_b).expect("b");
+        assert_eq!(fa.connection_id.as_deref(), Some(conn));
+        assert_eq!(fb.connection_id.as_deref(), Some(conn));
+        assert_eq!(fa.stream_id, Some(1));
+        assert_eq!(fb.stream_id, Some(3));
+        assert_ne!(fa.stream_id, fb.stream_id);
+        assert_eq!(fb.upstream_stream_id, Some(99));
+        assert_ne!(
+            fb.stream_id, fb.upstream_stream_id,
+            "MITM must never claim client stream id equals origin stream id"
+        );
+
+        let (page, _) = store.query(&FlowQuery::default());
+        assert_eq!(page.len(), 2);
+        for row in &page {
+            assert_eq!(row.connection_id.as_deref(), Some(conn));
+            assert_eq!(row.transport, None);
+        }
+        // summarize does not project upstream_stream_id onto FlowSummary.
+        let json_a = serde_json::to_value(&page[0]).unwrap();
+        let json_b = serde_json::to_value(&page[1]).unwrap();
+        assert!(json_a.get("upstreamStreamId").is_none());
+        assert!(json_b.get("upstreamStreamId").is_none());
     }
 
     #[test]
@@ -974,6 +1096,8 @@ mod tests {
                 truncated: false,
                 text: Some("hello".into()),
                 body_id: None,
+                injected: false,
+                compressed: false,
             },
         );
 
@@ -1000,6 +1124,8 @@ mod tests {
             truncated: false,
             text: None,
             body_id,
+            injected: false,
+            compressed: false,
         }
     }
 
@@ -1232,6 +1358,46 @@ mod tests {
             ..FlowQuery::default()
         });
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn query_search_matches_multiplex_connection_id() {
+        // Shared H2+H3 session key is searchable so REST clients can group
+        // sibling streams the same way the inspector filter does.
+        let store = FlowStore::new(100, 1024, 4096);
+        let mut h2 = init("GET", "api.example.com", "/a");
+        h2.request.http_version = HttpVersion::Http2;
+        h2.connection_id = Some("tls-session-shared".into());
+        h2.stream_id = None;
+        let id_a = store.create(h2);
+
+        let mut h2b = init("GET", "api.example.com", "/b");
+        h2b.request.http_version = HttpVersion::Http2;
+        h2b.connection_id = Some("tls-session-shared".into());
+        h2b.stream_id = Some(3);
+        let id_b = store.create(h2b);
+
+        let mut other = init("GET", "api.example.com", "/c");
+        other.connection_id = Some("other-session".into());
+        let _id_c = store.create(other);
+
+        let plain = store.create(init("GET", "api.example.com", "/h1"));
+
+        let (page, total) = store.query(&FlowQuery {
+            search: Some("tls-session-shared".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "search finds both streams on the multiplex session");
+        let ids: Vec<_> = page.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&id_a.as_str()));
+        assert!(ids.contains(&id_b.as_str()));
+        assert!(!ids.contains(&plain.as_str()));
+
+        let (_, total) = store.query(&FlowQuery {
+            search: Some("SESSION-SHARED".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "connection_id search is case insensitive");
     }
 
     #[test]

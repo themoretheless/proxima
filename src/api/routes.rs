@@ -67,6 +67,14 @@ pub(super) fn build(state: ApiState) -> Router {
             post(replay_flow).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route(
+            "/api/flows/{id}/ws/send",
+            post(ws_send).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route(
+            "/api/flows/{id}/ws/replay",
+            post(ws_replay).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route(
             "/api/send",
             post(send).layer(DefaultBodyLimit::max(body_limit)),
         )
@@ -86,10 +94,33 @@ pub(super) fn build(state: ApiState) -> Router {
             get(list_environments).post(create_environment),
         )
         .route(
+            "/api/environments/active",
+            get(get_active_environment).put(put_active_environment),
+        )
+        .route(
             "/api/environments/{id}",
             put(update_environment).delete(delete_environment),
         )
         .route("/api/stream", get(stream))
+        .route(
+            "/api/breakpoints",
+            get(get_breakpoints).put(put_breakpoints),
+        )
+        .route(
+            "/api/ws-rewrite",
+            get(get_ws_rewrite).put(put_ws_rewrite),
+        )
+        .route(
+            "/api/rewrite",
+            get(get_rewrite).put(put_rewrite),
+        )
+        .route("/api/pauses", get(list_pauses))
+        .route("/api/pauses/{pauseId}", get(get_pause))
+        .route(
+            "/api/pauses/{pauseId}/release",
+            post(release_pause).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route("/api/pauses/{pauseId}/drop", post(drop_pause))
         .route("/cert", get(cert_pem))
         .route("/cert.mobileconfig", get(cert_mobileconfig))
         .route("/setup", get(setup_page))
@@ -376,10 +407,374 @@ async fn replay_flow(
     Ok(Json(result).into_response())
 }
 
+/// Replays captured WebSocket frames onto a live upgraded flow.
+///
+/// Selects frames from the source flow's history (optional indices and
+/// direction filter), skips retention drop markers, resolves payloads from
+/// inline text or the body store, and injects them in order through the same
+/// path as [`ws_send`]. Injected frames are unmarked by rewrite and breakpoint
+/// rules; they are recorded with `injected: true`.
+///
+/// Limits: truncated captures and missing body bytes fail closed; opcode 0
+/// continuations and opcode 15 markers are never injected (explicit index is
+/// 400); compressed frames replay inflated display bytes uncompressed (not
+/// wire-identical RSV1). Only `mode: "live"` is implemented.
+async fn ws_replay(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let source_id = validate_id(&id)?;
+    let source = state
+        .store
+        .get(&source_id)
+        .ok_or_else(|| not_found("no flow with that id"))?;
+
+    let request: crate::replay::WsReplayRequest = if body.is_empty() {
+        crate::replay::WsReplayRequest::default()
+    } else {
+        parse_json_body(&body)?
+    };
+
+    let target_id = match &request.target_flow_id {
+        Some(raw) if !raw.is_empty() => {
+            let tid = validate_id(raw)?;
+            if state.store.get(&tid).is_none() {
+                return Err(not_found("no flow with that targetFlowId"));
+            }
+            tid
+        }
+        _ => source_id.clone(),
+    };
+
+    let messages = source.ws_messages.unwrap_or_default();
+
+    match crate::replay::replay_live(
+        state.ws_registry.as_ref(),
+        state.store.bodies(),
+        &source_id,
+        &target_id,
+        &messages,
+        &request,
+    )
+    .await
+    {
+        Ok(result) => Ok(Json(result).into_response()),
+        Err(crate::replay::PlanError::BadRequest(msg)) => Err(bad_request(msg)),
+        Err(crate::replay::PlanError::Conflict(msg)) => {
+            Err(ApiError::new(StatusCode::CONFLICT, msg))
+        }
+    }
+}
+
+/// Injects one WebSocket frame into a live upgraded flow.
+///
+/// `direction` is relative to the client: `send` goes toward the origin
+/// (masked), `recv` goes toward the client (unmasked). The frame is recorded
+/// like any other, with `injected: true`.
+async fn ws_send(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let id = validate_id(&id)?;
+    if state.store.get(&id).is_none() {
+        return Err(not_found("no flow with that id"));
+    }
+    let request: WsSendRequest = parse_json_body(&body)?;
+    let direction = parse_ws_direction(&request.direction)?;
+    let opcode = request.opcode;
+    if !matches!(opcode, 1 | 2 | 8 | 9 | 10) {
+        return Err(bad_request(
+            "opcode must be 1 (text), 2 (binary), 8 (close), 9 (ping) or 10 (pong)",
+        ));
+    }
+    let payload = ws_send_payload(&request)?;
+    if opcode >= 8 && payload.len() > 125 {
+        return Err(bad_request(
+            "a control frame payload cannot be longer than 125 bytes",
+        ));
+    }
+
+    let reply = match state.ws_registry.inject(&id, direction, opcode, payload) {
+        Ok(rx) => rx,
+        Err(crate::proxy::websocket::InjectError::NotLive)
+        | Err(crate::proxy::websocket::InjectError::Closed) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "that flow has no live WebSocket to inject into",
+            ));
+        }
+        Err(crate::proxy::websocket::InjectError::Full) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the WebSocket inject queue is full; try again when the peer is reading",
+            ));
+        }
+    };
+
+    let message = reply.await.map_err(|_| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "the WebSocket closed before the injected frame was written",
+        )
+    })?;
+    Ok(Json(json!({ "message": message })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WsSendRequest {
+    direction: String,
+    opcode: u8,
+    text: Option<String>,
+    data_base64: Option<String>,
+    close_code: Option<u16>,
+    close_reason: Option<String>,
+}
+
+fn parse_ws_direction(input: &str) -> Result<crate::types::WsDirection, ApiError> {
+    match input {
+        "send" => Ok(crate::types::WsDirection::Send),
+        "recv" => Ok(crate::types::WsDirection::Recv),
+        _ => Err(bad_request("direction must be \"send\" or \"recv\"")),
+    }
+}
+
+/// Payload resolution: text UTF-8, else base64, else close (code BE + reason),
+/// else empty.
+fn ws_send_payload(request: &WsSendRequest) -> Result<Vec<u8>, ApiError> {
+    if let Some(text) = &request.text {
+        return Ok(text.as_bytes().to_vec());
+    }
+    if let Some(encoded) = &request.data_base64 {
+        use base64::Engine as _;
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|err| bad_request(format!("dataBase64 was not valid base64: {err}")));
+    }
+    if let Some(code) = request.close_code {
+        let reason = request.close_reason.as_deref().unwrap_or("");
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        return Ok(payload);
+    }
+    Ok(Vec::new())
+}
+
 async fn send(State(state): State<ApiState>, body: Bytes) -> Result<Response, ApiError> {
     let spec: crate::replay::SendSpec = parse_json_body(&body)?;
     let result = state.replay.send(spec).await.map_err(upstream)?;
     Ok(Json(result).into_response())
+}
+
+/* ------------------------------------------------------------------ */
+/* breakpoints and pauses                                              */
+/* ------------------------------------------------------------------ */
+
+async fn get_breakpoints(State(state): State<ApiState>) -> Response {
+    Json(state.pauses.rules()).into_response()
+}
+
+async fn put_breakpoints(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let rules: crate::types::BreakpointRulesBody = parse_json_body(&body)?;
+    state.pauses.set_rules(rules);
+    Ok(Json(state.pauses.rules()).into_response())
+}
+
+/* ------------------------------------------------------------------ */
+/* WebSocket rewrite / drop rules                                      */
+/* ------------------------------------------------------------------ */
+
+async fn get_ws_rewrite(State(state): State<ApiState>) -> Response {
+    Json(state.ws_rewrite.rules()).into_response()
+}
+
+async fn put_ws_rewrite(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let rules: crate::config::WsRewriteRulesBody = parse_json_body(&body)?;
+    match state.ws_rewrite.set_rules(rules) {
+        Ok(saved) => Ok(Json(saved).into_response()),
+        Err(err) => Err(bad_request(err)),
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP rewrite / map-host / map-local                                 */
+/* ------------------------------------------------------------------ */
+
+async fn get_rewrite(State(state): State<ApiState>) -> Response {
+    Json(state.rewrite.rules_body()).into_response()
+}
+
+async fn put_rewrite(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let rules: crate::config::RewriteRulesBody = parse_json_body(&body)?;
+    state.rewrite.set_rules(rules);
+    Ok(Json(state.rewrite.rules_body()).into_response())
+}
+
+async fn list_pauses(State(state): State<ApiState>) -> Response {
+    Json(json!({ "pauses": state.pauses.list() })).into_response()
+}
+
+async fn get_pause(
+    State(state): State<ApiState>,
+    Path(pause_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let pause_id = validate_id(&pause_id)?;
+    let pause = state
+        .pauses
+        .get(&pause_id)
+        .ok_or_else(|| not_found("no pause with that id"))?;
+    Ok(Json(pause).into_response())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleasePauseBody {
+    /// When set, overrides the held opcode on release (WS).
+    opcode: Option<u8>,
+    text: Option<String>,
+    data_base64: Option<String>,
+    /// HTTP release overrides (ignored for WS pauses).
+    method: Option<String>,
+    url: Option<String>,
+    headers: Option<Vec<(String, String)>>,
+}
+
+async fn release_pause(
+    State(state): State<ApiState>,
+    Path(pause_id): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let pause_id = validate_id(&pause_id)?;
+    // Empty body means forward the original frame/message unchanged.
+    let request: ReleasePauseBody = if body.is_empty() {
+        ReleasePauseBody {
+            opcode: None,
+            text: None,
+            data_base64: None,
+            method: None,
+            url: None,
+            headers: None,
+        }
+    } else {
+        parse_json_body(&body)?
+    };
+
+    let snapshot = state.pauses.get(&pause_id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::GONE,
+            "that pause is no longer held (already released, dropped, or timed out)",
+        )
+    })?;
+
+    let decision = if snapshot.kind == crate::types::PauseKind::Http {
+        let http = snapshot.http.as_ref().ok_or_else(|| {
+            bad_request("HTTP pause is missing its body snapshot")
+        })?;
+        let (orig_opcode, orig_payload) = state.pauses.original(&pause_id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::GONE,
+                "that pause is no longer held (already released, dropped, or timed out)",
+            )
+        })?;
+        let _ = orig_opcode;
+        let body_bytes = if request.text.is_some() || request.data_base64.is_some() {
+            ws_send_payload(&WsSendRequest {
+                direction: "send".into(),
+                opcode: 1,
+                text: request.text,
+                data_base64: request.data_base64,
+                close_code: None,
+                close_reason: None,
+            })?
+        } else {
+            orig_payload
+        };
+        crate::proxy::breakpoint::PauseDecision::HttpRelease {
+            method: request.method.unwrap_or_else(|| http.method.clone()),
+            url: request.url.unwrap_or_else(|| http.url.clone()),
+            headers: request
+                .headers
+                .unwrap_or_else(|| http.headers.clone()),
+            body: body_bytes,
+        }
+    } else {
+        let (orig_opcode, orig_payload) = state.pauses.original(&pause_id).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::GONE,
+                "that pause is no longer held (already released, dropped, or timed out)",
+            )
+        })?;
+        let opcode = request.opcode.unwrap_or(orig_opcode);
+        if !matches!(opcode, 0x0..=0x2 | 0x8..=0xa) {
+            return Err(bad_request(
+                "opcode must be a data or control frame (0-2 or 8-10)",
+            ));
+        }
+        let payload = if request.text.is_some() || request.data_base64.is_some() {
+            ws_send_payload(&WsSendRequest {
+                direction: "send".into(),
+                opcode,
+                text: request.text,
+                data_base64: request.data_base64,
+                close_code: None,
+                close_reason: None,
+            })?
+        } else {
+            orig_payload
+        };
+        if opcode >= 8 && payload.len() > 125 {
+            return Err(bad_request(
+                "a control frame payload cannot be longer than 125 bytes",
+            ));
+        }
+        crate::proxy::breakpoint::PauseDecision::Release { opcode, payload }
+    };
+
+    match state.pauses.resolve(
+        &state.store,
+        &pause_id,
+        decision,
+        crate::types::PauseResolveReason::User,
+    ) {
+        Ok(snapshot) => Ok(Json(json!({ "pause": snapshot, "action": "release" })).into_response()),
+        Err(crate::proxy::breakpoint::ResolveError::NotFound)
+        | Err(crate::proxy::breakpoint::ResolveError::AlreadyResolved) => Err(ApiError::new(
+            StatusCode::GONE,
+            "that pause is no longer held (already released, dropped, or timed out)",
+        )),
+    }
+}
+
+async fn drop_pause(
+    State(state): State<ApiState>,
+    Path(pause_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let pause_id = validate_id(&pause_id)?;
+    match state.pauses.resolve(
+        &state.store,
+        &pause_id,
+        crate::proxy::breakpoint::PauseDecision::Drop,
+        crate::types::PauseResolveReason::User,
+    ) {
+        Ok(snapshot) => Ok(Json(json!({ "pause": snapshot, "action": "drop" })).into_response()),
+        Err(crate::proxy::breakpoint::ResolveError::NotFound)
+        | Err(crate::proxy::breakpoint::ResolveError::AlreadyResolved) => Err(ApiError::new(
+            StatusCode::GONE,
+            "that pause is no longer held (already released, dropped, or timed out)",
+        )),
+    }
 }
 
 async fn get_har(
@@ -492,6 +887,37 @@ async fn delete_collection(
 
 async fn list_environments(State(state): State<ApiState>) -> Result<Response, ApiError> {
     Ok(Json(state.replay.collections().environments()).into_response())
+}
+
+async fn get_active_environment(State(state): State<ApiState>) -> Response {
+    Json(json!({
+        "id": state.replay.collections().active_environment_id(),
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveEnvironmentBody {
+    /// Null or omitted clears the active environment.
+    id: Option<String>,
+}
+
+async fn put_active_environment(
+    State(state): State<ApiState>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let request: ActiveEnvironmentBody = if body.is_empty() {
+        ActiveEnvironmentBody { id: None }
+    } else {
+        parse_json_body(&body)?
+    };
+    let id = state
+        .replay
+        .collections()
+        .set_active_environment(request.id)
+        .map_err(|err| bad_request(err.to_string()))?;
+    Ok(Json(json!({ "id": id })).into_response())
 }
 
 async fn create_environment(
@@ -1043,6 +1469,10 @@ mod tests {
             replay,
             proxy_port: 0,
             ui_port: 0,
+            ws_registry: Arc::new(crate::proxy::websocket::WsRegistry::new()),
+            pauses: Arc::new(crate::proxy::breakpoint::PauseHub::new()),
+            ws_rewrite: crate::proxy::ws_rewrite::WsRewriteHub::empty(),
+            rewrite: crate::proxy::rewrite::RewriteHub::empty(),
         }
     }
 
@@ -1067,6 +1497,17 @@ mod tests {
         headers: &[(&str, &str)],
         body: Bytes,
     ) -> (StatusCode, HeaderMap) {
+        let (status, headers, _) = request_with_body(address, method, path, headers, body).await;
+        (status, headers)
+    }
+
+    async fn request_with_body(
+        address: SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> (StatusCode, HeaderMap, Bytes) {
         let stream = TcpStream::connect(address)
             .await
             .expect("connecting to the test inspector");
@@ -1093,9 +1534,8 @@ mod tests {
             .await
             .expect("an answer from the test inspector");
         let (parts, body) = response.into_parts();
-        // Drained so the connection can close cleanly rather than being reset.
-        let _ = body.collect().await;
-        (parts.status, parts.headers)
+        let collected = body.collect().await.expect("response body").to_bytes();
+        (parts.status, parts.headers, collected)
     }
 
     fn allow_origin(headers: &HeaderMap) -> Option<&str> {
@@ -1176,7 +1616,12 @@ mod tests {
         let big = Bytes::from(vec![b'x'; 3 * 1024 * 1024]);
         assert!(big.len() as u64 <= ceiling);
 
-        for path in ["/api/send", "/api/flows/whatever/replay"] {
+        for path in [
+            "/api/send",
+            "/api/flows/whatever/replay",
+            "/api/flows/whatever/ws/send",
+            "/api/pauses/whatever/release",
+        ] {
             let (status, _) = request(
                 address,
                 "POST",
@@ -1191,6 +1636,1112 @@ mod tests {
                 "{path} refused a body the capture side would have accepted"
             );
         }
+    }
+
+    /// The inject route is reachable without a live socket: unknown flow is
+    /// 404, known flow that is not upgraded is 409. Those two answers are what
+    /// the inspector shows when the form is used against a dead or missing id.
+    #[tokio::test]
+    async fn ws_send_answers_404_and_409_without_a_live_socket() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let missing = serde_json::json!({
+            "direction": "send",
+            "opcode": 1,
+            "text": "hello",
+        });
+        let body = Bytes::from(serde_json::to_vec(&missing).expect("json"));
+        let (status, _) = request(
+            address,
+            "POST",
+            "/api/flows/does-not-exist/ws/send",
+            &[("content-type", "application/json")],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A real flow that never upgraded has no inject channel.
+        let id = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://example.com/".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "example.com".into(),
+                host: "example.com".into(),
+                port: 443,
+                path: "/".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        let path = format!("/api/flows/{id}/ws/send");
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let bad = serde_json::json!({
+            "direction": "sideways",
+            "opcode": 1,
+        });
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&bad).expect("json")),
+        )
+        .await;
+        // Validation runs after the flow is found; a known-but-dead flow still
+        // fails on a bad body with 400 rather than 409.
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ws_send_rejects_bad_opcode_control_size_and_base64() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let id = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Websocket,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "http://ws.test/".into(),
+                scheme: crate::types::Scheme::Http,
+                authority: "ws.test".into(),
+                host: "ws.test".into(),
+                port: 80,
+                path: "/".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        let path = format!("/api/flows/{id}/ws/send");
+
+        // Opcode 3 is reserved and not injectable.
+        let bad_opcode = serde_json::json!({
+            "direction": "send",
+            "opcode": 3,
+            "text": "nope",
+        });
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&bad_opcode).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Control frames are capped at 125 payload bytes.
+        let too_big = "x".repeat(126);
+        let control = serde_json::json!({
+            "direction": "send",
+            "opcode": 9,
+            "text": too_big,
+        });
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&control).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let bad_b64 = serde_json::json!({
+            "direction": "recv",
+            "opcode": 2,
+            "dataBase64": "!!!not-base64!!!",
+        });
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&bad_b64).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Helper: create a websocket flow with a short frame history.
+    fn seed_ws_history(
+        store: &crate::capture::FlowStore,
+        frames: Vec<crate::types::WsMessage>,
+    ) -> String {
+        let id = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Websocket,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "http://ws.test/".into(),
+                scheme: crate::types::Scheme::Http,
+                authority: "ws.test".into(),
+                host: "ws.test".into(),
+                port: 80,
+                path: "/".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        store.update(&id, |flow| {
+            flow.ws_messages = Some(frames);
+        });
+        id
+    }
+
+    fn text_frame(direction: crate::types::WsDirection, text: &str) -> crate::types::WsMessage {
+        crate::types::WsMessage {
+            at: 1,
+            direction,
+            opcode: 1,
+            size: text.len() as u64,
+            truncated: false,
+            text: Some(text.into()),
+            body_id: None,
+            injected: false,
+            compressed: false,
+        }
+    }
+
+    /// Unknown source is 404; known source without a live target is 409.
+    #[tokio::test]
+    async fn ws_replay_answers_404_and_409_without_a_live_socket() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let body = Bytes::from(serde_json::to_vec(&serde_json::json!({})).expect("json"));
+        let (status, _, _) = request_with_body(
+            address,
+            "POST",
+            "/api/flows/does-not-exist/ws/replay",
+            &[("content-type", "application/json")],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let id = seed_ws_history(
+            &store,
+            vec![text_frame(crate::types::WsDirection::Send, "hello")],
+        );
+        let path = format!("/api/flows/{id}/ws/replay");
+        let (status, _, resp) = request_with_body(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err: serde_json::Value = serde_json::from_slice(&resp).expect("json");
+        assert!(
+            err.get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("")
+                .contains("live"),
+            "expected live conflict, got {err}"
+        );
+    }
+
+    /// Explicit index to a drop marker is 400; bad mode is 400; out of range is 400.
+    #[tokio::test]
+    async fn ws_replay_rejects_marker_index_and_bad_mode() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let marker = crate::types::WsMessage {
+            at: 0,
+            direction: crate::types::WsDirection::Send,
+            opcode: crate::capture::WS_DROPPED_OPCODE,
+            size: 3,
+            truncated: true,
+            text: Some("3 earlier messages discarded".into()),
+            body_id: None,
+            injected: false,
+            compressed: false,
+        };
+        let id = seed_ws_history(
+            &store,
+            vec![
+                marker,
+                text_frame(crate::types::WsDirection::Send, "kept"),
+            ],
+        );
+        let path = format!("/api/flows/{id}/ws/replay");
+
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "indices": [0] })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "mode": "compose" })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "indices": [99] })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A live registry half receives multi-frame replay in order with injected:true.
+    #[tokio::test]
+    async fn ws_replay_live_injects_selected_frames_in_order() {
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut inner = state(dir.path());
+        let store = inner.store.clone();
+        let registry = Arc::new(crate::proxy::websocket::WsRegistry::new());
+        inner.ws_registry = registry.clone();
+
+        let id = seed_ws_history(
+            &store,
+            vec![
+                text_frame(crate::types::WsDirection::Send, "first"),
+                text_frame(crate::types::WsDirection::Recv, "ignored-by-filter"),
+                text_frame(crate::types::WsDirection::Send, "second"),
+            ],
+        );
+
+        let (tx_up, mut rx_up) = mpsc::channel(8);
+        let (tx_client, _rx_client) = mpsc::channel(8);
+        registry.register(id.clone(), tx_up, tx_client);
+
+        let consumer = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            while let Some(cmd) = rx_up.recv().await {
+                payloads.push(cmd.payload.clone());
+                let _ = cmd.reply.send(crate::types::WsMessage {
+                    at: 1,
+                    direction: crate::types::WsDirection::Send,
+                    opcode: cmd.opcode,
+                    size: cmd.payload.len() as u64,
+                    truncated: false,
+                    text: Some(String::from_utf8_lossy(&cmd.payload).into_owned()),
+                    body_id: None,
+                    injected: true,
+                    compressed: false,
+                });
+            }
+            payloads
+        });
+
+        let address = serve(inner).await;
+        let path = format!("/api/flows/{id}/ws/replay");
+        let body = serde_json::json!({
+            "directions": ["send"],
+            "indices": [0, 2],
+        });
+        let (status, _, resp) = request_with_body(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&body).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_slice(&resp).expect("json");
+        assert_eq!(result.get("planned").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(result.get("sent").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(result.get("mode").and_then(|v| v.as_str()), Some("live"));
+        let messages = result
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].get("injected"), Some(&serde_json::json!(true)));
+        assert_eq!(messages[0].get("text").and_then(|v| v.as_str()), Some("first"));
+        assert_eq!(messages[1].get("text").and_then(|v| v.as_str()), Some("second"));
+
+        registry.unregister(&id);
+        let payloads = consumer.await.expect("consumer");
+        assert_eq!(payloads, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    /// Cross-flow target: source history injects onto another live id.
+    #[tokio::test]
+    async fn ws_replay_target_flow_id_uses_other_live_socket() {
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut inner = state(dir.path());
+        let store = inner.store.clone();
+        let registry = Arc::new(crate::proxy::websocket::WsRegistry::new());
+        inner.ws_registry = registry.clone();
+
+        let source_id = seed_ws_history(
+            &store,
+            vec![text_frame(crate::types::WsDirection::Send, "from-source")],
+        );
+        let target_id = seed_ws_history(&store, vec![]);
+
+        let (tx_up, mut rx_up) = mpsc::channel(4);
+        let (tx_client, _rx_client) = mpsc::channel(4);
+        registry.register(target_id.clone(), tx_up, tx_client);
+
+        let consumer = tokio::spawn(async move {
+            let cmd = rx_up.recv().await.expect("one inject");
+            let payload = cmd.payload.clone();
+            let _ = cmd.reply.send(crate::types::WsMessage {
+                at: 1,
+                direction: crate::types::WsDirection::Send,
+                opcode: 1,
+                size: payload.len() as u64,
+                truncated: false,
+                text: Some(String::from_utf8_lossy(&payload).into_owned()),
+                body_id: None,
+                injected: true,
+                compressed: false,
+            });
+            payload
+        });
+
+        let address = serve(inner).await;
+        let path = format!("/api/flows/{source_id}/ws/replay");
+        let body = serde_json::json!({ "targetFlowId": target_id });
+        let (status, _, resp) = request_with_body(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&body).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_slice(&resp).expect("json");
+        assert_eq!(
+            result.get("targetFlowId").and_then(|v| v.as_str()),
+            Some(target_id.as_str())
+        );
+        assert_eq!(result.get("sent").and_then(|v| v.as_u64()), Some(1));
+
+        registry.unregister(&target_id);
+        let payload = consumer.await.expect("consumer");
+        assert_eq!(payload, b"from-source");
+    }
+
+    /// Missing body store bytes fail closed as 409 before any inject is attempted.
+    #[tokio::test]
+    async fn ws_replay_missing_body_is_conflict() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let id = seed_ws_history(
+            &store,
+            vec![crate::types::WsMessage {
+                at: 1,
+                direction: crate::types::WsDirection::Send,
+                opcode: 2,
+                size: 4,
+                truncated: false,
+                text: None,
+                body_id: Some("evicted-or-never-stored".into()),
+                injected: false,
+                compressed: false,
+            }],
+        );
+        let path = format!("/api/flows/{id}/ws/replay");
+        let (status, _, resp) = request_with_body(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&serde_json::json!({})).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err: serde_json::Value = serde_json::from_slice(&resp).expect("json");
+        let msg = err
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("missing") || msg.contains("body"),
+            "expected missing-body conflict, got {err}"
+        );
+    }
+
+    /// Unknown targetFlowId is 404; source history is not rewritten.
+    #[tokio::test]
+    async fn ws_replay_unknown_target_flow_id_is_not_found() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let source_id = seed_ws_history(
+            &store,
+            vec![text_frame(crate::types::WsDirection::Send, "kept")],
+        );
+        let path = format!("/api/flows/{source_id}/ws/replay");
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "targetFlowId": "no-such-target"
+                }))
+                .expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Source history must stay untouched when the target is missing.
+        let source = store.get(&source_id).expect("source still present");
+        let msgs = source.ws_messages.expect("history");
+        assert_eq!(msgs.len(), 1);
+        assert!(!msgs[0].injected);
+        assert_eq!(msgs[0].text.as_deref(), Some("kept"));
+    }
+
+    /// Empty body uses defaults (auto-select skips non-injectable); explicit
+    /// index to a continuation is 400.
+    #[tokio::test]
+    async fn ws_replay_empty_body_defaults_and_bad_opcode_is_400() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let id = seed_ws_history(
+            &store,
+            vec![crate::types::WsMessage {
+                at: 1,
+                direction: crate::types::WsDirection::Send,
+                opcode: 0, // continuation: auto-select skips; explicit index fails closed
+                size: 0,
+                truncated: false,
+                text: None,
+                body_id: None,
+                injected: false,
+                compressed: false,
+            }],
+        );
+        let path = format!("/api/flows/{id}/ws/replay");
+
+        // Empty body is valid; auto-select plans nothing (continuation skipped).
+        let (status, _, resp) =
+            request_with_body(address, "POST", &path, &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_slice(&resp).expect("json");
+        assert_eq!(result.get("planned").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(result.get("sent").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(result.get("skipped").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(result.get("mode").and_then(|v| v.as_str()), Some("live"));
+
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "indices": [0] })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Rules and held pauses are reachable without a live peer: empty list,
+    /// replace, and resolve of a missing id. The inspector depends on these.
+    #[tokio::test]
+    async fn breakpoints_round_trip_and_missing_pause_is_gone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/breakpoints", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(got.get("rules").and_then(|v| v.as_array()).map(|a| a.len()), Some(0));
+
+        let rules = serde_json::json!({
+            "rules": [{
+                "id": "ws-1",
+                "enabled": true,
+                "kind": "ws",
+                "hosts": ["example.com"],
+                "pathPrefix": "/chat",
+                "directions": ["send"],
+                "opcodes": [],
+                "timeoutMs": 15000
+            }]
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/breakpoints",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&rules).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: crate::types::BreakpointRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(saved.rules.len(), 1);
+        assert_eq!(saved.rules[0].id, "ws-1");
+        assert!(saved.rules[0].enabled);
+        assert_eq!(saved.rules[0].hosts, vec!["example.com"]);
+        assert_eq!(saved.rules[0].path_prefix.as_deref(), Some("/chat"));
+        assert_eq!(saved.rules[0].timeout_ms, 15_000);
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/pauses", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let pauses: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            pauses.get("pauses").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(0)
+        );
+
+        // Nothing held: resolve and get must not invent a pause.
+        let (status, _) = request(
+            address,
+            "GET",
+            "/api/pauses/does-not-exist",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = request(
+            address,
+            "POST",
+            "/api/pauses/does-not-exist/drop",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+
+        let (status, _) = request(
+            address,
+            "POST",
+            "/api/pauses/does-not-exist/release",
+            &[("content-type", "application/json")],
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+
+        // Clearing rules is a PUT of an empty list, same shape the UI uses.
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/breakpoints",
+            &[("content-type", "application/json")],
+            Bytes::from_static(br#"{"rules":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cleared: crate::types::BreakpointRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert!(cleared.rules.is_empty());
+    }
+
+    /// WS rewrite rules round-trip through GET|PUT; invalid regex is a 400 and
+    /// leaves the previous list alone.
+    #[tokio::test]
+    async fn ws_rewrite_round_trip_and_invalid_regex_is_rejected() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/ws-rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let got: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            got.get("rules").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(0)
+        );
+
+        let rules = serde_json::json!({
+            "rules": [{
+                "hosts": ["chat.example.com"],
+                "pathPrefix": "/ws",
+                "directions": ["send"],
+                "opcodes": [],
+                "textRegex": "secret",
+                "drop": true
+            }]
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/ws-rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&rules).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: crate::config::WsRewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(saved.rules.len(), 1);
+        assert_eq!(saved.rules[0].hosts, vec!["chat.example.com"]);
+        assert_eq!(saved.rules[0].path_prefix.as_deref(), Some("/ws"));
+        assert!(saved.rules[0].drop);
+        assert_eq!(saved.rules[0].text_regex.as_deref(), Some("secret"));
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/ws-rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let again: crate::config::WsRewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(again.rules.len(), 1);
+
+        let bad = serde_json::json!({
+            "rules": [{
+                "textRegex": "(",
+                "drop": true
+            }]
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/ws-rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&bad).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let message = err.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            message.contains("text_regex") || message.contains("regex"),
+            "bad regex must name the field: {message}"
+        );
+
+        // Previous good rules must still be in force after a rejected PUT.
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/ws-rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let kept: crate::config::WsRewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(kept.rules.len(), 1);
+        assert!(kept.rules[0].drop);
+
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/ws-rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from_static(br#"{"rules":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cleared: crate::config::WsRewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert!(cleared.rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_and_drop_resolve_a_held_pause_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let pauses = inner.pauses.clone();
+        let address = serve(inner).await;
+
+        let held = pauses
+            .hold_ws(
+                &store,
+                "flow-1".into(),
+                crate::types::WsDirection::Send,
+                1,
+                5,
+                false,
+                b"hello",
+                30_000,
+            )
+            .expect("under the concurrent pause cap");
+        let pause_id = held.0;
+
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            &format!("/api/pauses/{pause_id}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot: crate::types::PauseSnapshot =
+            serde_json::from_slice(&body).expect("pause snapshot");
+        assert_eq!(snapshot.pause_id, pause_id);
+        assert_eq!(snapshot.flow_id, "flow-1");
+        assert_eq!(snapshot.kind, crate::types::PauseKind::Ws);
+        let ws = snapshot.ws.expect("ws body");
+        assert_eq!(ws.opcode, 1);
+        assert_eq!(ws.text.as_deref(), Some("hello"));
+
+        // Edited release: opcode stays text, payload becomes the new text.
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/release"),
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "text": "edited" })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resolved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(resolved.get("action").and_then(|v| v.as_str()), Some("release"));
+
+        // Second resolve is gone, not a second write.
+        let (status, _) = request(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/release"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+
+        // A fresh hold can be dropped instead.
+        let held = pauses
+            .hold_ws(
+                &store,
+                "flow-2".into(),
+                crate::types::WsDirection::Recv,
+                2,
+                2,
+                false,
+                &[0xde, 0xad],
+                30_000,
+            )
+            .expect("under the concurrent pause cap");
+        let pause_id = held.0;
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/drop"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let dropped: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(dropped.get("action").and_then(|v| v.as_str()), Some("drop"));
+        assert_eq!(pauses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_release_body_forwards_the_original_frame() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let pauses = inner.pauses.clone();
+        let address = serve(inner).await;
+
+        let (pause_id, mut rx) = pauses
+            .hold_ws(
+                &store,
+                "flow-orig".into(),
+                crate::types::WsDirection::Send,
+                1,
+                8,
+                false,
+                b"original",
+                30_000,
+            )
+            .expect("held");
+
+        // Omit body entirely: API must release the stored opcode/payload.
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/release"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resolved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(resolved.get("action").and_then(|v| v.as_str()), Some("release"));
+
+        let (decision, reason) = rx.try_recv().expect("decision delivered");
+        match decision {
+            crate::proxy::breakpoint::PauseDecision::Release { opcode, payload } => {
+                assert_eq!(opcode, 1);
+                assert_eq!(payload, b"original");
+            }
+            crate::proxy::breakpoint::PauseDecision::Drop => {
+                panic!("empty release body must not drop")
+            }
+            crate::proxy::breakpoint::PauseDecision::HttpRelease { .. } => {
+                panic!("WS release must not yield HTTP")
+            }
+        }
+        assert_eq!(reason, crate::types::PauseResolveReason::User);
+        assert_eq!(pauses.pending_count(), 0);
+    }
+
+    #[test]
+    fn parse_ws_direction_accepts_send_and_recv_only() {
+        assert!(matches!(
+            parse_ws_direction("send"),
+            Ok(crate::types::WsDirection::Send)
+        ));
+        assert!(matches!(
+            parse_ws_direction("recv"),
+            Ok(crate::types::WsDirection::Recv)
+        ));
+        assert!(parse_ws_direction("sideways").is_err());
+        assert!(parse_ws_direction("").is_err());
+        assert!(parse_ws_direction("Send").is_err());
+    }
+
+    /// P11: README curl examples use camelCase bodies. Deserialise the same
+    /// shapes so docs cannot drift from `WsSendRequest` field names.
+    #[test]
+    fn ws_send_request_deserializes_readme_camel_case() {
+        let text: WsSendRequest = serde_json::from_str(
+            r#"{"direction":"send","opcode":1,"text":"hello"}"#,
+        )
+        .expect("text body");
+        assert_eq!(text.direction, "send");
+        assert_eq!(text.opcode, 1);
+        assert_eq!(text.text.as_deref(), Some("hello"));
+        assert_eq!(ws_send_payload(&text).expect("payload"), b"hello");
+
+        let binary: WsSendRequest = serde_json::from_str(
+            r#"{"direction":"recv","opcode":2,"dataBase64":"AQID"}"#,
+        )
+        .expect("binary body");
+        assert_eq!(binary.direction, "recv");
+        assert_eq!(binary.opcode, 2);
+        assert_eq!(
+            ws_send_payload(&binary).expect("payload"),
+            &[0x01, 0x02, 0x03]
+        );
+
+        let close: WsSendRequest = serde_json::from_str(
+            r#"{"direction":"send","opcode":8,"closeCode":1000,"closeReason":"bye"}"#,
+        )
+        .expect("close body");
+        assert_eq!(close.close_code, Some(1000));
+        assert_eq!(close.close_reason.as_deref(), Some("bye"));
+        let payload = ws_send_payload(&close).expect("payload");
+        assert_eq!(&payload[..2], &1000u16.to_be_bytes());
+        assert_eq!(&payload[2..], b"bye");
+
+        // Snake_case field names are not accepted (docs and UI use camelCase).
+        let snake = r#"{"direction":"send","opcode":2,"data_base64":"AQID"}"#;
+        let parsed: WsSendRequest =
+            serde_json::from_str(snake).expect("unknown snake keys are ignored without deny");
+        assert!(
+            parsed.data_base64.is_none(),
+            "data_base64 must not bind; only dataBase64 is the public field"
+        );
+    }
+
+    #[test]
+    fn ws_send_payload_prefers_text_then_base64_then_close() {
+        // text wins over everything else when present.
+        let with_text = WsSendRequest {
+            direction: "send".into(),
+            opcode: 1,
+            text: Some("hello".into()),
+            data_base64: Some("AA==".into()),
+            close_code: Some(1000),
+            close_reason: Some("x".into()),
+        };
+        assert_eq!(ws_send_payload(&with_text).expect("ok"), b"hello");
+
+        // base64 when no text.
+        let with_b64 = WsSendRequest {
+            direction: "send".into(),
+            opcode: 2,
+            text: None,
+            data_base64: Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                [0xde, 0xad],
+            )),
+            close_code: None,
+            close_reason: None,
+        };
+        assert_eq!(ws_send_payload(&with_b64).expect("ok"), &[0xde, 0xad]);
+
+        // close code + reason when neither text nor base64.
+        let with_close = WsSendRequest {
+            direction: "send".into(),
+            opcode: 8,
+            text: None,
+            data_base64: None,
+            close_code: Some(1001),
+            close_reason: Some("going away".into()),
+        };
+        let payload = ws_send_payload(&with_close).expect("ok");
+        assert_eq!(&payload[..2], &1001u16.to_be_bytes());
+        assert_eq!(&payload[2..], b"going away");
+
+        // close with code only is two bytes.
+        let code_only = WsSendRequest {
+            direction: "send".into(),
+            opcode: 8,
+            text: None,
+            data_base64: None,
+            close_code: Some(1000),
+            close_reason: None,
+        };
+        assert_eq!(
+            ws_send_payload(&code_only).expect("ok"),
+            1000u16.to_be_bytes().to_vec()
+        );
+
+        // empty payload is allowed (ping with no body).
+        let empty = WsSendRequest {
+            direction: "send".into(),
+            opcode: 9,
+            text: None,
+            data_base64: None,
+            close_code: None,
+            close_reason: None,
+        };
+        assert!(ws_send_payload(&empty).expect("ok").is_empty());
+
+        // invalid base64 is a 400-shaped error.
+        let bad = WsSendRequest {
+            direction: "send".into(),
+            opcode: 2,
+            text: None,
+            data_base64: Some("not%%valid".into()),
+            close_code: None,
+            close_reason: None,
+        };
+        let err = ws_send_payload(&bad).expect_err("bad base64");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn injected_false_is_omitted_from_ws_message_json() {
+        // Ordinary capture stays quiet: only injected frames carry the flag.
+        let plain = crate::types::WsMessage {
+            at: 1,
+            direction: crate::types::WsDirection::Send,
+            opcode: 1,
+            size: 1,
+            truncated: false,
+            text: Some("a".into()),
+            body_id: None,
+            injected: false,
+            compressed: false,
+        };
+        let json = serde_json::to_value(&plain).expect("serialize");
+        assert!(json.get("injected").is_none());
+        assert!(json.get("compressed").is_none());
+
+        let injected = crate::types::WsMessage {
+            injected: true,
+            ..plain.clone()
+        };
+        let json = serde_json::to_value(&injected).expect("serialize");
+        assert_eq!(json.get("injected"), Some(&serde_json::json!(true)));
+        assert!(json.get("compressed").is_none());
+
+        // Inflated display for permessage-deflate; size remains wire length.
+        let compressed = crate::types::WsMessage {
+            compressed: true,
+            size: 12,
+            text: Some("hello inflated".into()),
+            ..plain
+        };
+        let json = serde_json::to_value(&compressed).expect("serialize");
+        assert_eq!(json.get("compressed"), Some(&serde_json::json!(true)));
+        assert_eq!(json.get("size"), Some(&serde_json::json!(12)));
+        assert_eq!(
+            json.get("text"),
+            Some(&serde_json::json!("hello inflated"))
+        );
     }
 
     #[test]
@@ -1281,5 +2832,422 @@ mod tests {
         assert!(validate_id("../../etc/passwd").is_err());
         assert!(validate_id("a\nb").is_err());
         assert!(validate_id(&"x".repeat(MAX_ID_LEN + 1)).is_err());
+    }
+
+    /// REST list and get expose the shared H2+H3 multiplex keys (camelCase).
+    /// H2 omits transport; H3 may set transport=quic. No new top-level fields.
+    #[tokio::test]
+    async fn list_and_get_expose_shared_multiplex_identity() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let h1 = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://example.com/h1".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "example.com".into(),
+                host: "example.com".into(),
+                port: 443,
+                path: "/h1".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+
+        let h2 = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://example.com/h2".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "example.com".into(),
+                host: "example.com".into(),
+                port: 443,
+                path: "/h2".into(),
+                http_version: crate::types::HttpVersion::Http2,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 2,
+            },
+            server: crate::types::FlowServer {
+                alpn: Some("h2".into()),
+                ..Default::default()
+            },
+            replay_of: None,
+            transport: None,
+            connection_id: Some("tls-session-uuid".into()),
+            stream_id: Some(1),
+            upstream_stream_id: None,
+        });
+
+        let h3 = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://example.com/h3".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "example.com".into(),
+                host: "example.com".into(),
+                port: 443,
+                path: "/h3".into(),
+                http_version: crate::types::HttpVersion::Http3,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 3,
+            },
+            server: crate::types::FlowServer {
+                alpn: Some("h3".into()),
+                ..Default::default()
+            },
+            replay_of: None,
+            transport: Some(crate::types::Transport::Quic),
+            connection_id: Some("quic-conn-uuid".into()),
+            stream_id: Some(0),
+            upstream_stream_id: Some(4),
+        });
+
+        // List summaries: connectionId + streamId, no upstreamStreamId.
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/flows", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("list json");
+        let flows = page["flows"].as_array().expect("flows array");
+        assert_eq!(flows.len(), 3);
+
+        let by_id = |id: &str| -> &serde_json::Value {
+            flows
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("missing flow {id}"))
+        };
+
+        let h1_sum = by_id(&h1);
+        assert!(h1_sum.get("connectionId").is_none());
+        assert!(h1_sum.get("streamId").is_none());
+        assert!(h1_sum.get("transport").is_none());
+        assert!(h1_sum.get("upstreamStreamId").is_none());
+
+        let h2_sum = by_id(&h2);
+        assert_eq!(h2_sum["connectionId"], "tls-session-uuid");
+        assert_eq!(h2_sum["streamId"], 1);
+        assert_eq!(h2_sum["httpVersion"], "2.0");
+        assert!(
+            h2_sum.get("transport").is_none(),
+            "TCP H2 must omit transport on list rows"
+        );
+        assert!(h2_sum.get("upstreamStreamId").is_none());
+
+        let h3_sum = by_id(&h3);
+        assert_eq!(h3_sum["connectionId"], "quic-conn-uuid");
+        assert_eq!(h3_sum["streamId"], 0);
+        assert_eq!(h3_sum["transport"], "quic");
+        assert_eq!(h3_sum["httpVersion"], "3.0");
+        assert!(h3_sum.get("upstreamStreamId").is_none());
+
+        // Full flow includes upstreamStreamId for reverse H3 only.
+        let path = format!("/api/flows/{h2}");
+        let (status, _, body) =
+            request_with_body(address, "GET", &path, &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let flow: serde_json::Value = serde_json::from_slice(&body).expect("h2 flow");
+        assert_eq!(flow["connectionId"], "tls-session-uuid");
+        assert_eq!(flow["streamId"], 1);
+        assert!(flow.get("transport").is_none());
+        assert!(flow.get("upstreamStreamId").is_none());
+
+        let path = format!("/api/flows/{h3}");
+        let (status, _, body) =
+            request_with_body(address, "GET", &path, &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let flow: serde_json::Value = serde_json::from_slice(&body).expect("h3 flow");
+        assert_eq!(flow["connectionId"], "quic-conn-uuid");
+        assert_eq!(flow["streamId"], 0);
+        assert_eq!(flow["upstreamStreamId"], 4);
+        assert_eq!(flow["transport"], "quic");
+
+        // search=connectionId groups sibling streams via the shared key.
+        let path = format!("/api/flows?search={}", "tls-session-uuid");
+        let (status, _, body) =
+            request_with_body(address, "GET", &path, &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("search json");
+        let found = page["flows"].as_array().expect("flows");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["id"], h2);
+    }
+
+    /// GET /api/status and the event-socket Status frame share ServerStatus.
+    /// Config quic fields must appear as camelCase without claiming the TCP
+    /// proxy port is the QUIC listener.
+    #[tokio::test]
+    async fn status_exposes_quic_fields_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            insecure_upstream: true,
+            ..crate::Config::default()
+        };
+        cfg.quic_port = Some(9443);
+        cfg.reverse_h3 = Some("origin.example:443".into());
+
+        let config = Arc::new(cfg);
+        let ca = Arc::new(crate::ca::CertAuthority::open(dir.path()).expect("ca"));
+        let store = Arc::new(crate::capture::FlowStore::new(
+            16,
+            config.max_body_bytes,
+            64 * 1024 * 1024,
+        ));
+        let replay = Arc::new(
+            crate::replay::ReplayEngine::new(config.clone(), store.clone())
+                .expect("replay engine"),
+        );
+        let address = serve(ApiState {
+            config,
+            ca,
+            store,
+            replay,
+            proxy_port: 9090,
+            ui_port: 9091,
+            ws_registry: Arc::new(crate::proxy::websocket::WsRegistry::new()),
+            pauses: Arc::new(crate::proxy::breakpoint::PauseHub::new()),
+            ws_rewrite: crate::proxy::ws_rewrite::WsRewriteHub::empty(),
+            rewrite: crate::proxy::rewrite::RewriteHub::empty(),
+        })
+        .await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/status", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+
+        assert_eq!(json["proxyPort"], 9090);
+        assert_eq!(json["uiPort"], 9091);
+        assert_eq!(
+            json["quicEnabled"].as_bool(),
+            Some(cfg!(feature = "quic")),
+            "quicEnabled must reflect the Cargo feature, not whether UDP is bound"
+        );
+        assert_eq!(json["quicPort"], 9443);
+        assert_eq!(json["reverseH3"], "origin.example:443");
+        let note = json["quicNote"].as_str().expect("quicNote present");
+        assert!(
+            note.contains("9443") || note.contains("--features quic"),
+            "quicNote must name the UDP port or guide rebuild: {note}"
+        );
+        assert!(
+            note.contains("cannot see QUIC") || note.contains("WireGuard") || note.contains("TUN")
+                || note.contains("--features quic"),
+            "quicNote must stay honest about TCP vs QUIC: {note}"
+        );
+        // TCP proxy port is a separate field; clients must not treat it as QUIC.
+        assert_ne!(json["proxyPort"], json["quicPort"]);
+    }
+
+    #[tokio::test]
+    async fn status_omits_quic_port_when_udp_unbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = serve(state(dir.path())).await;
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/status", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+        assert_eq!(
+            json["quicEnabled"].as_bool(),
+            Some(cfg!(feature = "quic"))
+        );
+        assert!(
+            json.get("quicPort").is_none(),
+            "default config must not claim a QUIC UDP port: {json}"
+        );
+        assert!(
+            json.get("reverseH3").is_none(),
+            "default config must omit reverseH3: {json}"
+        );
+        let note = json["quicNote"].as_str().expect("quicNote always present");
+        assert!(
+            note.contains("cannot see QUIC"),
+            "default note must state TCP cannot see QUIC: {note}"
+        );
+        assert_eq!(
+            json["wireguardEnabled"].as_bool(),
+            Some(cfg!(feature = "wireguard"))
+        );
+        assert!(
+            json.get("wireguardPort").is_none(),
+            "default config must not claim a WG UDP port: {json}"
+        );
+        let wg_note = json["wireguardNote"]
+            .as_str()
+            .expect("wireguardNote always present");
+        assert!(
+            wg_note.contains("WireGuard") || wg_note.contains("wireguard"),
+            "wireguardNote must be honest: {wg_note}"
+        );
+        assert_eq!(
+            json["tunEnabled"].as_bool(),
+            Some(cfg!(feature = "tun"))
+        );
+        assert!(
+            json.get("tunActive").is_none(),
+            "default config must not claim TUN is active: {json}"
+        );
+        let tun_note = json["tunNote"].as_str().expect("tunNote always present");
+        assert!(
+            tun_note.contains("TUN") || tun_note.contains("tun"),
+            "tunNote must be honest: {tun_note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_exposes_wireguard_fields_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..crate::Config::default()
+        };
+        cfg.wg_port = Some(51820);
+        cfg.mode = crate::config::ListenMode::WireGuard;
+
+        let config = Arc::new(cfg);
+        let ca = Arc::new(crate::ca::CertAuthority::open(dir.path()).expect("ca"));
+        let store = Arc::new(crate::capture::FlowStore::new(
+            16,
+            config.max_body_bytes,
+            64 * 1024 * 1024,
+        ));
+        let replay = Arc::new(
+            crate::replay::ReplayEngine::new(config.clone(), store.clone())
+                .expect("replay engine"),
+        );
+        let address = serve(ApiState {
+            config,
+            ca,
+            store,
+            replay,
+            proxy_port: 9090,
+            ui_port: 9091,
+            ws_registry: Arc::new(crate::proxy::websocket::WsRegistry::new()),
+            pauses: Arc::new(crate::proxy::breakpoint::PauseHub::new()),
+            ws_rewrite: crate::proxy::ws_rewrite::WsRewriteHub::empty(),
+            rewrite: crate::proxy::rewrite::RewriteHub::empty(),
+        })
+        .await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/status", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+
+        assert_eq!(
+            json["wireguardEnabled"].as_bool(),
+            Some(cfg!(feature = "wireguard")),
+            "wireguardEnabled must reflect the Cargo feature"
+        );
+        assert_eq!(json["wireguardPort"], 51820);
+        let note = json["wireguardNote"].as_str().expect("wireguardNote present");
+        assert!(
+            note.contains("51820")
+                || note.contains("--features wireguard")
+                || note.contains("scaffold")
+                || note.contains("not"),
+            "wireguardNote must be honest about scaffold: {note}"
+        );
+        assert_ne!(json["proxyPort"], json["wireguardPort"]);
+    }
+
+    /// GET /api/status exposes TUN scaffold flags from config without claiming
+    /// host packet capture or inventing a UDP port.
+    #[tokio::test]
+    async fn status_exposes_tun_fields_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..crate::Config::default()
+        };
+        cfg.tun = true;
+        cfg.mode = crate::config::ListenMode::Tun;
+
+        let config = Arc::new(cfg);
+        let ca = Arc::new(crate::ca::CertAuthority::open(dir.path()).expect("ca"));
+        let store = Arc::new(crate::capture::FlowStore::new(
+            16,
+            config.max_body_bytes,
+            64 * 1024 * 1024,
+        ));
+        let replay = Arc::new(
+            crate::replay::ReplayEngine::new(config.clone(), store.clone())
+                .expect("replay engine"),
+        );
+        let address = serve(ApiState {
+            config,
+            ca,
+            store,
+            replay,
+            proxy_port: 9090,
+            ui_port: 9091,
+            ws_registry: Arc::new(crate::proxy::websocket::WsRegistry::new()),
+            pauses: Arc::new(crate::proxy::breakpoint::PauseHub::new()),
+            ws_rewrite: crate::proxy::ws_rewrite::WsRewriteHub::empty(),
+            rewrite: crate::proxy::rewrite::RewriteHub::empty(),
+        })
+        .await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/status", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+
+        assert_eq!(
+            json["tunEnabled"].as_bool(),
+            Some(cfg!(feature = "tun")),
+            "tunEnabled must reflect the Cargo feature"
+        );
+        assert_eq!(
+            json["tunActive"].as_bool(),
+            Some(true),
+            "requested TUN must set tunActive true (scaffold task), not capture"
+        );
+        let note = json["tunNote"].as_str().expect("tunNote present");
+        assert!(
+            note.contains("scaffold")
+                || note.contains("no")
+                || note.contains("--features tun")
+                || note.contains("not"),
+            "tunNote must be honest about scaffold: {note}"
+        );
+        assert!(
+            !note.to_ascii_lowercase().contains("capturing packets")
+                && !note.to_ascii_lowercase().contains("live capture"),
+            "tunNote must not claim working capture: {note}"
+        );
+        // No invented UDP port field for TUN mode.
+        assert!(
+            json.get("tunPort").is_none(),
+            "TUN is not a UDP listener: {json}"
+        );
     }
 }

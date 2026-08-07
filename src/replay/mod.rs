@@ -11,9 +11,14 @@
 //! [`ReplayEngine::send`] needs a URL because there is nothing underneath it,
 //! and [`ReplayEngine::from_flow`] takes anything omitted from the captured
 //! request instead.
+//!
+//! WebSocket frame replay lives in [`ws`]: it reuses the live inject path
+//! rather than opening a second HTTP connection.
 
 pub mod collections;
 pub mod curl;
+pub mod vars;
+pub mod ws;
 
 use std::sync::Arc;
 
@@ -41,6 +46,11 @@ use crate::types::{
 
 pub use collections::{Collection, CollectionStore, Environment, SavedRequest};
 pub use curl::to_curl;
+pub use ws::{
+    execute_live, inject_error_message, is_injectable_opcode, plan_frames, parse_directions,
+    replay_live, resolve_payload, PlanError, PlannedFrame, WsReplayRequest, WsReplayResult,
+    DEFAULT_MAX_FRAMES,
+};
 
 /// True for a header that describes one connection rather than the request, and
 /// so must never be carried onto a new one.
@@ -76,6 +86,10 @@ pub struct SendSpec {
     pub headers: Option<Vec<HeaderPair>>,
     #[serde(default, deserialize_with = "present_or_absent")]
     pub body_base64: Option<Option<String>>,
+    /// Environment whose variables are applied as `{{name}}` before send.
+    /// When omitted, the store's active environment is used if one is set.
+    #[serde(default)]
+    pub environment_id: Option<String>,
 }
 
 /// Replay overrides are the same shape as a composed request; the difference is
@@ -138,22 +152,31 @@ impl ReplayEngine {
 
     /// Composes and sends a request that was never captured.
     pub async fn send(&self, spec: SendSpec) -> Result<SendResult> {
+        let vars = self
+            .collections
+            .variables_for(spec.environment_id.as_deref());
         let url = spec
             .url
             .as_deref()
             .map(str::trim)
             .filter(|url| !url.is_empty())
-            .ok_or_else(|| anyhow!("a composed request needs a url"))?
-            .to_string();
+            .ok_or_else(|| anyhow!("a composed request needs a url"))?;
+        let url = vars::interpolate(url, &vars);
+
+        let headers = vars::interpolate_headers(&spec.headers.unwrap_or_default(), &vars);
+        let body = match spec.body_base64 {
+            Some(Some(encoded)) => {
+                let raw = decode_base64(&encoded)?;
+                interpolate_body_bytes(&raw, &vars)
+            }
+            Some(None) | None => Bytes::new(),
+        };
 
         let outgoing = Outgoing {
             method: method_of(spec.method.as_deref(), "GET")?,
             target: Target::parse(&url)?,
-            headers: spec.headers.unwrap_or_default(),
-            body: match spec.body_base64 {
-                Some(Some(encoded)) => decode_base64(&encoded)?,
-                Some(None) | None => Bytes::new(),
-            },
+            headers,
+            body,
         };
         self.execute(outgoing, None).await
     }
@@ -166,25 +189,38 @@ impl ReplayEngine {
             .get(id)
             .ok_or_else(|| anyhow!("no flow with that id"))?;
 
+        let vars = self
+            .collections
+            .variables_for(edits.environment_id.as_deref());
+
         let url = edits
             .url
             .as_deref()
             .map(str::trim)
             .filter(|url| !url.is_empty())
-            .unwrap_or(flow.request.url.as_str())
-            .to_string();
+            .unwrap_or(flow.request.url.as_str());
+        let url = vars::interpolate(url, &vars);
+
+        let headers = vars::interpolate_headers(
+            &edits
+                .headers
+                .unwrap_or_else(|| flow.request.headers.clone()),
+            &vars,
+        );
+        let body = match edits.body_base64 {
+            Some(Some(encoded)) => {
+                let raw = decode_base64(&encoded)?;
+                interpolate_body_bytes(&raw, &vars)
+            }
+            Some(None) => Bytes::new(),
+            None => self.captured_body(&flow),
+        };
 
         let outgoing = Outgoing {
             method: method_of(edits.method.as_deref(), &flow.request.method)?,
             target: Target::parse(&url)?,
-            headers: edits
-                .headers
-                .unwrap_or_else(|| flow.request.headers.clone()),
-            body: match edits.body_base64 {
-                Some(Some(encoded)) => decode_base64(&encoded)?,
-                Some(None) => Bytes::new(),
-                None => self.captured_body(&flow),
-            },
+            headers,
+            body,
         };
         self.execute(outgoing, Some(flow.id)).await
     }
@@ -233,6 +269,10 @@ impl ReplayEngine {
             },
             server: FlowServer::default(),
             replay_of,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         });
 
         match self.exchange(&id, outgoing, sanitised).await {
@@ -410,6 +450,14 @@ impl Outgoing {
             map.append(name, value);
         }
         map
+    }
+}
+
+/// Applies `{{var}}` when the body is valid UTF-8; binary bodies pass through.
+fn interpolate_body_bytes(raw: &Bytes, vars: &std::collections::HashMap<String, String>) -> Bytes {
+    match std::str::from_utf8(raw) {
+        Ok(text) if text.contains("{{") => Bytes::from(vars::interpolate(text, vars)),
+        _ => raw.clone(),
     }
 }
 
@@ -899,6 +947,10 @@ mod tests {
             },
             server: FlowServer::default(),
             replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         });
 
         if !body.is_empty() {
@@ -931,6 +983,7 @@ mod tests {
                 url: Some(format!("http://{address}/compose")),
                 headers: Some(vec![("x-note".to_string(), "hello".to_string())]),
                 body_base64: Some(Some(STANDARD.encode(request_body))),
+                environment_id: None,
             })
             .await
             .expect("the send should have reached the local origin");

@@ -21,6 +21,10 @@ use tokio::sync::watch;
 
 use crate::ca::CertAuthority;
 use crate::capture::FlowStore;
+use crate::proxy::breakpoint::PauseHub;
+use crate::proxy::rewrite::RewriteHub;
+use crate::proxy::websocket::WsRegistry;
+use crate::proxy::ws_rewrite::WsRewriteHub;
 use crate::replay::ReplayEngine;
 use crate::types::ServerStatus;
 use crate::Config;
@@ -36,6 +40,14 @@ pub struct ApiState {
     pub replay: std::sync::Arc<ReplayEngine>,
     pub proxy_port: u16,
     pub ui_port: u16,
+    /// Live upgraded WebSockets shared with the proxy for frame inject.
+    pub ws_registry: std::sync::Arc<WsRegistry>,
+    /// Breakpoint rules and held pauses, shared with the proxy pump.
+    pub pauses: std::sync::Arc<PauseHub>,
+    /// WebSocket rewrite/drop rules, shared with the proxy pump.
+    pub ws_rewrite: std::sync::Arc<WsRewriteHub>,
+    /// HTTP rewrite / map-host / map-local rules, shared with the proxy.
+    pub rewrite: std::sync::Arc<RewriteHub>,
 }
 
 /// Every route the inspector serves, including the page itself.
@@ -87,6 +99,91 @@ pub fn status(state: &ApiState) -> ServerStatus {
         capturing: true,
         archiving: state.store.archive().is_some(),
         archive_dropped: state.store.archive().map(|a| a.dropped()).unwrap_or(0),
+        quic_enabled: cfg!(feature = "quic"),
+        quic_port: state.config.quic_port,
+        quic_note: Some(quic_status_note(
+            state.config.quic_port,
+            state.config.reverse_h3.as_deref(),
+        )),
+        reverse_h3: state.config.reverse_h3.clone(),
+        wireguard_enabled: cfg!(feature = "wireguard"),
+        wireguard_port: state.config.wg_port,
+        wireguard_note: Some(wireguard_status_note(state.config.wg_port)),
+        tun_enabled: cfg!(feature = "tun"),
+        tun_active: if state.config.tun {
+            Some(true)
+        } else {
+            None
+        },
+        tun_note: Some(tun_status_note(state.config.tun)),
+    }
+}
+
+/// Honest one-liner for the status payload: regular TCP proxy never sees QUIC.
+fn quic_status_note(quic_port: Option<u16>, reverse_h3: Option<&str>) -> String {
+    if !cfg!(feature = "quic") {
+        return "This build has no QUIC support (rebuild with --features quic). \
+                Regular TCP proxy mode cannot see QUIC/HTTP3. \
+                Phone path for QUIC needs WireGuard/TUN (not shipped)."
+            .to_string();
+    }
+    match (quic_port, reverse_h3) {
+        (Some(port), Some(upstream)) => format!(
+            "QUIC/HTTP3 reverse proxy on UDP port {port} -> {upstream}. \
+             Regular TCP proxy mode cannot see QUIC. \
+             Phone path for arbitrary app QUIC needs WireGuard/TUN (not shipped)."
+        ),
+        (Some(port), None) => format!(
+            "QUIC UDP listener on port {port} (accept-only, no reverse upstream / no forward). \
+             Regular TCP proxy mode cannot see QUIC. \
+             Phone path for QUIC needs WireGuard/TUN (not shipped)."
+        ),
+        (None, _) => "QUIC support is compiled in but no UDP listener is bound. \
+                      Regular TCP proxy mode cannot see QUIC/HTTP3. \
+                      Phone path for QUIC needs WireGuard/TUN (not shipped)."
+            .to_string(),
+    }
+}
+
+/// Honest one-liner for WireGuard: scaffold may bind; crypto is not a tunnel.
+fn wireguard_status_note(wg_port: Option<u16>) -> String {
+    if !cfg!(feature = "wireguard") {
+        return "This build has no WireGuard scaffold (rebuild with --features wireguard). \
+                Device-join crypto is not shipped either way. \
+                Phone Wi-Fi HTTP proxy settings never feed a WireGuard path."
+            .to_string();
+    }
+    match wg_port {
+        Some(port) => format!(
+            "WireGuard UDP scaffold on port {port} (bind only; Noise/WG crypto not implemented). \
+             Not a working device tunnel. Phone Wi-Fi HTTP proxy settings do not feed this path."
+        ),
+        None => "WireGuard scaffold is compiled in but no WG UDP listener is bound. \
+                 Crypto and a working device tunnel are not shipped. \
+                 Phone Wi-Fi HTTP proxy settings do not feed a WireGuard path."
+            .to_string(),
+    }
+}
+
+/// Honest one-liner for TUN: scaffold may run; no device open, no capture claim.
+fn tun_status_note(tun: bool) -> String {
+    if !cfg!(feature = "tun") {
+        return "This build has no TUN scaffold (rebuild with --features tun). \
+                Local packet capture is not shipped either way. \
+                macOS would need utun/Network Extension; Linux /dev/net/tun + CAP_NET_ADMIN; \
+                Windows host capture is not claimed."
+            .to_string();
+    }
+    if tun {
+        "TUN scaffold task is running (shutdown watch only; no utun//dev/net/tun open; \
+         no packet capture). macOS: utun/Network Extension (no TPROXY). \
+         Linux: /dev/net/tun + CAP_NET_ADMIN. Not a working capture path."
+            .to_string()
+    } else {
+        "TUN scaffold is compiled in but not requested. \
+         No virtual interface is open. macOS/Linux capture is not shipped; \
+         no Windows capture claim."
+            .to_string()
     }
 }
 
@@ -268,6 +365,237 @@ pub(crate) fn url_host(address: &str) -> String {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn quic_status_fields_track_feature_and_port() {
+        // Feature flag is compile-time; this asserts the status helper's shape.
+        let note_off_listener = quic_status_note(None, None);
+        assert!(
+            note_off_listener.contains("cannot see QUIC"),
+            "note must state regular TCP proxy cannot see QUIC: {note_off_listener}"
+        );
+
+        let note_bound = quic_status_note(Some(9443), None);
+        if cfg!(feature = "quic") {
+            assert!(
+                note_bound.contains("9443"),
+                "bound port should appear when feature is on: {note_bound}"
+            );
+            assert!(
+                note_bound.contains("accept-only"),
+                "accept-only path must say accept-only: {note_bound}"
+            );
+            assert!(
+                note_bound.contains("WireGuard") || note_bound.contains("TUN"),
+                "note should mention missing phone path: {note_bound}"
+            );
+        } else {
+            assert!(
+                note_bound.contains("--features quic"),
+                "feature-off note should tell how to rebuild: {note_bound}"
+            );
+        }
+
+        let note_reverse = quic_status_note(Some(9443), Some("origin.example:443"));
+        if cfg!(feature = "quic") {
+            assert!(note_reverse.contains("origin.example:443"));
+            assert!(note_reverse.contains("reverse"));
+        } else {
+            assert!(
+                note_reverse.contains("--features quic"),
+                "feature-off note ignores port/upstream and guides rebuild: {note_reverse}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_status_serializes_quic_enabled_and_omits_null_port() {
+        let status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["127.0.0.1".into()],
+            ca_fingerprint: "AB".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: cfg!(feature = "quic"),
+            quic_port: None,
+            quic_note: Some(quic_status_note(None, None)),
+            reverse_h3: None,
+            wireguard_enabled: cfg!(feature = "wireguard"),
+            wireguard_port: None,
+            wireguard_note: Some(wireguard_status_note(None)),
+            tun_enabled: cfg!(feature = "tun"),
+            tun_active: None,
+            tun_note: Some(tun_status_note(false)),
+        };
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(
+            json.get("quicEnabled").and_then(|v| v.as_bool()),
+            Some(cfg!(feature = "quic"))
+        );
+        assert!(
+            json.get("quicPort").is_none(),
+            "absent quic_port must skip_serializing"
+        );
+        assert!(
+            json
+                .get("quicNote")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("cannot see QUIC")),
+            "quicNote must be present and honest"
+        );
+        assert_eq!(
+            json.get("wireguardEnabled").and_then(|v| v.as_bool()),
+            Some(cfg!(feature = "wireguard"))
+        );
+        assert!(
+            json.get("wireguardPort").is_none(),
+            "absent wireguard_port must skip_serializing"
+        );
+        assert!(
+            json
+                .get("wireguardNote")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("WireGuard") || s.contains("wireguard")),
+            "wireguardNote must be present and honest"
+        );
+        assert_eq!(
+            json.get("tunEnabled").and_then(|v| v.as_bool()),
+            Some(cfg!(feature = "tun"))
+        );
+        assert!(
+            json.get("tunActive").is_none(),
+            "absent tun_active must skip_serializing"
+        );
+        assert!(
+            json
+                .get("tunNote")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("TUN") || s.contains("tun")),
+            "tunNote must be present and honest"
+        );
+
+        let with_port = ServerStatus {
+            quic_port: Some(9443),
+            quic_note: Some(quic_status_note(Some(9443), Some("up.example"))),
+            reverse_h3: Some("up.example".into()),
+            wireguard_port: Some(51820),
+            wireguard_note: Some(wireguard_status_note(Some(51820))),
+            tun_active: Some(true),
+            tun_note: Some(tun_status_note(true)),
+            ..status
+        };
+        let json = serde_json::to_value(&with_port).expect("serialize");
+        assert_eq!(json.get("quicPort").and_then(|v| v.as_u64()), Some(9443));
+        assert_eq!(
+            json.get("reverseH3").and_then(|v| v.as_str()),
+            Some("up.example")
+        );
+        assert_eq!(
+            json.get("wireguardPort").and_then(|v| v.as_u64()),
+            Some(51820)
+        );
+        let wg_note = json
+            .get("wireguardNote")
+            .and_then(|v| v.as_str())
+            .expect("wireguardNote present when set");
+        if cfg!(feature = "wireguard") {
+            assert!(
+                wg_note.contains("51820"),
+                "feature-on bound note should name the port: {wg_note}"
+            );
+        } else {
+            assert!(
+                wg_note.contains("--features wireguard"),
+                "feature-off note guides rebuild even if a port is set: {wg_note}"
+            );
+        }
+        assert_eq!(
+            json.get("tunActive").and_then(|v| v.as_bool()),
+            Some(true),
+            "tun_active Some(true) must serialize as tunActive"
+        );
+        let tun_note = json
+            .get("tunNote")
+            .and_then(|v| v.as_str())
+            .expect("tunNote present when set");
+        if cfg!(feature = "tun") {
+            assert!(
+                tun_note.contains("scaffold")
+                    || tun_note.contains("no")
+                    || tun_note.contains("not"),
+                "feature-on active note must stay scaffold-honest: {tun_note}"
+            );
+        } else {
+            assert!(
+                tun_note.contains("--features tun"),
+                "feature-off note guides rebuild even if active is set: {tun_note}"
+            );
+        }
+    }
+
+    #[test]
+    fn wireguard_status_note_is_honest_about_scaffold() {
+        let note_off = wireguard_status_note(None);
+        if cfg!(feature = "wireguard") {
+            assert!(
+                note_off.contains("no WG") || note_off.contains("not shipped"),
+                "{note_off}"
+            );
+        } else {
+            assert!(
+                note_off.contains("--features wireguard"),
+                "feature-off note should guide rebuild: {note_off}"
+            );
+        }
+        let note_bound = wireguard_status_note(Some(51820));
+        if cfg!(feature = "wireguard") {
+            assert!(note_bound.contains("51820"), "{note_bound}");
+            assert!(
+                note_bound.contains("scaffold") || note_bound.contains("not implemented"),
+                "must not claim a working tunnel: {note_bound}"
+            );
+        } else {
+            assert!(note_bound.contains("--features wireguard"), "{note_bound}");
+        }
+    }
+
+    #[test]
+    fn tun_status_note_is_honest_about_scaffold() {
+        let note_off = tun_status_note(false);
+        if cfg!(feature = "tun") {
+            assert!(
+                note_off.contains("not requested") || note_off.contains("not shipped"),
+                "{note_off}"
+            );
+        } else {
+            assert!(
+                note_off.contains("--features tun"),
+                "feature-off note should guide rebuild: {note_off}"
+            );
+        }
+        let note_on = tun_status_note(true);
+        if cfg!(feature = "tun") {
+            assert!(
+                note_on.contains("scaffold")
+                    || note_on.contains("no device")
+                    || note_on.contains("not a working"),
+                "must not claim working capture: {note_on}"
+            );
+            assert!(
+                note_on.contains("macOS")
+                    || note_on.contains("utun")
+                    || note_on.contains("Linux")
+                    || note_on.contains("/dev/net/tun"),
+                "should mention platform limits: {note_on}"
+            );
+        } else {
+            assert!(note_on.contains("--features tun"), "{note_on}");
+        }
+    }
 
     #[test]
     fn loopback_and_link_local_are_not_offered_to_a_phone() {

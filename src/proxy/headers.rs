@@ -36,6 +36,9 @@ pub enum Wire {
     Http1,
     /// HTTP/2, which rejects connection-specific headers entirely.
     Http2,
+    /// HTTP/3 over QUIC. Same hop rules as HTTP/2 (`Host` dropped, `te:
+    /// trailers` kept). Used by reverse H3 only; the TCP proxy never speaks h3.
+    Http3,
 }
 
 pub fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -85,22 +88,23 @@ fn is_te_trailers(value: &HeaderValue) -> bool {
 /// Over HTTP/1.1 an upgrade keeps its `Connection` and `Upgrade` headers,
 /// because without them the origin has no idea a WebSocket was requested.
 ///
-/// Over HTTP/2 two more things differ. `te: trailers` is explicitly permitted
-/// and is kept, because stripping it makes this proxy look like one that cannot
-/// carry trailers and breaks gRPC through it. `Host` is dropped, because h2
-/// addresses the origin through `:authority` and a `Host` copied from the client
-/// only ever contradicts it.
+/// Over HTTP/2 and HTTP/3 two more things differ. `te: trailers` is explicitly
+/// permitted and is kept, because stripping it makes this proxy look like one
+/// that cannot carry trailers and breaks gRPC through it. `Host` is dropped,
+/// because h2/h3 address the origin through `:authority` and a `Host` copied
+/// from the client only ever contradicts it.
 pub fn for_upstream(from: &HeaderMap, wire: Wire) -> HeaderMap {
     let keep_upgrade = wire == Wire::Http1 && is_websocket_upgrade(from);
+    let multiplexed = matches!(wire, Wire::Http2 | Wire::Http3);
     let mut out = HeaderMap::with_capacity(from.len());
     for (name, value) in from {
-        if wire == Wire::Http2 && name == http::header::HOST {
+        if multiplexed && name == http::header::HOST {
             continue;
         }
         if is_hop_by_hop(name) {
             let is_upgrade_framing =
                 name == http::header::CONNECTION || name == http::header::UPGRADE;
-            let keep_te = wire == Wire::Http2 && name == http::header::TE && is_te_trailers(value);
+            let keep_te = multiplexed && name == http::header::TE && is_te_trailers(value);
             if !(keep_upgrade && is_upgrade_framing) && !keep_te {
                 continue;
             }
@@ -265,6 +269,21 @@ mod tests {
         // by set_host afterwards.
         let out = for_upstream(&from, Wire::Http1);
         assert!(out.contains_key("host"));
+    }
+
+    #[test]
+    fn h3_matches_h2_hop_rules() {
+        let from = headers(&[
+            ("host", "stale.example.com"),
+            ("connection", "keep-alive"),
+            ("te", "trailers"),
+            ("accept", "*/*"),
+        ]);
+        let out = for_upstream(&from, Wire::Http3);
+        assert!(!out.contains_key("host"));
+        assert!(!out.contains_key("connection"));
+        assert!(out.contains_key("te"), "h3 keeps te: trailers like h2");
+        assert!(out.contains_key("accept"));
     }
 
     #[test]

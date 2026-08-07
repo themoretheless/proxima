@@ -49,6 +49,9 @@ struct Persisted {
     collections: Vec<Collection>,
     #[serde(default)]
     environments: Vec<Environment>,
+    /// Environment applied by default when a send omits `environmentId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_environment_id: Option<String>,
 }
 
 pub struct CollectionStore {
@@ -176,12 +179,53 @@ impl CollectionStore {
             let mut state = self.state.lock();
             let before = state.environments.len();
             state.environments.retain(|e| e.id != id);
+            if state.active_environment_id.as_deref() == Some(id) {
+                state.active_environment_id = None;
+            }
             (state.environments.len() != before, state.clone())
         };
         if removed {
             self.persist(&snapshot)?;
         }
         Ok(removed)
+    }
+
+    pub fn active_environment_id(&self) -> Option<String> {
+        self.state.lock().active_environment_id.clone()
+    }
+
+    /// Sets or clears the active environment. An unknown id is an error.
+    pub fn set_active_environment(&self, id: Option<String>) -> Result<Option<String>> {
+        let _writing = self.writes.lock();
+        let snapshot = {
+            let mut state = self.state.lock();
+            if let Some(ref want) = id {
+                if !state.environments.iter().any(|e| e.id == *want) {
+                    anyhow::bail!("no environment with id {want}");
+                }
+            }
+            state.active_environment_id = id;
+            state.clone()
+        };
+        self.persist(&snapshot)?;
+        Ok(snapshot.active_environment_id)
+    }
+
+    /// Variables for `environment_id`, or the active environment when `None`.
+    pub fn variables_for(&self, environment_id: Option<&str>) -> HashMap<String, String> {
+        let state = self.state.lock();
+        let id = environment_id
+            .map(|s| s.to_string())
+            .or_else(|| state.active_environment_id.clone());
+        let Some(id) = id else {
+            return HashMap::new();
+        };
+        state
+            .environments
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.variables.clone())
+            .unwrap_or_default()
     }
 
     /// Writes a sibling temporary file, flushes it to the platter and renames

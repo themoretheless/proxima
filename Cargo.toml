@@ -62,6 +62,7 @@ brotli = "8"
 zstd = "0.13"
 
 base64 = "0.22"
+regex = "1"
 sha2 = "0.10"
 rand = "0.9"
 time = { version = "0.3", features = ["formatting"] }
@@ -86,6 +87,21 @@ eframe = { version = "0.32", default-features = false, features = [
 # alternative is asking every user to install a matching libduckdb first.
 duckdb = { version = "1.10505", features = ["bundled"], optional = true }
 
+# QUIC / HTTP/3 over UDP. Optional: pulls quinn and h3, which most users of the
+# TCP HTTPS proxy never need. Reverse and future WireGuard paths live behind
+# this feature so the default binary stays small and builds without a UDP stack.
+# quinn is ring-only (rustls-ring); never enable rustls-aws-lc-rs here.
+quinn = { version = "0.11", default-features = false, features = [
+  "rustls-ring",
+  "runtime-tokio",
+  "log",
+], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+# Dual-stack UDP bind (IPV6_V6ONLY) for the quic feature. Already pulled by
+# quinn/tokio; listed so src/quic/udp.rs does not rely on a transitive dep.
+socket2 = { version = "0.6", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -99,8 +115,17 @@ lto = "thin"
 codegen-units = 1
 
 [features]
+# Empty default: gui, archive, quic, wireguard, and tun stay opt-in like each other.
+default = []
 gui = ["dep:eframe"]
 archive = ["dep:duckdb"]
+quic = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:socket2"]
+# WireGuard userspace scaffold (device-join path). Empty: no crypto crate yet.
+# Config/CLI/status fields are always compiled; the listen module is cfg-gated.
+wireguard = []
+# Local TUN / packet-capture scaffold. Empty: no tun/pcap crate yet.
+# Config/CLI/status fields are always compiled; the serve module is cfg-gated.
+tun = []
 
 [[bin]]
 name = "proxima"
@@ -110,3 +135,17 @@ path = "src/main.rs"
 name = "proxima-gui"
 path = "src/bin/gui.rs"
 required-features = ["gui"]
+
+# Localhost reverse-H3 MITM integration test. Built only with --features quic
+# so default `cargo test` never links quinn/h3.
+[[test]]
+name = "quic_reverse_e2e"
+path = "tests/quic_reverse_e2e.rs"
+required-features = ["quic"]
+
+# QUIC public-API smoke (bind, crypto, localhost 1-RTT). External-net cases
+# are #[ignore] so offline CI stays green; run with -- --ignored when online.
+[[test]]
+name = "quic_smoke"
+path = "tests/quic_smoke.rs"
+required-features = ["quic"]

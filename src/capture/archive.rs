@@ -827,6 +827,10 @@ mod tests {
             },
             server: FlowServer::default(),
             replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
         }
     }
 

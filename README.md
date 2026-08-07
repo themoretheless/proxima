@@ -150,24 +150,315 @@ proxy cannot honestly make.
 **Captured and decrypted:** HTTP and HTTPS over TCP from any app that honours
 the system proxy setting, including HTTP/2 and WebSockets. That covers the
 large majority of iOS app traffic, since `URLSession` respects the proxy.
+On a live upgraded WebSocket you can inject and replay frames (API below; the
+Frames tab has the same forms). The Frames tab also filters by direction and
+opcode, searches raw frame text, and pretty-prints JSON text payloads for
+display (search still uses the raw capture).
+
+### WebSocket inject and replay API
+
+Both routes write through the live inject path: the frame is encoded and
+written **immediately**, skips rewrite rules and breakpoints, is recorded like
+wire traffic, and is marked `injected: true` on the message (ordinary capture
+omits the field when false). Direction is relative to the client: `send` goes
+toward the origin (masked), `recv` goes toward the client (unmasked).
+
+#### `POST /api/flows/{id}/ws/send`
+
+Body fields are camelCase:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `direction` | `"send"` \| `"recv"` | required |
+| `opcode` | `1` \| `2` \| `8` \| `9` \| `10` | text, binary, close, ping, pong |
+| `text` | string | UTF-8 payload |
+| `dataBase64` | string | binary payload |
+| `closeCode` | u16 | close frame status (big-endian on the wire) |
+| `closeReason` | string | optional UTF-8 after `closeCode` |
+
+Payload priority: `text` > `dataBase64` > `closeCode` (+ reason) > empty.
+Control payloads (opcodes 8/9/10) may not exceed 125 bytes.
+
+```bash
+# Text toward the origin
+curl -s localhost:9091/api/flows/$ID/ws/send -H 'content-type: application/json' \
+  -d '{"direction":"send","opcode":1,"text":"hello"}'
+
+# Binary toward the client
+curl -s localhost:9091/api/flows/$ID/ws/send -H 'content-type: application/json' \
+  -d '{"direction":"recv","opcode":2,"dataBase64":"AQID"}'
+
+# Close with code + reason
+curl -s localhost:9091/api/flows/$ID/ws/send -H 'content-type: application/json' \
+  -d '{"direction":"send","opcode":8,"closeCode":1000,"closeReason":"bye"}'
+```
+
+Responses:
+
+- **200** `{ "message": <WsMessage> }` with `injected: true` when set
+- **400** invalid `direction`, opcode outside 1/2/8/9/10, bad `dataBase64`, or control payload longer than 125 bytes
+- **404** unknown flow id
+- **409** not a live upgraded socket, inject queue full, or the socket closed before the write finished
+
+#### `POST /api/flows/{id}/ws/replay`
+
+Replays captured frames from the source flow onto a live upgrade (same path as
+`/ws/send`). Body is camelCase and **rejects unknown fields**. Empty body uses
+defaults: `mode: "live"`, target = source id, auto-select injectable frames.
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `targetFlowId` | string | source id |
+| `mode` | `"live"` only | `"live"` (`"compose"` is refused) |
+| `indices` | number[] | auto-select all eligible frames |
+| `directions` | `("send"\|"recv")[]` | both |
+| `delayMs` | u64 | `0` |
+| `stopOnError` | bool | `true` |
+| `maxFrames` | usize | `4096` |
+
+```bash
+# Auto-select injectable frames onto the same live flow
+curl -s localhost:9091/api/flows/$ID/ws/replay -H 'content-type: application/json' -d '{}'
+
+# Explicit indices onto another live upgrade, pause between frames
+curl -s localhost:9091/api/flows/$SOURCE/ws/replay -H 'content-type: application/json' \
+  -d '{"targetFlowId":"'$TARGET'","indices":[0,2],"delayMs":50}'
+```
+
+Responses:
+
+- **200** `{ sourceFlowId, targetFlowId, mode, planned, sent, skipped, messages, error? }`
+  - `messages` are the injected `WsMessage` records (with `injected: true`)
+  - partial progress is possible when `stopOnError` is false; `error` names the first failure
+- **400** bad plan: unsupported `mode` (including compose), bad directions, out-of-range indices, explicit drop-marker or continuation index, non-injectable opcode, control payload over 125 bytes, `maxFrames` less than 1, or unknown JSON fields
+- **404** unknown source or `targetFlowId`
+- **409** not live / inject queue full / closed before write; also missing body-store bytes or truncated capture when nothing has been sent yet
+
+**Fail-closed limits (inject and replay share these):**
+
+- Opcodes **1, 2, 8, 9, 10** only. Opcode **0** (continuation) and **15** (retention drop marker) are never injected. Auto-selection skips them; an explicit index fails with 400.
+- Truncated captures and missing non-empty body-store bytes fail closed (409 when nothing was sent).
+- Under permessage-deflate, capture stores inflated display bytes; replay injects those bytes **uncompressed** (legal frames, not wire-identical RSV1).
+- Compose mode (dial a new socket with `replay_of`) is **not implemented**.
+
+**WebSocket frame breakpoints:** matching frames can be held before forward,
+edited, released, or dropped. Rules live only in memory (lost on restart) and
+are managed over the API or the inspector Breakpoints panel:
+
+```bash
+# Hold text and binary frames on example.com (default opcodes; not ping/pong/close)
+curl -s localhost:9091/api/breakpoints -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "id": "ws-1",
+    "enabled": true,
+    "kind": "ws",
+    "hosts": ["example.com"],
+    "pathPrefix": null,
+    "directions": [],
+    "opcodes": [],
+    "timeoutMs": 30000
+  }]
+}'
+
+# List held frames; release original or edited; drop without forwarding
+curl -s localhost:9091/api/pauses
+curl -s localhost:9091/api/pauses/$PAUSE_ID/release -X POST
+curl -s localhost:9091/api/pauses/$PAUSE_ID/release -H 'content-type: application/json' \
+  -d '{"text":"edited payload"}' -X POST
+curl -s localhost:9091/api/pauses/$PAUSE_ID/drop -X POST
+```
+
+`GET|PUT /api/breakpoints` replaces the whole rule list. Empty `hosts` matches
+any host; empty `directions` matches both; empty `opcodes` defaults to text and
+binary only so keepalive and the close handshake are never stalled by a rule.
+Each rule has a `timeoutMs`: if nobody releases or drops in time, the original
+frame is auto-forwarded. The live event socket emits `pause:hit` and
+`pause:resolved` (kind-tagged body: `ws` now, `http` later). Injected frames
+are never paused. With no enabled rules the proxy keeps its zero-latency
+byte-copy path.
+
+**WebSocket rewrite and drop:** matching frames can have their full payload
+replaced, or be dropped, before they are written. Rules apply per frame (not
+reassembled messages), before breakpoints, and are runtime-replaceable via
+`GET|PUT /api/ws-rewrite` or the inspector **WS rewrite** panel:
+
+```bash
+# Drop client-to-server text frames whose payload matches a regex
+curl -s localhost:9091/api/ws-rewrite -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "hosts": ["chat.example.com"],
+    "pathPrefix": "/ws",
+    "directions": ["send"],
+    "opcodes": [],
+    "textRegex": "secret",
+    "drop": true
+  }]
+}'
+
+# Replace every matching text payload on the wire
+curl -s localhost:9091/api/ws-rewrite -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "hosts": [],
+    "directions": [],
+    "opcodes": [1],
+    "replaceText": "rewritten"
+  }]
+}'
+```
+
+Empty `hosts` / `directions` match any; empty `opcodes` means text and binary
+only (never ping/pong/close by default). Capture records what went on the wire:
+a replace shows the new payload and a note under the flow's `rewrites`; a drop
+leaves only the note (no `ws_message`). Invalid `textRegex` or `replaceBase64`
+is rejected with 400 and the previous list stays in force. Injected frames skip
+rewrite rules. Opaque/broken framing has no structured match opportunity. When
+the 101 negotiates permessage-deflate, the proxy keeps an exact on-wire copy
+(no re-encode: RSV1 must survive) and inflates a copy for capture display
+(`compressed: true` on the message; `size` is still the wire length). REST
+flows, `ws:message` events, the inspector Frames tab, the GUI, and HAR
+(`_compressed`) all surface that flag when display bytes were inflated.
+Structured rewrite, text_regex, and breakpoints that re-encode do not apply
+under deflate; inject still sends uncompressed frames. With an empty rule list
+(and no breakpoints) and no deflate, the proxy keeps the zero-latency
+byte-copy path.
 
 **Captured but opaque:** anything excluded with `--skip`, plus non-HTTP
 protocols tunnelled through CONNECT. You get the endpoint, timing and byte
 counts, not the contents.
 
-**Not captured at all:**
+**Not captured on the default TCP proxy port:**
 
-- **QUIC and HTTP/3.** They run over UDP and do not traverse an HTTP proxy, so
-  those packets never reach Proxima. In practice, configuring a proxy makes most
-  clients fall back to TCP, but a client that insists on QUIC is invisible here.
+- **QUIC and HTTP/3 from a phone using only the HTTP proxy setting.** QUIC is
+  UDP; a classic CONNECT proxy never sees it. The TCP `--port` listener does
+  not invent HTTP/3 flows for CONNECT tunnels. Many clients fall back to TCP
+  when a proxy is configured, but a client that insists on QUIC is invisible on
+  `--port` alone.
 - **Apps that ignore the system proxy**, which some SDKs do deliberately.
 - **Traffic inside a VPN** the phone has already established.
 
+### QUIC / HTTP/3 (optional feature)
+
+The default binary does **not** link quinn or h3. QUIC is opt-in, like `gui`
+and `archive`, so a plain `cargo run` stays a TCP HTTPS proxy.
+
+**Enable the feature:**
+
+```bash
+cargo build --release --features quic
+cargo run --release --features quic -- --help
+```
+
+Requesting `--quic`, `--quic-port`, `--reverse-h3`, or `--mode reverse-h3`
+without that feature fails at startup with rebuild guidance
+(`cargo build --features quic` / `cargo run --features quic -- ...`).
+
+**0-RTT / early data is disabled** on both MITM legs (server
+`max_early_data_size = 0`, client `enable_early_data = false`, no
+`into_0rtt`). Handshakes are 1-RTT only: early data is replayable, tickets are
+not shared across client vs origin legs, and a debugging MITM needs a full
+handshake before capture is honest.
+
+**Accept-only UDP (inspect skeleton):** bind QUIC, terminate with the same CA
+as HTTPS, record each client H3 request stream as one flow, then answer `501`
+(no origin yet):
+
+```bash
+cargo run --release --features quic -- --quic-port 9443
+# or: --quic  (default UDP port 9443)
+```
+
+**Reverse HTTP/3:** speak H3 to clients on UDP, forward each stream to a fixed
+upstream authority over H3, and capture request/response bodies in the
+inspector:
+
+```bash
+cargo run --release --features quic -- \
+  --quic-port 9443 \
+  --reverse-h3 cloudflare-quic.com:443 \
+  --insecure
+```
+
+`--reverse-h3 host[:port]` alone implies reverse-h3 mode and defaults the UDP
+port to 9443. `--mode reverse-h3` is the same mode; it still needs
+`--reverse-h3`. Use `--quic-port 0` to let the OS assign an ephemeral UDP port
+(reported in the banner and status). `--insecure` is the same honesty as on
+TCP: upstream TLS may not match the name you are standing in for.
+
+What reverse records: one flow per client H3 request stream
+(`httpVersion` 3.0, transport quic, `server.alpn` from the negotiated client
+handshake when present), with optional connection/stream ids for multiplex.
+Control streams, QPACK table traffic, and datagrams are not turned into fake
+HTTP flows. 0-RTT early data is disabled on both legs.
+
+**Shared multiplex identity (HTTP/2 and HTTP/3):** list rows, full flows, the
+event socket (`flow:new` / `flow:update` / `flow:done`), and HAR all use the
+same optional camelCase keys: `connectionId` (Proxima UUID for the client
+multiplex session, not a wire QUIC CID), `streamId` (client-leg stream key when
+known), and on full flows only `upstreamStreamId` when MITM reopens a
+multiplexed origin leg. TCP HTTP/2 may set `connectionId` without `transport`;
+HTTP/3 sets `transport: "quic"`. HTTP/1.x and opaque tunnels omit the keys.
+Filter the inspector or `GET /api/flows?search=` by `connectionId` to group
+sibling streams on one session.
+
+**Still not a phone system-proxy path for QUIC.** Setting the phone's HTTP
+proxy to Proxima only sends TCP CONNECT to `--port`. Getting arbitrary app
+HTTP/3 into this process needs WireGuard or TUN (see PLANS.md). A
+`--features wireguard` scaffold can bind a UDP listen port (`--wireguard` /
+`--wg-port`, default 51820) and exposes status fields, but Noise/WG crypto and
+a working device tunnel are **not** shipped. Do not treat that bind as a phone
+VPN. A `--features tun` scaffold (`--tun` / `--mode tun`) starts a no-op task
+only: it does **not** open `utun` or `/dev/net/tun`, and is not working host
+capture. macOS would need utun/Network Extension (no TPROXY); Linux
+`/dev/net/tun` + `CAP_NET_ADMIN`; Windows host capture is not claimed. Reverse
+mode is for servers, tests, and clients you can point at Proxima as an H3
+origin on the UDP port. WireGuard, TUN, and reverse-h3 cannot be co-enabled
+in these scaffolds.
+
+**Chrome and user-installed CAs:** Chrome often refuses user CAs for QUIC even
+when the leaf is otherwise valid. If the client handshake fails with a cert
+reject, Proxima records an Error flow with code `quic_cert_reject` and may set
+`likely_pinning` with the same honesty caveats as TCP (that alert also covers
+Chrome user-CA policy, not only app pinning). Force the browser onto TCP/HTTP2
+(or a client that trusts the Proxima root for H3). That is a client policy
+limit, not something the TCP proxy can fix by pretending to see QUIC.
+
 **Visible, but as a failure:** apps that pin their certificates reject the
-Proxima leaf and their connections fail. Proxima recognises that specific TLS
-alert and labels the flow as likely pinning, so you can tell it apart from a
-network problem. Exclude those hosts with `--skip api.example.com` to let them
-through untouched.
+Proxima leaf and their connections fail. On TCP Proxima recognises the TLS
+alert and labels the flow as likely pinning. On QUIC the same alert class maps
+to `quic_cert_reject` (do not treat that as proof of app pinning vs Chrome's
+user-CA policy). Other stable codes on the UDP path: `quic_upstream`, `quic_alpn`,
+`h3`, `h3_abandoned`. Exclude pinned hosts with `--skip api.example.com` on the
+TCP path to let them through untouched.
+
+### Force-TCP operator tips (no product helper)
+
+Phone Wi-Fi "HTTP proxy" is **TCP CONNECT only**. UDP/QUIC never arrives on
+`--port`. Many mobile clients luckily fall back to HTTP/2 over that CONNECT
+tunnel; that is client behaviour, not Proxima "supporting" H3 on the proxy
+port. Clients that insist on QUIC stay invisible on the TCP listener.
+
+Practical ways to keep traffic on TCP where you control the client:
+
+- **Chrome / Chromium:** disable QUIC in flags or enterprise policy (names vary
+  by version; look for "Experimental QUIC protocol" / `QuicAllowed`), or point
+  only TCP-capable tools at the proxy.
+- **Prefer TCP-only clients** (curl without HTTP/3, many SDKs when a system
+  proxy is set) for day-to-day mobile work.
+- **Do not treat `quic_cert_reject` / `likely_pinning` as pure app pinning
+  proof.** Chrome's refusal of user CAs for QUIC produces the same class of
+  handshake failure on the optional UDP path.
+
+**What Proxima does not ship today:**
+
+- No built-in Alt-Svc strip, QUIC kill-switch, or client force-TCP flag.
+- No endpoint that rewrites origin headers to push browsers off H3.
+- `--no-http2` forces HTTP/1.1 on the **upstream** (origin) leg only; it does
+  not disable client QUIC, does not change the phone proxy path, and does not
+  invent H3 visibility on CONNECT.
+
+Status stays honest either way: `GET /api/status` exposes `quicEnabled`,
+`quicPort`, `quicNote`, and `reverseH3` when relevant, and never claims QUIC
+on the TCP `proxyPort`. Rebuild guidance appears when the feature is off.
 
 Capturing genuinely everything means putting the machine in the network path,
 as a transparent gateway or a VPN profile, rather than asking the device to
@@ -200,10 +491,25 @@ usually will not, unless it is a debug build with a permissive config.
     --map-host <host=target>             send one host's requests elsewhere
     --no-http2        force HTTP/1.1 upstream
     --insecure        accept invalid origin certificates
+    --mode <mode>     regular (TCP proxy) or reverse-h3
+                      (UDP HTTP/3 reverse; needs --features quic)
+    --quic            open a QUIC/UDP listener (accept-only on
+                      port 9443 unless --quic-port / --reverse-h3)
+    --quic-port <n>   UDP port for QUIC/HTTP3 (0 = ephemeral;
+                      default 9443 with --quic or reverse-h3)
+    --quic-host <ip>  bind address for QUIC UDP (default 0.0.0.0;
+                      use :: for dual-stack when the OS allows)
+    --reverse-h3 <host[:port]>
+                      reverse-proxy HTTP/3 on the QUIC UDP port
+                      (implies reverse-h3; needs --features quic)
 ```
 
 `PROXIMA_LOG=debug` turns on verbose logging. `RUST_LOG` is read as a second
 name for the same knob, so the reflex works too.
+
+The QUIC flags always parse; without `--features quic` they exit with rebuild
+guidance rather than silently ignoring UDP. Regular mode never opens a UDP
+socket unless you pass `--quic` / `--quic-port`.
 
 ## The certificate authority
 
@@ -238,9 +544,17 @@ src/
     mod.rs            CONNECT handling, TLS termination, dispatch
     forward.rs        sending a request upstream and recording both halves
     tunnel.rs         opaque tunnels for hosts that are not decrypted
-    websocket.rs      watching an upgraded socket without altering it
+    websocket.rs      upgraded socket copy, frame parse, and inject
     headers.rs        hop-by-hop stripping and the rest of the forwarding rules
     rewrite.rs        applying the configured edits to headers in flight
+  quic/               QUIC/UDP + HTTP/3 (behind --features quic only)
+    mod.rs            QuicServer, runtime knobs, accept loop
+    udp.rs            UDP bind and port-0 resolution
+    tls.rs            quinn ServerConfig/ClientConfig (ALPN h3, 0-RTT off)
+    endpoint.rs       quinn Endpoint accept/connect/drain
+    http3.rs          h3 session glue into FlowStore
+    reverse.rs        reverse HTTP/3 MITM and Host rewrite
+    forward_upstream.rs  dial origin over QUIC+H3
   capture/
     mod.rs            the flow ring buffer and the live event feed
     archive.rs        finished flows on disk, and the SQL over them
@@ -258,23 +572,29 @@ src/
     curl.rs           cURL export
 tests/
   e2e.rs              a real client, a real CONNECT, real TLS both ways
+  quic_reverse_e2e.rs reverse H3 MITM (required-features = ["quic"])
 ```
 
 ## Development
 
 ```bash
-cargo test --all-features               # unit tests, tests/e2e.rs, the window, the archive
+cargo test                              # default features: no quinn/h3
+cargo test --features quic              # unit tests in src/quic + quic_reverse_e2e
+cargo test --all-features               # unit tests, e2e, gui, archive, quic
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Both take every feature on purpose: the optional ones are a superset of the
-default build, and without them `src/gui.rs` and `src/capture/archive.rs` are
-neither tested nor linted. Drop the flag to check what someone building only the
-CLI gets, which is a case worth checking, since `archive.rs` compiles either way
-and the two halves have to keep the same shape.
+Default `cargo test` stays free of the UDP stack so the common CLI path stays
+fast to build. `--features quic` is required for `src/quic/*` module tests and
+for `tests/quic_reverse_e2e.rs` (Cargo.toml gates that target with
+`required-features = ["quic"]`). `--all-features` is a superset: without it
+`src/gui.rs`, `src/capture/archive.rs`, and `src/quic/` are neither fully
+tested nor linted. Drop the flag to check what someone building only the CLI
+gets, which is a case worth checking, since `archive.rs` and the Http3 domain
+types compile either way and have to keep the same shape.
 
-`tests/e2e.rs` is the one worth reading. The unit tests cover the pieces in
-isolation, which says nothing about whether a phone pointed at this proxy
-reaches the internet, so that file stands up an HTTPS origin with its own
-certificate, sends a real client through the proxy, and asserts on both what the
-client received and what the capture store recorded.
+`tests/e2e.rs` is the TCP path worth reading: an HTTPS origin with its own
+certificate, a real client through CONNECT, and asserts on both what the client
+received and what the capture store recorded. It does not claim QUIC visibility
+on the TCP proxy. The optional `quic_reverse_e2e` target exercises localhost
+UDP reverse MITM under `--features quic`.

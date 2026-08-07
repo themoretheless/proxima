@@ -108,14 +108,17 @@ const ICON: &str = "<link rel=\"icon\" href=\"data:image/svg+xml,%3Csvg xmlns='h
 const BODY: &str = r#"<header>
   <span class="mark">PROXIMA</span>
   <span id="dot" class="dot"></span><span id="state" class="state">connecting</span>
-  <input id="filter" type="search" placeholder="Filter by method, host, path or status" autocomplete="off" spellcheck="false" aria-label="Filter">
+  <input id="filter" type="search" placeholder="Filter by method, host, path, status or connection" autocomplete="off" spellcheck="false" aria-label="Filter">
   <span id="count" class="count"></span>
   <button id="theme" class="btn" type="button" title="Light, dark, or whatever this machine is set to">Theme: system</button>
   <button id="view" class="btn on" type="button">Hide tree</button>
+  <button id="break" class="btn" type="button" title="Hold WebSocket frames before they are forwarded">Breakpoints</button>
+  <button id="rewrite" class="btn" type="button" title="Replace or drop matching WebSocket frames on the wire">WS rewrite</button>
   <button id="compose" class="btn" type="button">Compose</button>
   <button id="clear" class="btn" type="button">Clear</button>
   <a class="btn" href="/setup">Set up a device</a>
 </header>
+<div id="pauses" class="pauses" hidden></div>
 <main>
   <section id="tree">
     <div id="live" class="part">
@@ -143,7 +146,7 @@ const BODY: &str = r#"<header>
       <input id="saved-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
              placeholder="Name or URL" aria-label="Search saved requests" hidden>
       <div id="books" role="tree" aria-label="Saved requests"></div>
-      <p id="no-books" class="pad hint">Nothing saved yet. Compose a request, name it, and save.</p>
+      <p id="no-books" class="pad hint">Nothing saved yet. Drag a live request here, copy one into a collection, or compose and save.</p>
     </div>
   </section>
   <section id="list">
@@ -162,6 +165,9 @@ const BODY: &str = r#"<header>
     <div class="c-line">
       <input id="c-name" type="text" autocomplete="off" placeholder="Name to save it under" aria-label="Name">
       <select id="c-book" aria-label="Collection"></select>
+      <select id="c-env" aria-label="Environment" title="{{var}} environment for send">
+        <option value="">No environment</option>
+      </select>
       <button id="c-save" class="btn" type="button">Save</button>
     </div>
     <div class="c-line">
@@ -178,6 +184,57 @@ const BODY: &str = r#"<header>
     <label class="c-label" for="c-body">Body</label>
     <textarea id="c-body" spellcheck="false"></textarea>
     <div id="c-out"></div>
+  </section>
+  <section id="breaker" hidden>
+    <p class="hint">Hold matching WebSocket frames before they are forwarded. Rules are runtime-only and lost on restart. Empty hosts matches any host. By default only text and binary frames pause; ping, pong and close keep flowing so keepalive and the close handshake do not stall. Injected frames skip breakpoints.</p>
+    <div class="c-line">
+      <input id="b-hosts" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Hosts, comma-separated (empty = any)" aria-label="Hosts">
+      <input id="b-path" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Path prefix (empty = any)" aria-label="Path prefix">
+      <input id="b-timeout" type="number" min="1000" max="300000" step="1000" value="30000"
+             aria-label="Timeout in milliseconds" title="Auto-release original after this many ms">
+    </div>
+    <div class="c-line">
+      <label class="b-check"><input id="b-enabled" type="checkbox" checked> Enabled</label>
+      <select id="b-dir" aria-label="Direction">
+        <option value="">both directions</option>
+        <option value="send">client to server</option>
+        <option value="recv">server to client</option>
+      </select>
+      <button id="b-save" class="btn" type="button">Save rules</button>
+      <button id="b-clear" class="btn" type="button">Clear all rules</button>
+    </div>
+    <p id="b-status" class="hint"></p>
+    <div id="b-list"></div>
+  </section>
+  <section id="rewriter" hidden>
+    <p class="hint">Replace or drop matching WebSocket frames before they are forwarded. Applied per frame (not reassembled messages), before breakpoints, and lost on restart unless you save again. Empty hosts matches any host. Empty opcodes mean text and binary only; ping, pong and close are never rewritten by default. Injected frames skip these rules. Drops leave a note on the flow and no frame in the list; replaces record the rewritten payload.</p>
+    <div class="c-line">
+      <input id="w-hosts" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Hosts, comma-separated (empty = any)" aria-label="Hosts">
+      <input id="w-path" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Path prefix (empty = any)" aria-label="Path prefix">
+      <input id="w-regex" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Text regex (optional, UTF-8 only)" aria-label="Text regex">
+    </div>
+    <div class="c-line">
+      <select id="w-dir" aria-label="Direction">
+        <option value="">both directions</option>
+        <option value="send">client to server</option>
+        <option value="recv">server to client</option>
+      </select>
+      <select id="w-action" aria-label="Action">
+        <option value="drop">drop frame</option>
+        <option value="replace">replace payload</option>
+      </select>
+      <input id="w-replace" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Replacement text (when replace)" aria-label="Replacement text">
+      <button id="w-save" class="btn" type="button">Save rules</button>
+      <button id="w-clear" class="btn" type="button">Clear all rules</button>
+    </div>
+    <p id="w-status" class="hint"></p>
+    <div id="w-list"></div>
   </section>
 </main>
 "#;
@@ -275,29 +332,77 @@ main.flat > #list, main.flat > #detail { grid-column: 1; }
 #detail { overflow: auto; padding: 12px 14px 40px; min-height: 0; }
 /* Composing takes the list and the pane under it, and leaves the tree alone: a
    saved request is opened from that tree, and covering it would put away the
-   thing being picked from. */
-main.composing { grid-template-rows: minmax(0, 1fr); }
-main.composing > #list, main.composing > #detail { display: none; }
+   thing being picked from. Breakpoints and WS rewrite rules use the same seat. */
+main.composing, main.breaking, main.rewriting { grid-template-rows: minmax(0, 1fr); }
+main.composing > #list, main.composing > #detail,
+main.breaking > #list, main.breaking > #detail,
+main.rewriting > #list, main.rewriting > #detail { display: none; }
 main.composing > #composer { grid-column: 2; grid-row: 1; }
 main.composing.flat > #composer { grid-column: 1; }
-#composer {
+main.breaking > #breaker { grid-column: 2; grid-row: 1; }
+main.breaking.flat > #breaker { grid-column: 1; }
+main.rewriting > #rewriter { grid-column: 2; grid-row: 1; }
+main.rewriting.flat > #rewriter { grid-column: 1; }
+#composer, #breaker, #rewriter {
   overflow: auto; min-height: 0; padding: 12px 14px 40px;
   display: flex; flex-direction: column; gap: 8px;
 }
-.c-line { display: flex; gap: 8px; }
+.c-line { display: flex; gap: 8px; flex-wrap: wrap; }
 #c-url { flex: 1; min-width: 0; }
-#composer select, #composer input, #composer textarea {
+#composer select, #composer input, #composer textarea,
+#breaker select, #breaker input, #breaker textarea,
+#rewriter select, #rewriter input, #rewriter textarea {
   background: var(--bg); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 5px 9px; font: inherit;
 }
-#composer select:focus, #composer input:focus, #composer textarea:focus {
+#composer select:focus, #composer input:focus, #composer textarea:focus,
+#breaker select:focus, #breaker input:focus, #breaker textarea:focus,
+#rewriter select:focus, #rewriter input:focus, #rewriter textarea:focus {
   outline: 1px solid var(--accent); border-color: var(--accent);
 }
 #composer textarea { min-height: 92px; resize: vertical; }
+#b-hosts, #b-path, #w-hosts, #w-path, #w-regex, #w-replace { flex: 1; min-width: 8rem; }
+#b-timeout { width: 7.5rem; }
+.b-check { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); white-space: nowrap; }
 .c-label {
   color: var(--dim); font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
 }
 .btn.on { border-color: var(--accent); color: var(--accent); }
+/* Held frames sit under the header so a timeout cannot hide behind a tab. */
+.pauses {
+  flex: none; max-height: 42%; overflow: auto;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 8px 12px; background: var(--err-bg); border-bottom: 1px solid var(--err-line);
+}
+.pause {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 11px; background: var(--field); border: 1px solid var(--err-line); border-radius: 8px;
+}
+.pause .p-head {
+  display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: baseline;
+}
+.pause .p-meta { color: var(--dim); font-size: 12px; }
+.pause .p-flow {
+  background: none; border: none; padding: 0; color: var(--accent);
+  font: inherit; cursor: pointer; text-decoration: underline;
+}
+.pause .p-flow:hover { color: var(--ink); }
+.pause .p-payload {
+  width: 100%; min-height: 56px; resize: vertical;
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px; font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.pause .p-payload:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.pause .p-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pause .p-status { margin: 0; color: var(--dim); font-size: 12px; }
+.rule {
+  display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline;
+  padding: 8px 10px; background: var(--field); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px;
+}
+.rule .off { color: var(--dim); }
+.rule .on { color: var(--good); }
 .head, .row {
   display: grid; align-items: baseline; gap: 10px; padding: 3px 12px;
   grid-template-columns: 4rem minmax(4rem, 11rem) minmax(0, 1fr) 4rem 4.6rem 4.4rem;
@@ -410,6 +515,14 @@ main.composing.flat > #composer { grid-column: 1; }
 }
 .kill:hover { color: var(--bad); }
 .sitem:hover .kill, .gline:hover .kill { visibility: visible; }
+/* Live rows drag into a collection; the target lights up so the drop is obvious. */
+.row[draggable="true"] { cursor: grab; }
+.row.dragging { opacity: .55; }
+.group.drop-over > .gline,
+#saved.drop-over > .shelf {
+  background: var(--pick);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .gline {
   display: flex; gap: 6px; align-items: baseline; padding: 3px 10px 3px 4px;
   cursor: default; border-radius: 0 6px 6px 0;
@@ -488,6 +601,15 @@ main.composing.flat > #composer { grid-column: 1; }
 .facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px 10px; margin-bottom: 14px; }
 .fkey { color: var(--dim); }
 .fval { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+/* Clickable connection id: filter the list to sibling streams on the same
+   multiplex session (H2 TLS or H3 QUIC). Same shape for both protocols. */
+button.flink {
+  display: inline; margin: 0; padding: 0; border: 0; background: transparent;
+  color: var(--accent); cursor: pointer; text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; word-break: break-all;
+}
+button.flink:hover { text-decoration: underline; }
 .block { margin-bottom: 16px; }
 .block h2 {
   font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
@@ -523,16 +645,55 @@ pre.body, pre.copy {
 .tabs .gap { flex: 1; min-width: 12px; }
 .panes.both { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 20px; }
 .panes.both > .wide { grid-column: 1 / -1; }
-.frame { display: grid; grid-template-columns: 9rem 9rem minmax(0, 1fr); gap: 8px; font-size: 12px; padding: 2px 0; }
+.frame { display: grid; grid-template-columns: 9rem 9rem minmax(0, 1fr) auto; gap: 8px; font-size: 12px; padding: 2px 0; align-items: start; }
 .frame .dir { color: var(--dim); }
 .frame.up .dir { color: var(--accent); }
 .frame .text { word-break: break-all; white-space: pre-wrap; }
+.frame .frame-replay {
+  height: 22px; width: 22px; padding: 0; flex: none;
+  color: var(--dim); border-color: transparent;
+}
+.frame .frame-replay:hover { color: var(--accent); border-color: var(--line); }
+/* Injected frames are real wire traffic, but they did not come from either peer,
+   so the list has to say so rather than looking like something the app did. */
+.frame.injected .dir::after { content: ' · injected'; color: var(--warn); }
+/* Display text/body is inflated (permessage-deflate); size is still the wire length. */
+.frame.compressed .dir::after { content: ' · compressed'; color: var(--info); }
+.inject {
+  display: flex; flex-direction: column; gap: 8px;
+  margin: 0 0 12px; padding: 10px 11px;
+  background: var(--field); border: 1px solid var(--line); border-radius: 8px;
+}
+.inject .c-line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.inject select, .inject input, .inject textarea {
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px; font: inherit;
+}
+.inject select:focus, .inject input:focus, .inject textarea:focus {
+  outline: 1px solid var(--accent); border-color: var(--accent);
+}
+.inject textarea { min-height: 56px; resize: vertical; width: 100%; }
+.inject .c-label {
+  color: var(--dim); font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+}
+.inject .hint { margin: 0; }
+/* Frame filters share the inject control language so the Frames tab stays one strip. */
+.inject.filters { margin-top: 0; }
+.inject.filters input[type="search"], .inject.filters input[type="text"] {
+  flex: 1; min-width: 8rem;
+}
+.inject.replay input[type="text"] { flex: 1; min-width: 10rem; }
+.inject.replay input[type="number"] { width: 6.5rem; }
+.frame.gap .dir { color: var(--dim); font-style: italic; }
+.frame.gap .meta { color: var(--dim); }
 @media (max-width: 1000px) {
   /* The tree is the pane you can do without: the filter box narrows the same
      list without taking a column to do it. */
   main, main.flat { grid-template-columns: minmax(0, 1fr); }
   main > #tree { display: none; }
-  main > #list, main > #detail, main.composing > #composer { grid-column: 1; }
+  main > #list, main > #detail,
+  main.composing > #composer, main.breaking > #breaker,
+  main.rewriting > #rewriter { grid-column: 1; }
   .head, .row { grid-template-columns: 3.6rem minmax(4rem, 8rem) minmax(0, 1fr) 3.4rem 4.2rem; }
   .head span:last-child, .row .dur { display: none; }
   /* Two columns of headers at this width are two columns of ellipsis. */
@@ -550,6 +711,10 @@ const SCRIPT: &str = r#"
   var MAX_FRAMES = 200;
   var RETRY_MIN = 400;
   var RETRY_MAX = 4000;
+  // Drag payload and clipboard envelope for live → saved request.
+  var FLOW_DRAG_TYPE = 'application/x-proxima-flow-id';
+  var SAVED_CLIP_TYPE = 'application/x-proxima-saved-request+json';
+  var SAVED_CLIP_PREFIX = 'proxima-saved-request:';
 
   var rowsEl = document.getElementById('rows');
   var treeEl = document.getElementById('hosts');
@@ -595,8 +760,23 @@ const SCRIPT: &str = r#"
   var backoff = RETRY_MIN;
   var frameList = null;
   var frameOwner = null;
+  // Retained window for the selected socket. Filters re-render from this, not
+  // from the DOM, so live appends and filter changes stay consistent.
+  var frameMessages = [];
+  // Absolute index of frameMessages[0] in the source flow ws_messages vector.
+  // Live retain shifts the front and bumps this so per-frame replay stays honest.
+  var frameIndexBase = 0;
+  // Status line under the replay form; per-row replay reuses it when present.
+  var replayStatusEl = null;
+  // direction: '' | 'send' | 'recv'; opcodes: null | { [code]: true }; query: lowercased needle.
+  var frameFilters = { direction: '', opcodes: null, query: '' };
   var side = 'info';
   var paired = false;
+  // Held frames keyed by pauseId. The strip under the header is drawn from this
+  // map so a reconnect can refill it from GET /api/pauses without inventing state.
+  var pauses = new Map();
+  var pauseTimer = 0;
+  var breakRules = [];
 
   // Every string that came off the wire enters the document through here, and
   // textContent is why a captured body full of markup stays a captured body
@@ -661,16 +841,32 @@ const SCRIPT: &str = r#"
     // value ever needs quoting.
     row.flowId = flow.id;
     row.hidden = true;
+    // Drag onto a collection to save. The payload is the flow id; the drop
+    // side rebuilds a SendSpec so the body is taken at drop time, not at grab.
+    row.draggable = true;
+    row.addEventListener('dragstart', function (event) {
+      row.classList.add('dragging');
+      event.dataTransfer.effectAllowed = 'copy';
+      event.dataTransfer.setData(FLOW_DRAG_TYPE, row.flowId);
+      event.dataTransfer.setData('text/plain', row.flowId);
+    });
+    row.addEventListener('dragend', function () {
+      row.classList.remove('dragging');
+      clearDropMarks();
+    });
+    row.addEventListener('click', function () { select(row.flowId); });
     row.appendChild(el('span', 'method'));
     var host = el('span', 'host');
     host.appendChild(el('span', 'hostname'));
-    host.appendChild(el('span', 'pin', 'PINNED'));
+    var pin = el('span', 'pin', 'PINNED');
+    // Cert-reject signal only; not pure app-pinning proof (Chrome user-CA too).
+    pin.title = 'Client rejected the Proxima certificate (pinning or user-CA policy). Not pure pinning proof.';
+    host.appendChild(pin);
     row.appendChild(host);
     row.appendChild(el('span', 'path'));
     row.appendChild(el('span', 'status'));
     row.appendChild(el('span', 'size'));
     row.appendChild(el('span', 'dur'));
-    row.addEventListener('click', function () { select(row.flowId); });
     return row;
   }
 
@@ -684,6 +880,17 @@ const SCRIPT: &str = r#"
     row.querySelector('.dur').textContent =
       typeof flow.duration === 'number' ? millis(flow.duration) : '...';
 
+    // Hover shows shared multiplex identity (H2 and H3 use the same keys).
+    // List columns stay quiet so ordinary HTTP/1 rows do not grow chrome.
+    var tips = [];
+    if (flow.httpVersion) { tips.push('HTTP/' + str(flow.httpVersion)); }
+    if (flow.transport) { tips.push(str(flow.transport)); }
+    if (flow.connectionId) { tips.push('conn ' + str(flow.connectionId)); }
+    if (flow.streamId != null && flow.streamId !== undefined) {
+      tips.push('stream ' + String(flow.streamId));
+    }
+    row.title = tips.join(' · ');
+
     var mark = statusClass(flow);
     var cls = 'row ' + mark;
     if (flow.likelyPinning) { cls += ' pinned'; }
@@ -695,7 +902,9 @@ const SCRIPT: &str = r#"
 
     needles.set(flow.id, [
       str(flow.method), str(flow.authority), str(flow.path),
-      statusLabel(flow), str(flow.error), str(flow.client)
+      statusLabel(flow), str(flow.error), str(flow.client),
+      str(flow.httpVersion), str(flow.transport),
+      str(flow.connectionId), str(flow.streamId)
     ].join(' ').toLowerCase());
     summaries.set(flow.id, flow);
     settle(flow);
@@ -840,6 +1049,9 @@ const SCRIPT: &str = r#"
     selectedId = null;
     frameList = null;
     frameOwner = null;
+    frameMessages = [];
+    frameIndexBase = 0;
+    replayStatusEl = null;
     detailToken += 1;
     hint('Pick a request to see its headers and body.');
     tally();
@@ -1199,6 +1411,9 @@ const SCRIPT: &str = r#"
     strip(detailEl);
     frameList = null;
     frameOwner = null;
+    frameMessages = [];
+    frameIndexBase = 0;
+    replayStatusEl = null;
     detailEl.appendChild(el('p', 'hint', text));
   }
 
@@ -1223,6 +1438,9 @@ const SCRIPT: &str = r#"
     strip(detailEl);
     frameList = null;
     frameOwner = null;
+    frameMessages = [];
+    frameIndexBase = 0;
+    replayStatusEl = null;
     var request = flow.request || {};
     var response = flow.response || null;
 
@@ -1230,8 +1448,26 @@ const SCRIPT: &str = r#"
     // One line, and the copy sits at the head of it: it acts on the URL beside
     // it, and a row of its own for a single control was a row of mostly nothing.
     head.appendChild(copyBar(flow, request, response));
-    head.appendChild(el('span', 'dmethod', str(request.method)));
-    head.appendChild(el('span', 'durl mono', str(request.url)));
+    // HTTP/2 and HTTP/3 sit on multiplexed sessions; surface the version next
+    // to the method so H2/H3 are obvious without opening Info. HTTP/1 stays
+    // as method alone.
+    var methodLabel = str(request.method);
+    if (request.httpVersion === '2.0' || request.httpVersion === '3.0') {
+      methodLabel = methodLabel + '  ' + str(request.httpVersion);
+    }
+    head.appendChild(el('span', 'dmethod', methodLabel));
+    var durl = el('span', 'durl mono', str(request.url));
+    // Same drag source as list rows: pull the detail URL onto a collection.
+    if (flow.id && request.url) {
+      durl.draggable = true;
+      durl.title = 'Drag onto a collection to save';
+      durl.addEventListener('dragstart', function (event) {
+        event.dataTransfer.effectAllowed = 'copy';
+        event.dataTransfer.setData(FLOW_DRAG_TYPE, flow.id);
+        event.dataTransfer.setData('text/plain', flow.id);
+      });
+    }
+    head.appendChild(durl);
     detailEl.appendChild(head);
 
     sides(flow, request, response);
@@ -1243,7 +1479,11 @@ const SCRIPT: &str = r#"
      tab you had just moved away from. */
 
   function sides(flow, request, response) {
-    var frames = Array.isArray(flow.wsMessages) ? flow.wsMessages : null;
+    // A live upgrade may still have an empty list. The Frames tab still has to
+    // exist so a frame can be injected before either peer has said anything.
+    var frames = Array.isArray(flow.wsMessages)
+      ? flow.wsMessages
+      : (flow.kind === 'websocket' ? [] : null);
     var tabs = el('div', 'tabs');
     var panes = el('div', 'panes');
     var buttons = [];
@@ -1253,6 +1493,9 @@ const SCRIPT: &str = r#"
       // Whatever the frame list was pointing at is about to leave the document.
       frameList = null;
       frameOwner = null;
+      frameMessages = [];
+      frameIndexBase = 0;
+      replayStatusEl = null;
       panes.className = paired ? 'panes both' : 'panes';
 
       for (var i = 0; i < buttons.length; i++) {
@@ -1309,16 +1552,31 @@ const SCRIPT: &str = r#"
     // side by side they take the full width instead of a column each.
     var box = el('div', which === 'request' || which === 'response' ? 'pane' : 'pane wide');
     if (which === 'frames') {
-      box.appendChild(frameBlock(flow.id, frames));
+      box.appendChild(frameBlock(flow.id, frames, flow));
       return box;
     }
     if (which === 'info') {
       box.appendChild(facts(flow, request, response));
+      if (Array.isArray(flow.rewrites) && flow.rewrites.length) {
+        var rw = el('section', 'block');
+        rw.appendChild(el('h2', null, 'Rewrites'));
+        for (var ri = 0; ri < flow.rewrites.length; ri++) {
+          rw.appendChild(el('p', 'mono', str(flow.rewrites[ri])));
+        }
+        box.appendChild(rw);
+      }
       if (flow.error) {
         var trouble = el('div', 'error');
-        trouble.appendChild(el('div', 'etitle', str(flow.error.message)));
+        var etitle = str(flow.error.message);
+        if (flow.error.code) {
+          etitle = '[' + str(flow.error.code) + '] ' + etitle;
+        }
+        trouble.appendChild(el('div', 'etitle', etitle));
         if (flow.error.likelyPinning) {
-          trouble.appendChild(el('p', null, 'The client rejected the Proxima certificate, which almost always means the app pins its own. Nothing here is broken and no setting on this machine will decrypt it: the app has to be built against a permissive network security config, or run on a device where Proxima is in the system trust store.'));
+          // likelyPinning is a cert-reject signal, not pure app-pinning proof:
+          // Chrome often refuses user CAs for QUIC, and TCP UnknownCA alerts
+          // cover the same class. See README force-TCP / Chrome user-CA notes.
+          trouble.appendChild(el('p', null, 'The client rejected the Proxima certificate. That often means the app pins its own CA, but it is not pure pinning proof: on QUIC especially, Chrome may refuse a user-installed CA even when the leaf is otherwise valid. Nothing here decrypts it; build the app against a permissive network security config, put Proxima in the system trust store, or force the client onto TCP/HTTP2. Exclude the host with --skip to let traffic through untouched.'));
         }
         box.appendChild(trouble);
       }
@@ -1342,6 +1600,17 @@ const SCRIPT: &str = r#"
       : statusLabel({ state: flow.state, kind: flow.kind, error: flow.error })]);
     pairs.push(['Kind', str(flow.kind) + (flow.intercepted ? ', decrypted' : ', not decrypted')]);
     pairs.push(['HTTP', str(request.httpVersion)]);
+    // transport is orthogonal to multiplex: omit for TCP (including H2);
+    // "quic" only for H3. connectionId/streamId are the shared H2+H3 session
+    // identity (Proxima UUID per client multiplex session, not a wire CID).
+    if (flow.transport) { pairs.push(['Transport', str(flow.transport)]); }
+    if (flow.connectionId) { pairs.push(['Connection', str(flow.connectionId)]); }
+    if (flow.streamId != null && flow.streamId !== undefined) {
+      pairs.push(['Stream id', String(flow.streamId)]);
+    }
+    if (flow.upstreamStreamId != null && flow.upstreamStreamId !== undefined) {
+      pairs.push(['Upstream stream id', String(flow.upstreamStreamId)]);
+    }
     pairs.push(['Started', clock(timings.start)]);
     pairs.push(['Duration', typeof timings.end === 'number' && typeof timings.start === 'number'
       ? millis(timings.end - timings.start)
@@ -1363,9 +1632,36 @@ const SCRIPT: &str = r#"
     var grid = el('div', 'facts');
     for (var i = 0; i < pairs.length; i++) {
       grid.appendChild(el('span', 'fkey', pairs[i][0]));
-      grid.appendChild(el('span', 'fval', pairs[i][1]));
+      // Connection is a Proxima multiplex session key. Clicking it filters the
+      // list so sibling streams on the same H2 TLS or H3 QUIC session group.
+      if (pairs[i][0] === 'Connection' && flow.connectionId) {
+        var link = el('button', 'flink', shortId(flow.connectionId));
+        link.type = 'button';
+        link.title = 'Filter list to this multiplex session\n' + str(flow.connectionId);
+        link.addEventListener('click', function () {
+          filterByConnection(str(flow.connectionId));
+        });
+        grid.appendChild(link);
+      } else {
+        grid.appendChild(el('span', 'fval', pairs[i][1]));
+      }
     }
     return grid;
+  }
+
+  // Shorten a UUID-like connection id for the facts grid; full value stays in
+  // title and is what filter-by-connection uses.
+  function shortId(id) {
+    var s = str(id);
+    if (s.length <= 12) { return s; }
+    return s.slice(0, 8) + '...';
+  }
+
+  function filterByConnection(connectionId) {
+    if (!connectionId) { return; }
+    filterEl.value = connectionId;
+    needle = connectionId.trim().toLowerCase();
+    rows.forEach(function (row, id) { filterRow(row, id); });
   }
 
   function headerBlock(title, headers) {
@@ -1466,26 +1762,391 @@ const SCRIPT: &str = r#"
     }
   }
 
-  function frameBlock(id, messages) {
+  function frameBlock(id, messages, flow) {
     var block = el('section', 'block');
     block.appendChild(el('h2', null, 'WebSocket frames'));
+    block.appendChild(injectForm(id, flow));
+    block.appendChild(replayForm(id, flow));
+    block.appendChild(frameFilterBar());
     frameList = el('div', 'frames mono');
     frameOwner = id;
-    var recent = messages.slice(-MAX_FRAMES);
-    for (var i = 0; i < recent.length; i++) {
-      frameList.appendChild(frameLine(recent[i]));
-    }
+    // Keep a retained window, then paint only the rows that match the filters.
+    var all = Array.isArray(messages) ? messages : [];
+    frameMessages = all.slice(-MAX_FRAMES);
+    frameIndexBase = Math.max(0, all.length - frameMessages.length);
+    renderFrames();
     block.appendChild(frameList);
     return block;
   }
 
-  function frameLine(message) {
+  /* Filters apply to the retained window (not the DOM alone). Search uses the
+     raw captured text; display can pretty-print JSON without changing matches. */
+  function matchesFrame(message) {
+    if (!message) { return false; }
+    if (frameFilters.direction && message.direction !== frameFilters.direction) {
+      return false;
+    }
+    if (frameFilters.opcodes && !frameFilters.opcodes[message.opcode]) {
+      return false;
+    }
+    var needle = frameFilters.query;
+    if (needle) {
+      var raw = typeof message.text === 'string' ? message.text : '';
+      if (raw.toLowerCase().indexOf(needle) < 0) { return false; }
+    }
+    return true;
+  }
+
+  function displayText(message) {
+    var raw = typeof message.text === 'string' ? message.text : null;
+    if (raw === null) { return null; }
+    // Text frames only: pretty-print when the payload is JSON, else leave raw.
+    if (message.opcode === 1) {
+      try {
+        return JSON.stringify(JSON.parse(raw), null, 2);
+      } catch (error) {
+        return raw;
+      }
+    }
+    return raw;
+  }
+
+  function renderFrames() {
+    if (!frameList) { return; }
+    strip(frameList);
+    for (var i = 0; i < frameMessages.length; i++) {
+      if (matchesFrame(frameMessages[i])) {
+        frameList.appendChild(frameLine(frameMessages[i], frameIndexBase + i));
+      }
+    }
+  }
+
+  function retainFrame(message) {
+    frameMessages.push(message || {});
+    while (frameMessages.length > MAX_FRAMES) {
+      frameMessages.shift();
+      frameIndexBase += 1;
+    }
+  }
+
+  function isInjectableOpcode(code) {
+    return code === 1 || code === 2 || code === 8 || code === 9 || code === 10;
+  }
+
+  function frameFilterBar() {
+    var bar = el('div', 'inject filters');
+    bar.appendChild(el('p', 'hint',
+      'Filter the list. Search matches raw frame text; JSON is pretty-printed below.'));
+
+    var line = el('div', 'c-line');
+    var dir = document.createElement('select');
+    dir.setAttribute('aria-label', 'Frame direction filter');
+    addOption(dir, '', 'any direction');
+    addOption(dir, 'send', 'client to server');
+    addOption(dir, 'recv', 'server to client');
+    dir.value = frameFilters.direction || '';
+    line.appendChild(dir);
+
+    var op = document.createElement('select');
+    op.setAttribute('aria-label', 'Frame opcode filter');
+    addOption(op, '', 'any opcode');
+    addOption(op, '1', 'text');
+    addOption(op, '2', 'binary');
+    addOption(op, '8', 'close');
+    addOption(op, '9', 'ping');
+    addOption(op, '10', 'pong');
+    // Reflect a single-code set as the select value; multi is unused in this UI.
+    op.value = frameFilters.opcodes
+      ? String(Object.keys(frameFilters.opcodes)[0] || '')
+      : '';
+    line.appendChild(op);
+
+    var query = document.createElement('input');
+    query.type = 'search';
+    query.placeholder = 'search frame text';
+    query.spellcheck = false;
+    query.setAttribute('aria-label', 'Search frame text');
+    query.value = frameFilters.query || '';
+    line.appendChild(query);
+    bar.appendChild(line);
+
+    function applyFilters() {
+      frameFilters.direction = dir.value || '';
+      if (op.value === '') {
+        frameFilters.opcodes = null;
+      } else {
+        var set = {};
+        set[Number(op.value)] = true;
+        frameFilters.opcodes = set;
+      }
+      frameFilters.query = query.value.trim().toLowerCase();
+      renderFrames();
+    }
+    dir.addEventListener('change', applyFilters);
+    op.addEventListener('change', applyFilters);
+    query.addEventListener('input', applyFilters);
+    return bar;
+  }
+
+  function addOption(select, value, label) {
+    var option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+
+  /* The form posts to /api/flows/{id}/ws/send. The event socket appends the
+     recorded frame afterwards, so a successful inject must not also draw the
+     response here or the list would double every frame. */
+  function injectForm(id, flow) {
+    var form = el('div', 'inject');
+    var closed = flow && (flow.state === 'complete' || flow.state === 'error' ||
+      flow.state === 'aborted');
+    form.appendChild(el('p', 'hint', closed
+      ? 'This socket is closed. Inject only works on a live upgraded flow.'
+      : 'Inject a frame into the live connection. Written immediately; skips rewrite rules and breakpoints; recorded like wire traffic and marked injected. Client to server is masked; server to client is not. Opcodes text, binary, ping, pong, close only (no continuations or drop markers).'));
+
+    var line = el('div', 'c-line');
+    var dir = document.createElement('select');
+    dir.setAttribute('aria-label', 'Direction');
+    addOption(dir, 'send', 'client to server');
+    addOption(dir, 'recv', 'server to client');
+    line.appendChild(dir);
+
+    var op = document.createElement('select');
+    op.setAttribute('aria-label', 'Opcode');
+    addOption(op, '1', 'text');
+    addOption(op, '2', 'binary');
+    addOption(op, '9', 'ping');
+    addOption(op, '10', 'pong');
+    addOption(op, '8', 'close');
+    line.appendChild(op);
+
+    var go = el('button', 'btn', 'Inject');
+    go.type = 'button';
+    line.appendChild(go);
+    form.appendChild(line);
+
+    var closeLine = el('div', 'c-line');
+    closeLine.hidden = true;
+    var code = document.createElement('input');
+    code.type = 'number';
+    code.value = '1000';
+    code.min = '0';
+    code.max = '65535';
+    code.setAttribute('aria-label', 'Close code');
+    closeLine.appendChild(code);
+    var reason = document.createElement('input');
+    reason.type = 'text';
+    reason.placeholder = 'close reason';
+    reason.setAttribute('aria-label', 'Close reason');
+    reason.spellcheck = false;
+    closeLine.appendChild(reason);
+    form.appendChild(closeLine);
+
+    var payloadLabel = el('label', 'c-label', 'Payload');
+    form.appendChild(payloadLabel);
+    var payload = document.createElement('textarea');
+    payload.spellcheck = false;
+    payload.setAttribute('aria-label', 'Payload');
+    form.appendChild(payload);
+
+    var status = el('p', 'hint');
+    form.appendChild(status);
+
+    function showClose(on) {
+      closeLine.hidden = !on;
+      payload.hidden = on;
+      payloadLabel.hidden = on;
+      if (!on) {
+        payloadLabel.textContent = op.value === '2'
+          ? 'Payload (sent as UTF-8 bytes)'
+          : 'Payload';
+      }
+    }
+    op.addEventListener('change', function () { showClose(op.value === '8'); });
+
+    go.addEventListener('click', function () {
+      injectFrame(id, dir.value, Number(op.value), payload.value, code.value,
+        reason.value, go, status);
+    });
+    return form;
+  }
+
+  async function injectFrame(id, direction, opcode, text, closeCode, closeReason, button, status) {
+    var body = { direction: direction, opcode: opcode };
+    if (opcode === 8) {
+      var code = parseInt(closeCode, 10);
+      if (!isFinite(code) || code < 0 || code > 65535) {
+        status.textContent = 'Close code must be between 0 and 65535.';
+        return;
+      }
+      body.closeCode = code;
+      if (closeReason) { body.closeReason = closeReason; }
+    } else if (opcode === 2) {
+      body.dataBase64 = toBase64(text);
+    } else if (text) {
+      body.text = text;
+    }
+
+    button.disabled = true;
+    status.textContent = 'Injecting...';
+    try {
+      var response = await fetch('/api/flows/' + encodeURIComponent(id) + '/ws/send', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* body may not be JSON */ }
+      if (!response.ok) {
+        status.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : ('Inject failed (' + response.status + ')');
+        return;
+      }
+      status.textContent = 'Injected.';
+    } catch (error) {
+      status.textContent = 'Could not inject: ' + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  /* Replay posts to /api/flows/{id}/ws/replay. Like inject, the event socket
+     owns list rows: a successful replay must not paint response.messages here
+     or same-flow injects would double every frame. */
+  function replayForm(id, flow) {
+    var form = el('div', 'inject replay');
+    var closed = flow && (flow.state === 'complete' || flow.state === 'error' ||
+      flow.state === 'aborted');
+    form.appendChild(el('p', 'hint', closed
+      ? 'This socket is closed. Replay only works onto a live upgraded flow (use another targetFlowId if needed).'
+      : 'Replay captured frames onto this live socket (or another live target). Drop markers and continuations are skipped; compressed frames re-inject inflated bytes uncompressed.'));
+
+    var line = el('div', 'c-line');
+    var dir = document.createElement('select');
+    dir.setAttribute('aria-label', 'Replay direction filter');
+    addOption(dir, '', 'both directions');
+    addOption(dir, 'send', 'client to server only');
+    addOption(dir, 'recv', 'server to client only');
+    line.appendChild(dir);
+
+    var delay = document.createElement('input');
+    delay.type = 'number';
+    delay.min = '0';
+    delay.max = '60000';
+    delay.step = '10';
+    delay.value = '0';
+    delay.placeholder = 'delay ms';
+    delay.setAttribute('aria-label', 'Delay between frames in milliseconds');
+    delay.title = 'Milliseconds to wait between successful injects';
+    line.appendChild(delay);
+
+    var go = el('button', 'btn', 'Replay history');
+    go.type = 'button';
+    line.appendChild(go);
+    form.appendChild(line);
+
+    var targetLine = el('div', 'c-line');
+    var target = document.createElement('input');
+    target.type = 'text';
+    target.spellcheck = false;
+    target.autocomplete = 'off';
+    target.placeholder = 'target flow id (empty = this flow)';
+    target.setAttribute('aria-label', 'Target flow id');
+    targetLine.appendChild(target);
+    form.appendChild(targetLine);
+
+    var status = el('p', 'hint');
+    form.appendChild(status);
+    replayStatusEl = status;
+
+    go.addEventListener('click', function () {
+      var directions = dir.value ? [dir.value] : null;
+      var delayMs = parseInt(delay.value, 10);
+      if (!isFinite(delayMs) || delayMs < 0) { delayMs = 0; }
+      var targetId = target.value.trim() || null;
+      replayFrames(id, null, directions, delayMs, targetId, go, status);
+    });
+    return form;
+  }
+
+  async function replayFrames(sourceId, indices, directions, delayMs, targetFlowId, button, status) {
+    var body = {};
+    body.mode = 'live';
+    if (indices && indices.length) { body.indices = indices; }
+    if (directions && directions.length) { body.directions = directions; }
+    if (delayMs > 0) { body.delayMs = delayMs; }
+    if (targetFlowId) { body.targetFlowId = targetFlowId; }
+    body.stopOnError = true;
+
+    button.disabled = true;
+    status.textContent = 'Replaying...';
+    try {
+      var response = await fetch('/api/flows/' + encodeURIComponent(sourceId) + '/ws/replay', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* body may not be JSON */ }
+      if (!response.ok) {
+        status.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : ('Replay failed (' + response.status + ')');
+        return;
+      }
+      var sent = parsed && typeof parsed.sent === 'number' ? parsed.sent : 0;
+      var planned = parsed && typeof parsed.planned === 'number' ? parsed.planned : 0;
+      var skipped = parsed && typeof parsed.skipped === 'number' ? parsed.skipped : 0;
+      var note = 'Replayed ' + sent + ' of ' + planned + ' frame' + (planned === 1 ? '' : 's');
+      if (skipped) { note += ' (' + skipped + ' skipped)'; }
+      note += '.';
+      if (parsed && parsed.error) { note += ' ' + String(parsed.error); }
+      status.textContent = note;
+    } catch (error) {
+      status.textContent = 'Could not replay: ' + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function frameLine(message, absoluteIndex) {
     var out = message.direction === 'send';
-    var line = el('div', out ? 'frame up' : 'frame down');
-    line.appendChild(el('span', 'dir', out ? 'client to server' : 'server to client'));
-    line.appendChild(el('span', 'meta',
-      opcode(message.opcode) + ', ' + size(message.size) + (message.truncated ? ', cut short' : '')));
-    if (typeof message.text === 'string') { line.appendChild(el('span', 'text', message.text)); }
+    var gap = message.opcode === 15;
+    var line = el('div', gap ? 'frame gap' : (out ? 'frame up' : 'frame down'));
+    if (message.injected) { line.className += ' injected'; }
+    // Capture-side inflate only: on-wire bytes stayed compressed (RSV1 intact).
+    if (message.compressed) { line.className += ' compressed'; }
+    line.appendChild(el('span', 'dir', gap
+      ? 'retention gap'
+      : (out ? 'client to server' : 'server to client')));
+    var meta = opcode(message.opcode) + ', ' + size(message.size);
+    // size is wire length; text/body_id may already be inflated when compressed.
+    if (message.compressed) { meta += ' wire'; }
+    if (message.truncated && !gap) { meta += ', cut short'; }
+    line.appendChild(el('span', 'meta', meta));
+    // Search raw text via matchesFrame; paint pretty JSON when it applies.
+    var shown = displayText(message);
+    if (typeof shown === 'string') { line.appendChild(el('span', 'text', shown)); }
+    // Single-frame replay onto the same live flow. Gaps and non-injectable
+    // opcodes stay off the button: the server would refuse them closed.
+    if (!gap && isInjectableOpcode(message.opcode) && typeof absoluteIndex === 'number') {
+      var again = el('button', 'icon frame-replay', '↻');
+      again.type = 'button';
+      again.title = 'Replay this frame onto the live socket';
+      again.setAttribute('aria-label', 'Replay this frame');
+      again.addEventListener('click', function () {
+        var status = replayStatusEl || el('p', 'hint');
+        replayFrames(frameOwner, [absoluteIndex], null, 0, null, again, status);
+      });
+      line.appendChild(again);
+    }
     return line;
   }
 
@@ -1495,6 +2156,8 @@ const SCRIPT: &str = r#"
     if (code === 8) { return 'close'; }
     if (code === 9) { return 'ping'; }
     if (code === 10) { return 'pong'; }
+    // Capture ring-buffer marker (WS_DROPPED_OPCODE = 0xf), not a real frame.
+    if (code === 15) { return 'gap'; }
     return 'opcode ' + str(code);
   }
 
@@ -1555,6 +2218,25 @@ const SCRIPT: &str = r#"
         item('Response body', function () { return bodyText(flow.id, 'response'); });
       }
     }
+    // Live → saved: clipboard copy of a SavedRequest, and a direct save that
+    // does not require opening the composer first.
+    item('Copy as saved request', function () {
+      return flowToSavedJson(flow.id);
+    });
+    var saveItem = el('button', 'mitem', 'Save to collection');
+    saveItem.type = 'button';
+    saveItem.setAttribute('role', 'menuitem');
+    saveItem.addEventListener('click', function () {
+      shut();
+      saveFlowToCollection(flow.id, null).then(function (name) {
+        says(mark, '✓', 'Saved as ' + name);
+        setTimeout(function () { says(mark, COPY_MARK, 'Copy as cURL'); }, 2000);
+      }).catch(function (error) {
+        says(mark, '!', error.message || 'Could not save');
+        setTimeout(function () { says(mark, COPY_MARK, 'Copy as cURL'); }, 3000);
+      });
+    });
+    menu.appendChild(saveItem);
 
     caret.addEventListener('click', function (event) {
       // Without this the document listener below would close the menu in the
@@ -1668,16 +2350,57 @@ const SCRIPT: &str = r#"
     }
     if (event.type === 'clear') { wipe(); return; }
     if (event.type === 'status') {
+      // Surface QUIC / WireGuard / TUN facts on the chrome status strip when
+      // present. Never invent a working tunnel or host capture: WG and TUN
+      // are scaffold-only.
+      var st = event.status || {};
+      var stripBits = [];
+      var titleBits = [];
+      if (st.quicEnabled || st.quicPort || st.quicNote || st.reverseH3) {
+        if (st.quicPort) { stripBits.push('QUIC :' + st.quicPort); }
+        if (st.reverseH3) { stripBits.push('reverse ' + st.reverseH3); }
+        else if (st.quicPort) { stripBits.push('accept-only'); }
+        if (st.quicNote) { titleBits.push(String(st.quicNote)); }
+      }
+      if (st.wireguardEnabled || st.wireguardPort || st.wireguardNote) {
+        if (st.wireguardPort) {
+          stripBits.push('WG :' + st.wireguardPort + ' scaffold');
+        }
+        if (st.wireguardNote) { titleBits.push(String(st.wireguardNote)); }
+      }
+      if (st.tunEnabled || st.tunActive || st.tunNote) {
+        if (st.tunActive) {
+          stripBits.push('TUN scaffold');
+        }
+        if (st.tunNote) { titleBits.push(String(st.tunNote)); }
+      }
+      if (titleBits.length) {
+        stateEl.title = titleBits.join(' ');
+      }
+      if (stripBits.length && (stateEl.textContent === 'live' ||
+          (stateEl.textContent.indexOf('QUIC') < 0 &&
+           stateEl.textContent.indexOf('WG') < 0 &&
+           stateEl.textContent.indexOf('TUN') < 0))) {
+        link('live', 'live · ' + stripBits.slice(0, 3).join(' · '));
+      }
       // The first one is the handshake. A later one means the socket dropped
       // events on the floor and this list has holes in it.
       if (greeted) { reload(); } else { greeted = true; }
       return;
     }
     if (event.type === 'ws:message' && event.id === frameOwner && frameList) {
-      frameList.appendChild(frameLine(event.message || {}));
-      while (frameList.childElementCount > MAX_FRAMES) {
-        frameList.removeChild(frameList.firstChild);
-      }
+      // Trim the retained window, then re-render so active filters apply to live
+      // rows the same way they do after a filter change (including injects).
+      retainFrame(event.message || {});
+      renderFrames();
+      return;
+    }
+    if (event.type === 'pause:hit' && event.pause) {
+      notePause(event.pause);
+      return;
+    }
+    if (event.type === 'pause:resolved' && event.pauseId) {
+      clearPause(event.pauseId);
     }
   }
 
@@ -1697,11 +2420,539 @@ const SCRIPT: &str = r#"
     } catch (error) {
       stateEl.textContent = 'cannot read flows';
     }
+    // Pauses outlive a list rebuild: refill from the hub so a lagged socket
+    // cannot leave a held frame invisible until it times out.
+    await loadPauses();
     var pending = queue;
     queue = null;
     for (var j = 0; j < pending.length; j++) { apply(pending[j]); }
     tally();
     if (reopen && rows.has(reopen)) { select(reopen); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* breakpoints and held pauses                                       */
+  /* ---------------------------------------------------------------- */
+
+  var pausesEl = document.getElementById('pauses');
+  var breakBtn = document.getElementById('break');
+  var breakerEl = document.getElementById('breaker');
+  var breakStatusEl = document.getElementById('b-status');
+  var breakListEl = document.getElementById('b-list');
+
+  function notePause(pause) {
+    if (!pause || !pause.pauseId) { return; }
+    pauses.set(pause.pauseId, pause);
+    paintPauses();
+  }
+
+  function clearPause(pauseId) {
+    if (!pauses.delete(pauseId)) { return; }
+    paintPauses();
+  }
+
+  function pausePayloadText(pause) {
+    var ws = pause && pause.ws ? pause.ws : null;
+    if (!ws) { return ''; }
+    if (typeof ws.text === 'string') { return ws.text; }
+    if (ws.dataBase64) {
+      try { return fromBase64(ws.dataBase64); }
+      catch (error) { return ''; }
+    }
+    return '';
+  }
+
+  function pauseOpcodeLabel(code) {
+    return opcode(code);
+  }
+
+  function secondsLeft(expiresAt) {
+    if (typeof expiresAt !== 'number' || !isFinite(expiresAt)) { return 0; }
+    return Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+  }
+
+  function paintPauses() {
+    strip(pausesEl);
+    pausesEl.hidden = pauses.size === 0;
+    if (pauseTimer) {
+      clearInterval(pauseTimer);
+      pauseTimer = 0;
+    }
+    if (pauses.size === 0) {
+      dressBreak();
+      return;
+    }
+    var list = [];
+    pauses.forEach(function (pause) { list.push(pause); });
+    list.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
+    for (var i = 0; i < list.length; i++) {
+      pausesEl.appendChild(pauseCard(list[i]));
+    }
+    pauseTimer = setInterval(tickPauses, 1000);
+    dressBreak();
+  }
+
+  function tickPauses() {
+    var clocks = pausesEl.querySelectorAll('[data-expires]');
+    for (var i = 0; i < clocks.length; i++) {
+      var node = clocks[i];
+      var left = secondsLeft(Number(node.getAttribute('data-expires')));
+      node.textContent = left + 's left';
+    }
+  }
+
+  function pauseCard(pause) {
+    var ws = pause.ws || {};
+    var card = el('div', 'pause');
+    card.setAttribute('data-pause-id', pause.pauseId);
+
+    var head = el('div', 'p-head');
+    var title = el('span', 'mono', 'Held WebSocket frame');
+    head.appendChild(title);
+    var flowBtn = el('button', 'p-flow mono', str(pause.flowId));
+    flowBtn.type = 'button';
+    flowBtn.title = 'Open this flow';
+    flowBtn.addEventListener('click', function () {
+      if (rows.has(pause.flowId)) { select(pause.flowId); }
+    });
+    head.appendChild(flowBtn);
+    var dir = ws.direction === 'send' ? 'client to server' : 'server to client';
+    head.appendChild(el('span', 'p-meta mono',
+      dir + ' · ' + pauseOpcodeLabel(ws.opcode) + ' · ' + size(ws.size) +
+      (ws.truncated ? ' · cut short' : '')));
+    var clock = el('span', 'p-meta mono', secondsLeft(pause.expiresAt) + 's left');
+    clock.setAttribute('data-expires', String(pause.expiresAt || 0));
+    head.appendChild(clock);
+    card.appendChild(head);
+
+    var payload = document.createElement('textarea');
+    payload.className = 'p-payload';
+    payload.spellcheck = false;
+    payload.setAttribute('aria-label', 'Frame payload');
+    payload.value = pausePayloadText(pause);
+    card.appendChild(payload);
+
+    var actions = el('div', 'p-actions');
+    var releaseBtn = el('button', 'btn', 'Release');
+    releaseBtn.type = 'button';
+    releaseBtn.title = 'Forward the original frame unchanged';
+    var releaseEditBtn = el('button', 'btn', 'Release edited');
+    releaseEditBtn.type = 'button';
+    releaseEditBtn.title = 'Forward the payload in the box';
+    var dropBtn = el('button', 'btn', 'Drop');
+    dropBtn.type = 'button';
+    dropBtn.title = 'Do not forward this frame';
+    var status = el('p', 'p-status');
+    actions.appendChild(releaseBtn);
+    actions.appendChild(releaseEditBtn);
+    actions.appendChild(dropBtn);
+    actions.appendChild(status);
+    card.appendChild(actions);
+
+    releaseBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'release', null, releaseBtn, status);
+    });
+    releaseEditBtn.addEventListener('click', function () {
+      var body = { opcode: typeof ws.opcode === 'number' ? ws.opcode : 1 };
+      if (body.opcode === 2) { body.dataBase64 = toBase64(payload.value); }
+      else { body.text = payload.value; }
+      resolvePause(pause.pauseId, 'release', body, releaseEditBtn, status);
+    });
+    dropBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'drop', null, dropBtn, status);
+    });
+    return card;
+  }
+
+  async function resolvePause(pauseId, action, body, button, status) {
+    button.disabled = true;
+    status.textContent = action === 'drop' ? 'Dropping...' : 'Releasing...';
+    var url = action === 'drop'
+      ? '/api/pauses/' + encodeURIComponent(pauseId) + '/drop'
+      : '/api/pauses/' + encodeURIComponent(pauseId) + '/release';
+    try {
+      var response = await fetch(url, {
+        method: 'POST',
+        headers: body ? { 'content-type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* may not be JSON */ }
+      if (!response.ok) {
+        status.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : (action + ' failed (' + response.status + ')');
+        // Already gone: clear the card rather than leaving a dead hold on screen.
+        if (response.status === 404 || response.status === 410) {
+          clearPause(pauseId);
+        }
+        return;
+      }
+      clearPause(pauseId);
+    } catch (error) {
+      status.textContent = 'Could not ' + action + ': ' + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function loadPauses() {
+    try {
+      var page = await getJson('/api/pauses');
+      pauses.clear();
+      var list = page && Array.isArray(page.pauses) ? page.pauses : [];
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && list[i].pauseId) { pauses.set(list[i].pauseId, list[i]); }
+      }
+    } catch (error) {
+      // Leave whatever the event socket already delivered.
+    }
+    paintPauses();
+  }
+
+  function breaking(on) {
+    if (on) { composing(false); rewriting(false); }
+    mainEl.classList.toggle('breaking', on);
+    breakerEl.hidden = !on;
+    if (on) { loadRules(); }
+    else { dressBreak(); }
+  }
+
+  function dressBreak() {
+    var armed = breakRules.some(function (r) { return r.enabled; });
+    var held = pauses.size;
+    breakBtn.classList.toggle('on', !breakerEl.hidden || armed || held > 0);
+    if (held > 0) {
+      breakBtn.textContent = 'Breakpoints (' + held + ')';
+    } else if (armed) {
+      breakBtn.textContent = 'Breakpoints · on';
+    } else {
+      breakBtn.textContent = 'Breakpoints';
+    }
+  }
+
+  function paintRules() {
+    strip(breakListEl);
+    if (!breakRules.length) {
+      breakListEl.appendChild(el('p', 'hint', 'No rules. Save one above to start holding frames.'));
+      dressBreak();
+      return;
+    }
+    for (var i = 0; i < breakRules.length; i++) {
+      var rule = breakRules[i];
+      var row = el('div', 'rule');
+      row.appendChild(el('span', rule.enabled ? 'on' : 'off',
+        rule.enabled ? 'enabled' : 'disabled'));
+      row.appendChild(el('span', 'mono', str(rule.kind || 'ws')));
+      var hosts = Array.isArray(rule.hosts) && rule.hosts.length
+        ? rule.hosts.join(', ')
+        : 'any host';
+      row.appendChild(el('span', 'mono', hosts));
+      var path = rule.pathPrefix ? str(rule.pathPrefix) : 'any path';
+      row.appendChild(el('span', 'mono', path));
+      var dirs = Array.isArray(rule.directions) && rule.directions.length
+        ? rule.directions.join(', ')
+        : 'both';
+      row.appendChild(el('span', 'mono', dirs));
+      var ops = Array.isArray(rule.opcodes) && rule.opcodes.length
+        ? rule.opcodes.map(pauseOpcodeLabel).join(', ')
+        : 'text, binary';
+      row.appendChild(el('span', 'mono', ops));
+      row.appendChild(el('span', 'mono', str(rule.timeoutMs) + ' ms'));
+      breakListEl.appendChild(row);
+    }
+    dressBreak();
+  }
+
+  async function loadRules() {
+    try {
+      var page = await getJson('/api/breakpoints');
+      breakRules = page && Array.isArray(page.rules) ? page.rules : [];
+      if (breakRules.length) {
+        var rule = breakRules[0];
+        document.getElementById('b-enabled').checked = rule.enabled !== false;
+        document.getElementById('b-hosts').value =
+          Array.isArray(rule.hosts) ? rule.hosts.join(', ') : '';
+        document.getElementById('b-path').value = rule.pathPrefix || '';
+        document.getElementById('b-timeout').value =
+          typeof rule.timeoutMs === 'number' ? rule.timeoutMs : 30000;
+        var dir = document.getElementById('b-dir');
+        if (Array.isArray(rule.directions) && rule.directions.length === 1) {
+          dir.value = rule.directions[0];
+        } else {
+          dir.value = '';
+        }
+      }
+      breakStatusEl.textContent = breakRules.length
+        ? (breakRules.length + ' rule' + (breakRules.length === 1 ? '' : 's') + ' loaded')
+        : 'No rules yet';
+    } catch (error) {
+      breakStatusEl.textContent = 'Could not load rules: ' + error.message;
+      breakRules = [];
+    }
+    paintRules();
+  }
+
+  async function saveRules() {
+    var hostsRaw = document.getElementById('b-hosts').value;
+    var hosts = [];
+    var parts = hostsRaw.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var h = parts[i].trim();
+      if (h) { hosts.push(h); }
+    }
+    var path = document.getElementById('b-path').value.trim();
+    var timeout = parseInt(document.getElementById('b-timeout').value, 10);
+    if (!isFinite(timeout) || timeout < 1000) { timeout = 30000; }
+    if (timeout > 300000) { timeout = 300000; }
+    var dir = document.getElementById('b-dir').value;
+    var rule = {
+      id: 'ws-1',
+      enabled: document.getElementById('b-enabled').checked,
+      kind: 'ws',
+      hosts: hosts,
+      pathPrefix: path || null,
+      directions: dir ? [dir] : [],
+      opcodes: [],
+      timeoutMs: timeout
+    };
+    breakStatusEl.textContent = 'Saving...';
+    try {
+      var response = await fetch('/api/breakpoints', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [rule] }),
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* may not be JSON */ }
+      if (!response.ok) {
+        breakStatusEl.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : ('Save failed (' + response.status + ')');
+        return;
+      }
+      breakRules = parsed && Array.isArray(parsed.rules) ? parsed.rules : [rule];
+      breakStatusEl.textContent = rule.enabled
+        ? 'Saved. Matching WebSocket frames will pause until release, drop, or timeout.'
+        : 'Saved. Rule is disabled; traffic is not held.';
+      paintRules();
+    } catch (error) {
+      breakStatusEl.textContent = 'Could not save: ' + error.message;
+    }
+  }
+
+  async function clearRules() {
+    breakStatusEl.textContent = 'Clearing...';
+    try {
+      var response = await fetch('/api/breakpoints', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [] }),
+        cache: 'no-store'
+      });
+      if (!response.ok) {
+        breakStatusEl.textContent = 'Clear failed (' + response.status + ')';
+        return;
+      }
+      breakRules = [];
+      document.getElementById('b-hosts').value = '';
+      document.getElementById('b-path').value = '';
+      document.getElementById('b-timeout').value = '30000';
+      document.getElementById('b-enabled').checked = true;
+      document.getElementById('b-dir').value = '';
+      breakStatusEl.textContent = 'All rules cleared. WebSocket traffic is no longer held.';
+      paintRules();
+    } catch (error) {
+      breakStatusEl.textContent = 'Could not clear: ' + error.message;
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* WebSocket rewrite / drop rules                                    */
+  /* ---------------------------------------------------------------- */
+
+  var rewriteBtn = document.getElementById('rewrite');
+  var rewriterEl = document.getElementById('rewriter');
+  var rewriteStatusEl = document.getElementById('w-status');
+  var rewriteListEl = document.getElementById('w-list');
+  var rewriteRules = [];
+
+  function rewriting(on) {
+    if (on) { composing(false); breaking(false); }
+    mainEl.classList.toggle('rewriting', on);
+    rewriterEl.hidden = !on;
+    if (on) { loadRewriteRules(); }
+    else { dressRewrite(); }
+  }
+
+  function dressRewrite() {
+    var armed = rewriteRules.some(function (r) {
+      return r && (r.drop || r.replaceText || r.replaceBase64);
+    });
+    rewriteBtn.classList.toggle('on', !rewriterEl.hidden || armed);
+    if (armed) {
+      rewriteBtn.textContent = 'WS rewrite · on';
+    } else {
+      rewriteBtn.textContent = 'WS rewrite';
+    }
+  }
+
+  function paintRewriteRules() {
+    strip(rewriteListEl);
+    if (!rewriteRules.length) {
+      rewriteListEl.appendChild(el('p', 'hint',
+        'No rules. Save one above to replace or drop matching frames.'));
+      dressRewrite();
+      return;
+    }
+    for (var i = 0; i < rewriteRules.length; i++) {
+      var rule = rewriteRules[i];
+      var row = el('div', 'rule');
+      var action = rule.drop
+        ? 'drop'
+        : (rule.replaceText != null
+          ? 'replace text'
+          : (rule.replaceBase64 ? 'replace base64' : 'noop'));
+      row.appendChild(el('span', rule.drop || rule.replaceText || rule.replaceBase64 ? 'on' : 'off',
+        action));
+      var hosts = Array.isArray(rule.hosts) && rule.hosts.length
+        ? rule.hosts.join(', ')
+        : 'any host';
+      row.appendChild(el('span', 'mono', hosts));
+      var path = rule.pathPrefix ? str(rule.pathPrefix) : 'any path';
+      row.appendChild(el('span', 'mono', path));
+      var dirs = Array.isArray(rule.directions) && rule.directions.length
+        ? rule.directions.join(', ')
+        : 'both';
+      row.appendChild(el('span', 'mono', dirs));
+      var ops = Array.isArray(rule.opcodes) && rule.opcodes.length
+        ? rule.opcodes.map(pauseOpcodeLabel).join(', ')
+        : 'text, binary';
+      row.appendChild(el('span', 'mono', ops));
+      if (rule.textRegex) {
+        row.appendChild(el('span', 'mono', '/' + str(rule.textRegex) + '/'));
+      }
+      if (rule.replaceText != null && !rule.drop) {
+        row.appendChild(el('span', 'mono', '-> ' + str(rule.replaceText).slice(0, 40)));
+      }
+      rewriteListEl.appendChild(row);
+    }
+    dressRewrite();
+  }
+
+  async function loadRewriteRules() {
+    try {
+      var page = await getJson('/api/ws-rewrite');
+      rewriteRules = page && Array.isArray(page.rules) ? page.rules : [];
+      if (rewriteRules.length) {
+        var rule = rewriteRules[0];
+        document.getElementById('w-hosts').value =
+          Array.isArray(rule.hosts) ? rule.hosts.join(', ') : '';
+        document.getElementById('w-path').value = rule.pathPrefix || '';
+        document.getElementById('w-regex').value = rule.textRegex || '';
+        var dir = document.getElementById('w-dir');
+        if (Array.isArray(rule.directions) && rule.directions.length === 1) {
+          dir.value = rule.directions[0];
+        } else {
+          dir.value = '';
+        }
+        var action = document.getElementById('w-action');
+        action.value = rule.drop ? 'drop' : 'replace';
+        document.getElementById('w-replace').value = rule.replaceText || '';
+      }
+      rewriteStatusEl.textContent = rewriteRules.length
+        ? (rewriteRules.length + ' rule' + (rewriteRules.length === 1 ? '' : 's') + ' loaded')
+        : 'No rules yet';
+    } catch (error) {
+      rewriteStatusEl.textContent = 'Could not load rules: ' + error.message;
+      rewriteRules = [];
+    }
+    paintRewriteRules();
+  }
+
+  async function saveRewriteRules() {
+    var hostsRaw = document.getElementById('w-hosts').value;
+    var hosts = [];
+    var parts = hostsRaw.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var h = parts[i].trim();
+      if (h) { hosts.push(h); }
+    }
+    var path = document.getElementById('w-path').value.trim();
+    var regex = document.getElementById('w-regex').value.trim();
+    var dir = document.getElementById('w-dir').value;
+    var action = document.getElementById('w-action').value;
+    var replaceText = document.getElementById('w-replace').value;
+    if (action === 'replace' && replaceText === '') {
+      rewriteStatusEl.textContent = 'Replacement text is required when the action is replace.';
+      return;
+    }
+    var rule = {
+      hosts: hosts,
+      pathPrefix: path || null,
+      directions: dir ? [dir] : [],
+      opcodes: [],
+      textRegex: regex || null,
+      drop: action === 'drop',
+      replaceText: action === 'replace' ? replaceText : null,
+      replaceBase64: null
+    };
+    rewriteStatusEl.textContent = 'Saving...';
+    try {
+      var response = await fetch('/api/ws-rewrite', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [rule] }),
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* may not be JSON */ }
+      if (!response.ok) {
+        rewriteStatusEl.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : ('Save failed (' + response.status + ')');
+        return;
+      }
+      rewriteRules = parsed && Array.isArray(parsed.rules) ? parsed.rules : [rule];
+      rewriteStatusEl.textContent = action === 'drop'
+        ? 'Saved. Matching frames will be dropped (notes only on the flow).'
+        : 'Saved. Matching frames will have their payload replaced on the wire.';
+      paintRewriteRules();
+    } catch (error) {
+      rewriteStatusEl.textContent = 'Could not save: ' + error.message;
+    }
+  }
+
+  async function clearRewriteRules() {
+    rewriteStatusEl.textContent = 'Clearing...';
+    try {
+      var response = await fetch('/api/ws-rewrite', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [] }),
+        cache: 'no-store'
+      });
+      if (!response.ok) {
+        rewriteStatusEl.textContent = 'Clear failed (' + response.status + ')';
+        return;
+      }
+      rewriteRules = [];
+      document.getElementById('w-hosts').value = '';
+      document.getElementById('w-path').value = '';
+      document.getElementById('w-regex').value = '';
+      document.getElementById('w-dir').value = '';
+      document.getElementById('w-action').value = 'drop';
+      document.getElementById('w-replace').value = '';
+      rewriteStatusEl.textContent = 'All rewrite rules cleared. Frames pass through unchanged.';
+      paintRewriteRules();
+    } catch (error) {
+      rewriteStatusEl.textContent = 'Could not clear: ' + error.message;
+    }
   }
 
   function link(kind, text) {
@@ -1748,6 +2999,7 @@ const SCRIPT: &str = r#"
   var outEl = document.getElementById('c-out');
 
   function composing(on) {
+    if (on) { breaking(false); rewriting(false); }
     mainEl.classList.toggle('composing', on);
     composerEl.hidden = !on;
     composeBtn.classList.toggle('on', on);
@@ -1803,11 +3055,13 @@ const SCRIPT: &str = r#"
     }
 
     var bodyText = document.getElementById('c-body').value;
+    var envId = document.getElementById('c-env').value;
     var spec = {
       method: document.getElementById('c-method').value,
       url: url,
       headers: readHeaders(document.getElementById('c-headers').value),
-      bodyBase64: bodyText ? toBase64(bodyText) : null
+      bodyBase64: bodyText ? toBase64(bodyText) : null,
+      environmentId: envId || null
     };
 
     button.disabled = true;
@@ -1855,6 +3109,12 @@ const SCRIPT: &str = r#"
   }
 
   composeBtn.addEventListener('click', function () { composing(composerEl.hidden); });
+  breakBtn.addEventListener('click', function () { breaking(breakerEl.hidden); });
+  rewriteBtn.addEventListener('click', function () { rewriting(rewriterEl.hidden); });
+  document.getElementById('b-save').addEventListener('click', saveRules);
+  document.getElementById('b-clear').addEventListener('click', clearRules);
+  document.getElementById('w-save').addEventListener('click', saveRewriteRules);
+  document.getElementById('w-clear').addEventListener('click', clearRewriteRules);
   document.getElementById('c-send').addEventListener('click', fire);
   document.addEventListener('keydown', function (event) {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !composerEl.hidden) {
@@ -1882,6 +3142,56 @@ const SCRIPT: &str = r#"
       books = [];
     }
     paintBooks();
+    loadEnvironments();
+  }
+
+  var environments = [];
+
+  async function loadEnvironments() {
+    try {
+      var got = await getJson('/api/environments');
+      environments = Array.isArray(got) ? got : [];
+    } catch (error) {
+      environments = [];
+    }
+    var activeId = null;
+    try {
+      var active = await getJson('/api/environments/active');
+      activeId = active && active.id ? str(active.id) : null;
+    } catch (error) { /* no active */ }
+    fillEnvChoices(activeId);
+  }
+
+  function fillEnvChoices(activeId) {
+    var choose = document.getElementById('c-env');
+    if (!choose) { return; }
+    var held = activeId || choose.value;
+    strip(choose);
+    var none = el('option', null, 'No environment');
+    none.value = '';
+    choose.appendChild(none);
+    for (var i = 0; i < environments.length; i++) {
+      var option = el('option', null, str(environments[i].name));
+      option.value = environments[i].id;
+      choose.appendChild(option);
+    }
+    choose.value = held;
+    if (!choose.value) { choose.value = ''; }
+  }
+
+  var envSelect = document.getElementById('c-env');
+  if (envSelect) {
+    envSelect.addEventListener('change', async function () {
+      var id = envSelect.value || null;
+      try {
+        await fetch('/api/environments/active', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: id }),
+          cache: 'no-store'
+        });
+      } catch (error) { /* not fatal */ }
+    });
   }
 
   var bookHunt = '';
@@ -1912,7 +3222,8 @@ const SCRIPT: &str = r#"
     if (books.length && !showing) {
       noBooksEl.textContent = 'Nothing saved here answers that.';
     } else if (!books.length) {
-      noBooksEl.textContent = 'Nothing saved yet. Compose a request, name it, and save.';
+      noBooksEl.textContent =
+        'Nothing saved yet. Drag a live request here, copy one into a collection, or compose and save.';
     }
     fillBookChoices();
     return count;
@@ -2019,6 +3330,9 @@ const SCRIPT: &str = r#"
     line.addEventListener('click', function () {
       twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
     });
+
+    // Drop a live flow here to append it as a saved request in this collection.
+    acceptLiveDrop(box, function () { return book; });
 
     var body = el('div', 'gbody');
     for (var i = 0; i < kept.length; i++) {
@@ -2168,6 +3482,291 @@ const SCRIPT: &str = r#"
       noBooksEl.textContent = 'Could not delete that: ' + error.message;
     }
   }
+
+  /* ---------------------------------------------------------------- */
+  /* live request → saved request (drag, copy, paste)                  */
+  /* ---------------------------------------------------------------- */
+
+  // Headers that describe a hop or are implied by the URL/body. Replaying them
+  // confuses the next send the same way it confuses curl.
+  function isSavedHop(name) {
+    var n = str(name).toLowerCase();
+    return n === 'host' || n === 'content-length' || n === 'transfer-encoding'
+      || n === 'connection' || n === 'keep-alive' || n === 'proxy-connection'
+      || n === 'proxy-authenticate' || n === 'proxy-authorization'
+      || n === 'te' || n === 'trailers' || n === 'upgrade';
+  }
+
+  function filterSavedHeaders(headers) {
+    var list = Array.isArray(headers) ? headers : [];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      if (!Array.isArray(list[i])) { continue; }
+      if (isSavedHop(list[i][0])) { continue; }
+      out.push([str(list[i][0]), str(list[i][1])]);
+    }
+    return out;
+  }
+
+  async function bodyAsBase64(id, which) {
+    var response = await fetch(
+      '/api/flows/' + encodeURIComponent(id) + '/body/' + which + '?decode=1',
+      { cache: 'no-store' }
+    );
+    if (!response.ok) {
+      throw new Error('the body is no longer available (' + response.status + ')');
+    }
+    var buffer = await response.arrayBuffer();
+    var bytes = new Uint8Array(buffer);
+    var binary = '';
+    // Chunked: apply on huge bodies would blow the stack with one huge join.
+    var chunk = 0x8000;
+    for (var i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function defaultSavedName(request) {
+    var method = str(request.method) || 'GET';
+    var path = str(request.path) || str(request.url) || 'request';
+    if (path.length > 80) { path = path.slice(0, 77) + '...'; }
+    return method + ' ' + path;
+  }
+
+  // Build a SavedRequest (SendSpec under a name) from a live flow id.
+  async function flowToSaved(id) {
+    var flow = await getJson('/api/flows/' + encodeURIComponent(id));
+    var request = flow.request || {};
+    var url = str(request.url);
+    if (!url) {
+      throw new Error('that flow has no request URL to save');
+    }
+    var bodyBase64 = null;
+    if (request.body) {
+      try {
+        bodyBase64 = await bodyAsBase64(id, 'request');
+      } catch (error) {
+        // Headers and URL are still worth keeping when the body was evicted.
+        bodyBase64 = null;
+      }
+    }
+    return {
+      id: '',
+      name: defaultSavedName(request),
+      spec: {
+        method: str(request.method) || 'GET',
+        url: url,
+        headers: filterSavedHeaders(request.headers),
+        bodyBase64: bodyBase64
+      }
+    };
+  }
+
+  async function flowToSavedJson(id) {
+    var saved = await flowToSaved(id);
+    return SAVED_CLIP_PREFIX + JSON.stringify(saved);
+  }
+
+  function parseSavedClipboard(text) {
+    var raw = str(text).trim();
+    if (raw.indexOf(SAVED_CLIP_PREFIX) === 0) {
+      raw = raw.slice(SAVED_CLIP_PREFIX.length);
+    }
+    var value = JSON.parse(raw);
+    if (!value || typeof value !== 'object') {
+      throw new Error('clipboard is not a saved request');
+    }
+    var spec = value.spec || value;
+    if (!str(spec.url)) {
+      throw new Error('clipboard has no URL');
+    }
+    return {
+      id: '',
+      name: str(value.name) || str(spec.url),
+      spec: {
+        method: str(spec.method) || 'GET',
+        url: str(spec.url),
+        headers: Array.isArray(spec.headers) ? spec.headers : [],
+        bodyBase64: spec.bodyBase64 == null ? null : str(spec.bodyBase64)
+      }
+    };
+  }
+
+  async function ensureBook(book) {
+    if (book && book.id) { return book; }
+    if (books.length) { return books[0]; }
+    return putBook({ id: '', name: 'From capture', requests: [] });
+  }
+
+  async function appendSaved(book, saved) {
+    var target = await ensureBook(book);
+    // Refresh from the in-memory list so concurrent saves do not drop siblings.
+    for (var i = 0; i < books.length; i++) {
+      if (books[i].id === target.id) { target = books[i]; break; }
+    }
+    target.requests = (target.requests || []).concat([saved]);
+    await putBook(target);
+    await loadBooks();
+    return { book: target, saved: saved };
+  }
+
+  async function saveFlowToCollection(flowId, book) {
+    var saved = await flowToSaved(flowId);
+    await appendSaved(book, saved);
+    return saved.name;
+  }
+
+  function clearDropMarks() {
+    var marks = document.querySelectorAll('.drop-over');
+    for (var i = 0; i < marks.length; i++) {
+      marks[i].classList.remove('drop-over');
+    }
+  }
+
+  function isLiveDrag(event) {
+    if (!event.dataTransfer) { return false; }
+    var types = event.dataTransfer.types;
+    if (!types) { return false; }
+    for (var i = 0; i < types.length; i++) {
+      if (types[i] === FLOW_DRAG_TYPE || types[i] === 'text/plain') { return true; }
+    }
+    return false;
+  }
+
+  function acceptLiveDrop(node, bookOf) {
+    node.addEventListener('dragenter', function (event) {
+      if (!isLiveDrag(event)) { return; }
+      event.preventDefault();
+      node.classList.add('drop-over');
+    });
+    node.addEventListener('dragover', function (event) {
+      if (!isLiveDrag(event)) { return; }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      node.classList.add('drop-over');
+    });
+    node.addEventListener('dragleave', function (event) {
+      if (event.relatedTarget && node.contains(event.relatedTarget)) { return; }
+      node.classList.remove('drop-over');
+    });
+    node.addEventListener('drop', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      node.classList.remove('drop-over');
+      clearDropMarks();
+      var flowId = event.dataTransfer.getData(FLOW_DRAG_TYPE)
+        || event.dataTransfer.getData('text/plain');
+      if (!flowId) { return; }
+      saveFlowToCollection(flowId, bookOf()).catch(function (error) {
+        noBooksEl.hidden = false;
+        noBooksEl.textContent = 'Could not save that: ' + error.message;
+      });
+    });
+  }
+
+  // The whole Saved panel accepts a drop when there is no specific collection
+  // under the pointer (empty list, or between groups).
+  (function wireSavedPanelDrop() {
+    var panel = document.getElementById('saved');
+    if (!panel) { return; }
+    acceptLiveDrop(panel, function () { return null; });
+  })();
+
+  function typingTarget(node) {
+    if (!node || !node.tagName) { return false; }
+    var tag = node.tagName.toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || node.isContentEditable;
+  }
+
+  // Cmd/Ctrl+C on a selected live flow copies a saved-request envelope.
+  // Cmd/Ctrl+V over the saved column pastes it into a collection.
+  document.addEventListener('keydown', function (event) {
+    if (typingTarget(event.target)) { return; }
+    var mod = event.metaKey || event.ctrlKey;
+    if (!mod) { return; }
+    if (event.key === 'c' || event.key === 'C') {
+      if (!selectedId) { return; }
+      // Do not steal a real text selection on the page.
+      var sel = window.getSelection && window.getSelection();
+      if (sel && str(sel.toString())) { return; }
+      event.preventDefault();
+      copyFlowAsSaved(selectedId);
+      return;
+    }
+    if (event.key === 'v' || event.key === 'V') {
+      // Paste is handled on the paste event so the clipboard can be read.
+      return;
+    }
+  });
+
+  async function copyFlowAsSaved(id) {
+    try {
+      var text = await flowToSavedJson(id);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        throw new Error('no clipboard');
+      }
+      flashSavedHint('Copied live request as a saved request. Paste into Saved requests.');
+    } catch (error) {
+      try {
+        var again = await flowToSavedJson(id);
+        offerSavedText(again);
+      } catch (err) {
+        flashSavedHint('Could not copy: ' + err.message);
+      }
+    }
+  }
+
+  function offerSavedText(text) {
+    var head = detailEl.querySelector('.dhead') || detailEl;
+    var stale = detailEl.querySelector('pre.copy-saved');
+    if (stale) { stale.parentNode.removeChild(stale); }
+    var pre = el('pre', 'copy copy-saved mono', text);
+    if (head.nextSibling) {
+      detailEl.insertBefore(pre, head.nextSibling);
+    } else {
+      detailEl.appendChild(pre);
+    }
+    flashSavedHint('Clipboard blocked; saved request is below to copy by hand.');
+  }
+
+  function flashSavedHint(message) {
+    noBooksEl.hidden = false;
+    noBooksEl.textContent = message;
+  }
+
+  document.addEventListener('paste', function (event) {
+    if (typingTarget(event.target)) { return; }
+    var panel = document.getElementById('saved');
+    // Only when focus is on the saved side or nothing particular, so we do not
+    // hijack paste meant for the filter box (already excluded) or composer.
+    var inSaved = panel && (panel.contains(event.target) || document.activeElement === document.body);
+    if (!inSaved && event.target !== booksEl && event.target !== noBooksEl) {
+      // Still allow paste when the selection is a flow and user is on the list:
+      // the intent "I copied a live request, paste into saved" is global enough
+      // when the clipboard carries our prefix.
+    }
+    var text = '';
+    try {
+      text = (event.clipboardData && event.clipboardData.getData('text/plain')) || '';
+    } catch (error) { return; }
+    if (text.indexOf(SAVED_CLIP_PREFIX) !== 0 && text.indexOf('"spec"') < 0) {
+      return;
+    }
+    try {
+      var saved = parseSavedClipboard(text);
+      event.preventDefault();
+      appendSaved(null, saved).then(function () {
+        flashSavedHint('Pasted into saved requests as ' + saved.name + '.');
+      }).catch(function (error) {
+        flashSavedHint('Could not paste: ' + error.message);
+      });
+    } catch (error) {
+      // Not our payload; leave paste alone.
+    }
+  });
 
   /* Either half of the column folds to its bar. Which of them is folded is
      remembered, because it is a decision about how you work rather than about
@@ -2392,6 +3991,8 @@ const SCRIPT: &str = r#"
     }
   });
   loadBooks();
+  loadRules();
+  loadPauses();
 
   document.getElementById('clear').addEventListener('click', async function () {
     try {
@@ -2528,7 +4129,7 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 9] = [
+    const KNOWN_PATHS: [&str; 19] = [
         "/api/flows",
         "/api/flows?limit=",
         "/api/flows/",
@@ -2536,8 +4137,18 @@ mod tests {
         "/api/send",
         "/api/collections",
         "/api/collections/",
+        "/api/environments",
+        "/api/environments/active",
+        "/api/breakpoints",
+        "/api/ws-rewrite",
+        "/api/pauses",
+        "/api/pauses/",
         "/body/",
         "/curl",
+        "/ws/send",
+        "/ws/replay",
+        "/drop",
+        "/release",
     ];
 
     #[test]
@@ -2573,6 +4184,22 @@ mod tests {
             (
                 "'/api/flows/' + encodeURIComponent(id) + '/curl'",
                 "/api/flows/{id}/curl",
+            ),
+            (
+                "'/api/flows/' + encodeURIComponent(id) + '/ws/send'",
+                "/api/flows/{id}/ws/send",
+            ),
+            (
+                "'/api/flows/' + encodeURIComponent(sourceId) + '/ws/replay'",
+                "/api/flows/{id}/ws/replay",
+            ),
+            (
+                "'/api/pauses/' + encodeURIComponent(pauseId) + '/drop'",
+                "/api/pauses/{pauseId}/drop",
+            ),
+            (
+                "'/api/pauses/' + encodeURIComponent(pauseId) + '/release'",
+                "/api/pauses/{pauseId}/release",
             ),
         ] {
             assert!(
@@ -3232,6 +4859,32 @@ mod tests {
         );
     }
 
+    /// Live traffic becomes a saved request by drag, by copy/paste, or by the
+    /// copy menu. The page must keep those three paths, not only "compose then save".
+    #[test]
+    fn live_requests_can_be_saved_by_drag_and_by_copy() {
+        for needle in [
+            "var FLOW_DRAG_TYPE = 'application/x-proxima-flow-id';",
+            "var SAVED_CLIP_PREFIX = 'proxima-saved-request:';",
+            "function flowToSaved(id)",
+            "function saveFlowToCollection(flowId, book)",
+            "function acceptLiveDrop(node, bookOf)",
+            "function copyFlowAsSaved(id)",
+            "item('Copy as saved request'",
+            "Save to collection",
+            "row.draggable = true",
+        ] {
+            assert!(
+                SCRIPT.contains(needle),
+                "live → saved must stay wired: missing {needle}"
+            );
+        }
+        assert!(
+            CSS.contains(".group.drop-over > .gline") || CSS.contains("drop-over"),
+            "drop targets need a visible drag-over state"
+        );
+    }
+
     /// The composer's own payload is checked elsewhere against `SendSpec`. This
     /// is the other half: what a saved request looks like on disk.
     #[test]
@@ -3461,6 +5114,9 @@ mod tests {
             error: None,
             likely_pinning: true,
             client: "192.168.1.4".to_string(),
+            transport: None,
+            connection_id: None,
+            stream_id: None,
         };
         let json = serde_json::to_value(&summary).expect("a summary serialises");
         let object = json.as_object().expect("a summary is an object");
@@ -3519,6 +5175,679 @@ mod tests {
         }
     }
 
+    /// The Frames tab is where inject lives. A websocket with no frames yet
+    /// still has to offer it, or the first thing you can do on a live socket is
+    /// wait for the peer.
+    #[test]
+    fn a_websocket_flow_offers_frames_even_before_any_arrive() {
+        assert!(
+            SCRIPT.contains("flow.kind === 'websocket' ? [] : null"),
+            "an empty websocket must still open the Frames tab for inject"
+        );
+        assert!(
+            SCRIPT.contains("function injectForm(id, flow)"),
+            "the frames pane must build an inject form"
+        );
+        assert!(
+            SCRIPT.contains("function injectFrame(id, direction, opcode, text, closeCode, closeReason, button, status)"),
+            "the inject form must post through injectFrame"
+        );
+        assert!(
+            CSS.contains(".frame.injected .dir::after"),
+            "injected frames must read as injected in the list"
+        );
+        assert!(
+            SCRIPT.contains("if (message.injected) { line.className += ' injected'; }"),
+            "frameLine must honour the injected flag the capture records"
+        );
+        assert!(
+            CSS.contains(".frame.compressed .dir::after"),
+            "deflate frames must read as compressed in the list"
+        );
+        assert!(
+            SCRIPT.contains("if (message.compressed) { line.className += ' compressed'; }"),
+            "frameLine must honour the compressed flag the capture records"
+        );
+        assert!(
+            SCRIPT.contains("if (message.compressed) { meta += ' wire'; }"),
+            "compressed frames must label size as wire length (display may be inflated)"
+        );
+        // P11: inject form states the same fail-closed contract as README/API.
+        assert!(
+            SCRIPT.contains("skips rewrite rules and breakpoints"),
+            "inject form must say injects skip rewrite and breakpoints"
+        );
+        assert!(
+            SCRIPT.contains("marked injected"),
+            "inject form must say injected frames are marked"
+        );
+        assert!(
+            SCRIPT.contains("no continuations or drop markers"),
+            "inject form must name opcodes that cannot be injected"
+        );
+        assert!(
+            BODY.contains("Injected frames skip breakpoints"),
+            "breakpoints panel must say injects skip holds (parity with rewrite)"
+        );
+        assert!(
+            BODY.contains("Injected frames skip these rules"),
+            "rewrite panel must keep stating injects skip rewrite"
+        );
+        assert!(
+            SCRIPT.contains("Drop markers and continuations are skipped")
+                && SCRIPT.contains("uncompressed"),
+            "replay form must keep deflate / drop-marker honesty"
+        );
+    }
+
+    /// Frames tab filter bar: direction, opcode, text search over a retained
+    /// window; live ws:message and filter changes share matchesFrame.
+    #[test]
+    fn frames_tab_filters_by_direction_opcode_and_text() {
+        assert!(
+            SCRIPT.contains("var frameFilters = { direction: '', opcodes: null, query: '' };"),
+            "frame filters must live as a small retained state object"
+        );
+        assert!(
+            SCRIPT.contains("function matchesFrame(message)"),
+            "one matcher must decide visibility for both live rows and re-renders"
+        );
+        assert!(
+            SCRIPT.contains("function frameFilterBar()"),
+            "the frames pane must offer a filter bar"
+        );
+        assert!(
+            SCRIPT.contains("function renderFrames()"),
+            "changing filters must re-paint from the retained window"
+        );
+        assert!(
+            SCRIPT.contains("function retainFrame(message)"),
+            "live frames must trim the retained window, not only the DOM"
+        );
+        assert!(
+            SCRIPT.contains("Frame direction filter") && SCRIPT.contains("Frame opcode filter"),
+            "direction and opcode filters must be labelled controls"
+        );
+        assert!(
+            SCRIPT.contains("Search frame text"),
+            "a text search box must sit on the filter bar"
+        );
+        // Substring on raw text (lowercased), never a RegExp built from the needle.
+        assert!(
+            SCRIPT.contains("raw.toLowerCase().indexOf(needle) < 0"),
+            "frame text search must stay a substring match on the raw payload"
+        );
+        assert!(
+            SCRIPT.contains("retainFrame(event.message || {});")
+                && SCRIPT.contains("renderFrames();"),
+            "live ws:message must retain then re-render under the active filters"
+        );
+        assert!(
+            CSS.contains(".inject.filters"),
+            "frame filters must share the inject control styling"
+        );
+    }
+
+    /// Pretty-print is display-only: opcode 1 JSON is indented; search still
+    /// runs on the raw captured text.
+    #[test]
+    fn text_frames_pretty_print_json_without_changing_search() {
+        assert!(
+            SCRIPT.contains("function displayText(message)"),
+            "frame display text must go through one pretty-print helper"
+        );
+        assert!(
+            SCRIPT.contains("JSON.stringify(JSON.parse(raw), null, 2)"),
+            "valid JSON text frames must render indented by two spaces"
+        );
+        assert!(
+            SCRIPT.contains("if (message.opcode === 1)"),
+            "pretty-print is for text frames only"
+        );
+        assert!(
+            SCRIPT.contains("var shown = displayText(message);"),
+            "frameLine must paint the pretty form, not the raw string alone"
+        );
+        // matchesFrame still reads message.text, not displayText(...).
+        let matcher = SCRIPT
+            .split_once("function matchesFrame(message) {")
+            .expect("matchesFrame still exists")
+            .1;
+        let body = matcher
+            .split_once("function displayText")
+            .expect("displayText follows matchesFrame")
+            .0;
+        assert!(
+            body.contains("message.text") && !body.contains("displayText"),
+            "search must use raw message.text, not the pretty-printed display"
+        );
+    }
+
+    /// Opcode 0xf is the capture retention marker, not a peer frame and not
+    /// injectable. The list has to say so.
+    #[test]
+    fn drop_markers_read_as_retention_gaps() {
+        assert!(
+            SCRIPT.contains("if (code === 15) { return 'gap'; }"),
+            "opcode 15 must label as a gap, not a real opcode number alone"
+        );
+        assert!(
+            SCRIPT.contains("'retention gap'"),
+            "the direction column must name the gap for what it is"
+        );
+        assert!(
+            SCRIPT.contains("var gap = message.opcode === 15;"),
+            "frameLine must special-case the retention marker"
+        );
+        assert!(
+            CSS.contains(".frame.gap"),
+            "gaps need a quieter style so they do not look injectable"
+        );
+        // Filter bar offers real opcodes only; gap is not a peer frame to pick.
+        let filter_bar = SCRIPT
+            .split_once("function frameFilterBar() {")
+            .expect("frameFilterBar still exists")
+            .1;
+        let filter_body = filter_bar
+            .split_once("function addOption(select, value, label) {")
+            .expect("addOption follows frameFilterBar")
+            .0;
+        for real in ["'1', 'text'", "'2', 'binary'", "'8', 'close'", "'9', 'ping'", "'10', 'pong'"]
+        {
+            assert!(
+                filter_body.contains(real),
+                "frame filter opcode list must still offer {real}"
+            );
+        }
+        assert!(
+            !filter_body.contains("'15'") && !filter_body.contains("gap"),
+            "frame filter must not treat retention gaps as a selectable opcode"
+        );
+    }
+
+    /// Closed sockets keep an honest inject hint; the form still renders so the
+    /// tab layout does not jump when a live flow finishes.
+    #[test]
+    fn closed_websocket_flows_keep_an_honest_inject_hint() {
+        assert!(
+            SCRIPT.contains(
+                "This socket is closed. Inject only works on a live upgraded flow."
+            ),
+            "a finished websocket must say inject needs a live upgraded flow"
+        );
+        let form = SCRIPT
+            .split_once("function injectForm(id, flow) {")
+            .expect("injectForm still exists")
+            .1;
+        let body = form
+            .split_once("async function injectFrame(")
+            .expect("injectFrame follows injectForm")
+            .0;
+        assert!(
+            body.contains("flow.state === 'complete'")
+                && body.contains("flow.state === 'error'")
+                && body.contains("flow.state === 'aborted'"),
+            "closed inject hint must cover complete, error, and aborted states"
+        );
+        assert!(
+            body.contains("form.appendChild(el('p', 'hint', closed"),
+            "the closed hint must be the inject form's status copy, not a second panel"
+        );
+    }
+
+    /// Successful inject posts only; the event socket paints the recorded frame.
+    /// Drawing the POST response here would double every injected row.
+    #[test]
+    fn inject_success_does_not_double_draw_the_frame() {
+        let inject = SCRIPT
+            .split_once("async function injectFrame(id, direction, opcode, text, closeCode, closeReason, button, status) {")
+            .expect("injectFrame still exists")
+            .1;
+        // frameLine may sit after the replay helpers; still the next list painter.
+        let body = inject
+            .split_once("function frameLine(message, absoluteIndex) {")
+            .expect("frameLine follows inject helpers")
+            .0;
+        assert!(
+            body.contains("status.textContent = 'Injected.';"),
+            "a successful inject must only mark status, not invent a list row"
+        );
+        for forbidden in [
+            "retainFrame(",
+            "renderFrames(",
+            "frameLine(",
+            "frameList.appendChild",
+            "frameMessages.push",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "injectFrame must not {forbidden}: the event socket owns the list"
+            );
+        }
+        // Live path is still the one that retains then re-renders.
+        assert!(
+            SCRIPT.contains("if (event.type === 'ws:message' && event.id === frameOwner && frameList)")
+                && SCRIPT.contains("retainFrame(event.message || {});")
+                && SCRIPT.contains("renderFrames();"),
+            "ws:message must remain the sole path that adds inject rows to the list"
+        );
+    }
+
+    /// The Frames tab keeps a retained window, then paints only matches. Trimming
+    /// the DOM alone would drop filtered-out frames that should reappear later.
+    #[test]
+    fn frames_tab_retains_a_window_then_paints_matches() {
+        assert!(
+            SCRIPT.contains("var MAX_FRAMES = 200;"),
+            "the frames tab must cap how many messages it keeps"
+        );
+        assert!(
+            SCRIPT.contains("all.slice(-MAX_FRAMES)"),
+            "initial load must keep only the trailing window"
+        );
+        assert!(
+            SCRIPT.contains("while (frameMessages.length > MAX_FRAMES)")
+                && SCRIPT.contains("frameMessages.shift();"),
+            "live retain must drop from the front of the retained window"
+        );
+        let render = SCRIPT
+            .split_once("function renderFrames() {")
+            .expect("renderFrames still exists")
+            .1;
+        let render_body = render
+            .split_once("function retainFrame(message) {")
+            .expect("retainFrame follows renderFrames")
+            .0;
+        assert!(
+            render_body.contains("if (matchesFrame(frameMessages[i]))")
+                && render_body.contains(
+                    "frameList.appendChild(frameLine(frameMessages[i], frameIndexBase + i));"
+                ),
+            "renderFrames must paint only retained rows that match the active filters"
+        );
+        assert!(
+            SCRIPT.contains("block.appendChild(injectForm(id, flow));")
+                && SCRIPT.contains("block.appendChild(replayForm(id, flow));")
+                && SCRIPT.contains("block.appendChild(frameFilterBar());"),
+            "Frames pane must stack inject, then replay, then filters, above the list"
+        );
+        // Filter changes re-paint immediately; no submit button on the bar.
+        let filter = SCRIPT
+            .split_once("function applyFilters() {")
+            .expect("applyFilters still exists")
+            .1;
+        let filter_tail = filter.split_once("return bar;").expect("filter bar returns").0;
+        assert!(
+            filter_tail.contains("dir.addEventListener('change', applyFilters);")
+                && filter_tail.contains("op.addEventListener('change', applyFilters);")
+                && filter_tail.contains("query.addEventListener('input', applyFilters);"),
+            "direction, opcode, and search must re-render as soon as they change"
+        );
+    }
+
+    /// matchesFrame covers direction, opcode set, and raw-text substring; empty
+    /// filters mean "any". The matcher is the single source of list visibility.
+    #[test]
+    fn matches_frame_checks_direction_opcode_and_raw_text() {
+        let matcher = SCRIPT
+            .split_once("function matchesFrame(message) {")
+            .expect("matchesFrame still exists")
+            .1;
+        let body = matcher
+            .split_once("function displayText(message) {")
+            .expect("displayText follows matchesFrame")
+            .0;
+        assert!(
+            body.contains("frameFilters.direction && message.direction !== frameFilters.direction"),
+            "direction filter must compare against message.direction"
+        );
+        assert!(
+            body.contains("frameFilters.opcodes && !frameFilters.opcodes[message.opcode]"),
+            "opcode filter must look up message.opcode in the active set"
+        );
+        assert!(
+            body.contains("typeof message.text === 'string' ? message.text : ''")
+                && body.contains("raw.toLowerCase().indexOf(needle) < 0"),
+            "text search must substring-match lowercased raw message.text"
+        );
+        assert!(
+            body.contains("if (!message) { return false; }") && body.contains("return true;"),
+            "a null message is hidden; an unfiltered message stays visible"
+        );
+    }
+
+    /// displayText pretty-prints opcode-1 JSON only; binary/close/etc. stay raw
+    /// (or absent). Non-JSON text frames must fall back without throwing away text.
+    #[test]
+    fn display_text_pretty_prints_json_text_frames_only() {
+        let display = SCRIPT
+            .split_once("function displayText(message) {")
+            .expect("displayText still exists")
+            .1;
+        let body = display
+            .split_once("function renderFrames() {")
+            .expect("renderFrames follows displayText")
+            .0;
+        assert!(
+            body.contains("if (message.opcode === 1)"),
+            "pretty-print is gated on text frames"
+        );
+        assert!(
+            body.contains("JSON.stringify(JSON.parse(raw), null, 2)"),
+            "valid JSON must indent with two spaces"
+        );
+        assert!(
+            body.contains("catch (error)") && body.contains("return raw;"),
+            "invalid JSON text frames must fall back to the raw payload"
+        );
+        assert!(
+            body.contains("if (raw === null) { return null; }"),
+            "a frame without text must not invent a display string"
+        );
+        // Pretty helper is not used for HTTP body indent under another name here;
+        // the same indent-2 pattern is the contract for both.
+        assert!(
+            SCRIPT.contains("JSON.stringify(JSON.parse(text), null, 2)")
+                || SCRIPT.matches("null, 2)").count() >= 1,
+            "JSON pretty-print indent-2 must remain available in the page script"
+        );
+    }
+
+    /// WS rewrite rules are first-class UI: GET|PUT /api/ws-rewrite, form fields
+    /// match the config rule shape, and notes already show under flow Info.
+    #[test]
+    fn the_inspector_surfaces_ws_rewrite_rules() {
+        assert!(
+            BODY.contains("id=\"rewrite\""),
+            "the header must offer a WS rewrite control"
+        );
+        assert!(
+            BODY.contains("id=\"rewriter\""),
+            "rules must have a panel of their own"
+        );
+        assert!(
+            SCRIPT.contains("async function saveRewriteRules()"),
+            "the rules form must PUT /api/ws-rewrite"
+        );
+        assert!(
+            SCRIPT.contains("getJson('/api/ws-rewrite')"),
+            "the panel must load current rules"
+        );
+        assert!(
+            SCRIPT.contains("fetch('/api/ws-rewrite'"),
+            "save and clear must hit the rewrite endpoint"
+        );
+        for field in [
+            "hosts:",
+            "pathPrefix:",
+            "directions:",
+            "opcodes:",
+            "textRegex:",
+            "drop:",
+            "replaceText:",
+            "replaceBase64:",
+        ] {
+            assert!(
+                SCRIPT.contains(field),
+                "WS rewrite UI must still send {field}"
+            );
+        }
+        assert!(
+            BODY.contains("per frame") || BODY.contains("per-frame") || SCRIPT.contains("per frame"),
+            "the UI must state per-frame matching limits"
+        );
+    }
+
+    /// Breakpoints and held pauses are first-class UI: rules via PUT, resolve
+    /// via POST, and both pause events on the stream strip under the header.
+    #[test]
+    fn the_inspector_surfaces_ws_breakpoints_and_held_pauses() {
+        assert!(
+            BODY.contains("id=\"break\""),
+            "the header must offer a Breakpoints control"
+        );
+        assert!(
+            BODY.contains("id=\"breaker\""),
+            "rules must have a panel of their own"
+        );
+        assert!(
+            BODY.contains("id=\"pauses\""),
+            "held frames must land in a strip the page can fill"
+        );
+        assert!(
+            SCRIPT.contains("event.type === 'pause:hit'"),
+            "the event socket must accept pause:hit"
+        );
+        assert!(
+            SCRIPT.contains("event.type === 'pause:resolved'"),
+            "the event socket must accept pause:resolved"
+        );
+        assert!(
+            SCRIPT.contains("function notePause(pause)"),
+            "a hit must enter the local pause map"
+        );
+        assert!(
+            SCRIPT.contains("function resolvePause(pauseId, action, body, button, status)"),
+            "release and drop must post through one helper"
+        );
+        assert!(
+            SCRIPT.contains("async function saveRules()"),
+            "the rules form must PUT /api/breakpoints"
+        );
+        assert!(
+            SCRIPT.contains("JSON.stringify({ rules: [rule] })"),
+            "saving must send a rules envelope the endpoint deserialises"
+        );
+        assert!(
+            SCRIPT.contains("JSON.stringify({ rules: [] })"),
+            "clearing must PUT an empty rules list"
+        );
+        assert!(
+            CSS.contains(".pauses"),
+            "held pauses need styles so they stay visible under the header"
+        );
+        // Field names the form and release body put on the wire.
+        for field in [
+            "enabled:",
+            "kind: 'ws'",
+            "hosts:",
+            "pathPrefix:",
+            "directions:",
+            "opcodes:",
+            "timeoutMs:",
+            "dataBase64",
+            "opcode:",
+        ] {
+            assert!(
+                SCRIPT.contains(field),
+                "breakpoint UI must still send {field}"
+            );
+        }
+    }
+
+    /// Frames tab live replay: form posts history (or one index) through
+    /// `/ws/replay`; list rows still come only from the event socket.
+    #[test]
+    fn frames_tab_offers_live_ws_replay() {
+        assert!(
+            SCRIPT.contains("function replayForm(id, flow)"),
+            "the frames pane must build a replay form"
+        );
+        assert!(
+            SCRIPT.contains(
+                "function replayFrames(sourceId, indices, directions, delayMs, targetFlowId, button, status)"
+            ),
+            "replay must post through replayFrames"
+        );
+        assert!(
+            SCRIPT.contains("Replay history")
+                && SCRIPT.contains("Replay direction filter")
+                && SCRIPT.contains("Target flow id"),
+            "replay form must offer direction filter, target, and a history action"
+        );
+        assert!(
+            SCRIPT.contains("frameIndexBase")
+                && SCRIPT.contains("frameLine(frameMessages[i], frameIndexBase + i)"),
+            "per-frame replay needs absolute indices into source history"
+        );
+        assert!(
+            SCRIPT.contains("function isInjectableOpcode(code)")
+                && SCRIPT.contains("Replay this frame"),
+            "injectable frames must offer a single-frame replay control"
+        );
+        assert!(
+            SCRIPT.contains(
+                "This socket is closed. Replay only works onto a live upgraded flow"
+            ),
+            "a finished websocket must say replay needs a live target"
+        );
+        // Successful replay must not invent list rows from response.messages.
+        let replay = SCRIPT
+            .split_once(
+                "async function replayFrames(sourceId, indices, directions, delayMs, targetFlowId, button, status) {",
+            )
+            .expect("replayFrames still exists")
+            .1;
+        let body = replay
+            .split_once("function frameLine(message, absoluteIndex) {")
+            .expect("frameLine follows replayFrames")
+            .0;
+        for forbidden in [
+            "retainFrame(",
+            "renderFrames(",
+            "frameLine(",
+            "frameList.appendChild",
+            "frameMessages.push",
+            "parsed.messages",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "replayFrames must not {forbidden}: the event socket owns the list"
+            );
+        }
+        assert!(
+            body.contains("status.textContent = note;")
+                || body.contains("status.textContent = 'Replaying...'"),
+            "a successful replay must only mark status"
+        );
+        assert!(
+            CSS.contains(".inject.replay") && CSS.contains(".frame-replay"),
+            "replay form and per-row control need styles"
+        );
+    }
+
+    /// Same contract as inject: every key the page posts has to be one
+    /// WsReplayRequest deserialises (deny_unknown_fields).
+    #[test]
+    fn every_key_the_ws_replay_form_sends_is_one_the_endpoint_acts_on() {
+        let payload = serde_json::json!({
+            "mode": "live",
+            "indices": [0, 2],
+            "directions": ["send"],
+            "delayMs": 10,
+            "targetFlowId": "other-id",
+            "stopOnError": true,
+        });
+        let object = payload.as_object().expect("the payload is an object");
+        for key in object.keys() {
+            assert!(
+                SCRIPT.contains(&format!("{key}:"))
+                    || SCRIPT.contains(&format!("body.{key}"))
+                    || SCRIPT.contains(&format!("\"{key}\"")),
+                "{key} is in this test but the replay form no longer sends it"
+            );
+        }
+
+        let req: crate::replay::WsReplayRequest =
+            serde_json::from_value(payload).expect("the replay form payload is a WsReplayRequest");
+        assert_eq!(req.mode.as_deref(), Some("live"));
+        assert_eq!(req.indices.as_deref(), Some(&[0usize, 2][..]));
+        assert_eq!(
+            req.directions.as_ref().map(|d| d.as_slice()),
+            Some(&["send".to_string()][..])
+        );
+        assert_eq!(req.delay_ms, Some(10));
+        assert_eq!(req.target_flow_id.as_deref(), Some("other-id"));
+        assert_eq!(req.stop_on_error, Some(true));
+
+        for field in [
+            "body.mode = 'live'",
+            "body.indices = indices",
+            "body.directions = directions",
+            "body.delayMs = delayMs",
+            "body.targetFlowId = targetFlowId",
+            "body.stopOnError = true",
+        ] {
+            assert!(
+                SCRIPT.contains(field),
+                "the replay form must still send {field}"
+            );
+        }
+
+        // A key the endpoint does not act on must be refused, not swallowed.
+        let mut invented = serde_json::json!({ "mode": "live" });
+        invented["followRedirects"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<crate::replay::WsReplayRequest>(invented).is_err(),
+            "a key the replay endpoint does not act on must be refused, not swallowed"
+        );
+    }
+
+    /// Same contract as the HTTP composer: every key the page posts has to be
+    /// one the endpoint deserialises, or inject silently does something else.
+    #[test]
+    fn every_key_the_ws_inject_form_sends_is_one_the_endpoint_acts_on() {
+        let payload = serde_json::json!({
+            "direction": "send",
+            "opcode": 1,
+            "text": "hello",
+            "dataBase64": "aGk=",
+            "closeCode": 1000,
+            "closeReason": "bye",
+        });
+        let object = payload.as_object().expect("the payload is an object");
+        for key in object.keys() {
+            assert!(
+                SCRIPT.contains(&format!("{key}:")) || SCRIPT.contains(&format!("body.{key}")),
+                "{key} is in this test but the inject form no longer sends it"
+            );
+        }
+
+        // The real request body is built in injectFrame; deserialising the same
+        // shape through the route's private struct is not possible here, so the
+        // camelCase fields of WsMessage-bound inject are checked against the
+        // documented request shape instead.
+        for field in [
+            "direction:",
+            "opcode:",
+            "text = text",
+            "dataBase64",
+            "closeCode",
+            "closeReason",
+        ] {
+            assert!(
+                SCRIPT.contains(field),
+                "the inject form must still send {field}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("body.closeCode = code;"),
+            "close frames must send closeCode"
+        );
+        assert!(
+            SCRIPT.contains("body.closeReason = closeReason;"),
+            "close frames must send closeReason when set"
+        );
+        assert!(
+            SCRIPT.contains("body.dataBase64 = toBase64(text);"),
+            "binary frames must send dataBase64"
+        );
+        assert!(
+            SCRIPT.contains("body.text = text;"),
+            "text frames must send text"
+        );
+    }
+
     /// Serde drops a key it does not recognise, so a field the page invents
     /// reads on screen as a promise and on the wire as nothing at all.
     #[test]
@@ -3555,6 +5884,173 @@ mod tests {
         assert!(
             !SCRIPT.contains("followRedirects"),
             "the composer must not ask for a behaviour nothing implements"
+        );
+    }
+
+    /// Shared H2+H3 multiplex identity on Flow / FlowSummary. The list and
+    /// Info pane read the same camelCase keys the REST and event socket send;
+    /// transport stays optional and is not required for H2 connectionId.
+    #[test]
+    fn multiplex_fields_are_read_from_summary_and_full_flow() {
+        // List filter needle includes connection/stream so typing a session id
+        // groups sibling streams without a separate API field.
+        assert!(
+            SCRIPT.contains("str(flow.connectionId), str(flow.streamId)"),
+            "list filter must match connectionId and streamId from FlowSummary"
+        );
+        // Row tooltip surfaces version, transport, conn, stream without new columns.
+        assert!(
+            SCRIPT.contains("tips.push('conn ' + str(flow.connectionId));"),
+            "list row title must show connectionId when present"
+        );
+        assert!(
+            SCRIPT.contains("tips.push('stream ' + String(flow.streamId));"),
+            "list row title must show streamId when present"
+        );
+        // Info facts: same keys for H2 and H3; transport only when set.
+        assert!(
+            SCRIPT.contains("if (flow.transport) { pairs.push(['Transport', str(flow.transport)]); }"),
+            "Info must show transport only when present (H3 quic; omit for TCP H2)"
+        );
+        assert!(
+            SCRIPT.contains("if (flow.connectionId) { pairs.push(['Connection', str(flow.connectionId)]); }"),
+            "Info must show connectionId for H2 and H3 multiplex sessions"
+        );
+        assert!(
+            SCRIPT.contains("pairs.push(['Stream id', String(flow.streamId)]);"),
+            "Info must show client-leg streamId when known"
+        );
+        assert!(
+            SCRIPT.contains("pairs.push(['Upstream stream id', String(flow.upstreamStreamId)]);"),
+            "Info must show upstreamStreamId (full flow only) when MITM reopened multiplex"
+        );
+        // Click connection to filter siblings on the same multiplex session.
+        assert!(
+            SCRIPT.contains("function filterByConnection(connectionId)"),
+            "Connection fact must offer filter-by-session for H2/H3 grouping"
+        );
+        assert!(
+            SCRIPT.contains("filterByConnection(str(flow.connectionId));"),
+            "clicking Connection must filter the list to that session id"
+        );
+        assert!(
+            CSS.contains("button.flink"),
+            "connection filter control needs distinct styling"
+        );
+        // Detail head marks HTTP/2 and HTTP/3 without inventing a transport label.
+        assert!(
+            SCRIPT.contains("request.httpVersion === '2.0' || request.httpVersion === '3.0'"),
+            "detail method line must surface 2.0 and 3.0 versions"
+        );
+        // Filter box copy mentions connection so the shared key is discoverable.
+        assert!(
+            BODY.contains("status or connection"),
+            "filter placeholder must mention connection for multiplex session search"
+        );
+        // Event-socket status frames drive the chrome strip for bound UDP
+        // listeners and scaffolds (quic / reverse-h3 / wireguard / tun);
+        // never the TCP proxy port, and never a claim that WG crypto or host
+        // packet capture works.
+        assert!(
+            SCRIPT.contains("st.quicEnabled || st.quicPort || st.quicNote || st.reverseH3"),
+            "status events must read ServerStatus quic fields"
+        );
+        assert!(
+            SCRIPT.contains("QUIC :' + st.quicPort"),
+            "status strip must show the UDP quicPort when bound"
+        );
+        assert!(
+            SCRIPT.contains("st.reverseH3"),
+            "status strip must surface reverseH3 upstream when set"
+        );
+        assert!(
+            SCRIPT.contains("accept-only"),
+            "status strip must label accept-only when no reverse upstream"
+        );
+        assert!(
+            SCRIPT.contains("st.quicNote"),
+            "status strip must put quicNote on the live indicator title"
+        );
+        assert!(
+            SCRIPT.contains("st.wireguardEnabled || st.wireguardPort || st.wireguardNote"),
+            "status events must read ServerStatus wireguard fields"
+        );
+        assert!(
+            SCRIPT.contains("WG :' + st.wireguardPort"),
+            "status strip must show the WG UDP port when bound"
+        );
+        assert!(
+            SCRIPT.contains("scaffold"),
+            "WG/TUN strip labels must say scaffold so they are not fake claims"
+        );
+        assert!(
+            SCRIPT.contains("st.wireguardNote"),
+            "status strip must put wireguardNote on the live indicator title"
+        );
+        assert!(
+            SCRIPT.contains("st.tunEnabled || st.tunActive || st.tunNote"),
+            "status events must read ServerStatus tun fields"
+        );
+        assert!(
+            SCRIPT.contains("TUN scaffold"),
+            "status strip must label TUN as scaffold when active"
+        );
+        assert!(
+            SCRIPT.contains("st.tunNote"),
+            "status strip must put tunNote on the live indicator title"
+        );
+        assert!(
+            SCRIPT.contains("st.tunActive"),
+            "status strip must gate the TUN label on tunActive"
+        );
+        // P11: likelyPinning is a cert-reject signal, not pure pinning proof.
+        assert!(
+            SCRIPT.contains("not pure pinning proof")
+                || SCRIPT.contains("user-installed CA")
+                || SCRIPT.contains("user-CA policy"),
+            "Info error copy must not claim pure app pinning for likelyPinning"
+        );
+        assert!(
+            SCRIPT.contains("pin.title")
+                && SCRIPT.contains("Not pure pinning proof"),
+            "PINNED badge tooltip must state cert-reject is not pure pinning proof"
+        );
+
+        // FlowSummary still serialises the optional keys the list reads.
+        let summary = FlowSummary {
+            id: "s1".into(),
+            kind: FlowKind::Http,
+            state: FlowState::Complete,
+            intercepted: true,
+            method: "GET".into(),
+            scheme: Scheme::Https,
+            authority: "example.com".into(),
+            path: "/".into(),
+            http_version: HttpVersion::Http2,
+            status: Some(200),
+            content_type: None,
+            request_size: 0,
+            response_size: 0,
+            start: 1,
+            duration: Some(2),
+            error: None,
+            likely_pinning: false,
+            client: "10.0.0.2".into(),
+            transport: None,
+            connection_id: Some("tls-session-uuid".into()),
+            stream_id: Some(3),
+        };
+        let json = serde_json::to_value(&summary).expect("summary serialises");
+        assert_eq!(json["connectionId"], "tls-session-uuid");
+        assert_eq!(json["streamId"], 3);
+        assert_eq!(json["httpVersion"], "2.0");
+        assert!(
+            json.as_object().unwrap().get("transport").is_none(),
+            "H2 summary must omit transport so TCP list JSON stays quiet"
+        );
+        assert!(
+            json.as_object().unwrap().get("upstreamStreamId").is_none(),
+            "upstreamStreamId is full-Flow only, not on FlowSummary"
         );
     }
 }

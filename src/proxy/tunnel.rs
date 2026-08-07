@@ -50,6 +50,10 @@ pub(super) fn tunnel_init(host: &str, port: u16, client: FlowClient) -> FlowInit
         client,
         server: FlowServer::default(),
         replay_of: None,
+        transport: None,
+        connection_id: None,
+        stream_id: None,
+        upstream_stream_id: None,
     }
 }
 

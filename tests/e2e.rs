@@ -94,6 +94,10 @@ async fn start_with(deny: Vec<String>, rewrite: RewriteRules) -> Harness {
         ca,
         store: store.clone(),
         setup: Arc::new(StubSetup),
+        ws_registry: Arc::new(proxima::proxy::websocket::WsRegistry::new()),
+        pauses: Arc::new(proxima::proxy::breakpoint::PauseHub::new()),
+        ws_rewrite: proxima::proxy::ws_rewrite::WsRewriteHub::empty(),
+        rewrite: proxima::proxy::rewrite::RewriteHub::empty(),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

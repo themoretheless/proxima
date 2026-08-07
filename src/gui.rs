@@ -30,6 +30,12 @@ const EVICT_SLACK: usize = 512;
 /// Body bytes rendered as text. Past this the preview is cut: a 10 MB response
 /// pasted into a label costs more than it tells anyone.
 const PREVIEW_LIMIT: usize = 256 * 1024;
+/// Detail copy when `likely_pinning` is set. Cert-reject signal only: Chrome
+/// user-CA refusal for QUIC is the same class, so this is not pure app-pinning
+/// proof (see README force-TCP / Chrome user-CA notes).
+const LIKELY_PINNING_NOTE: &str = "Client rejected the Proxima certificate (pinning or user-CA \
+policy, not pure pinning proof). Exclude the host with --skip to let it through untouched, or \
+force the client onto TCP/HTTP2.";
 
 pub struct Inspector {
     store: Arc<FlowStore>,
@@ -150,6 +156,9 @@ impl Inspector {
                         self.load_detail(&id);
                     }
                 }
+                // Native GUI does not surface breakpoints yet; ignore so the
+                // exhaustive match stays complete when pause events land.
+                Ok(ProxyEvent::PauseHit { .. }) | Ok(ProxyEvent::PauseResolved { .. }) => {}
                 Ok(ProxyEvent::Clear) => {
                     self.rows.clear();
                     self.index.clear();
@@ -273,10 +282,51 @@ impl eframe::App for Inspector {
                 ui.label(egui::RichText::new(dot).color(if self.live { OK } else { ERROR }))
                     .on_hover_text(tip);
 
+                // QUIC/UDP listener facts from ServerStatus (never the TCP proxy port).
+                if let Some(label) = quic_status_label(&self.status) {
+                    ui.separator();
+                    let tip = self
+                        .status
+                        .quic_note
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "QUIC/HTTP3 over UDP. Regular TCP proxy mode cannot see QUIC."
+                                .to_string()
+                        });
+                    ui.label(egui::RichText::new(label).monospace().weak())
+                        .on_hover_text(tip);
+                }
+
+                // WireGuard scaffold bind facts (never claim device-join crypto).
+                if let Some(label) = wireguard_status_label(&self.status) {
+                    ui.separator();
+                    let tip = self
+                        .status
+                        .wireguard_note
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "WireGuard UDP scaffold only. Noise/WG crypto is not shipped."
+                                .to_string()
+                        });
+                    ui.label(egui::RichText::new(label).monospace().weak())
+                        .on_hover_text(tip);
+                }
+
+                // TUN scaffold task (never claim host packet capture).
+                if let Some(label) = tun_status_label(&self.status) {
+                    ui.separator();
+                    let tip = self.status.tun_note.clone().unwrap_or_else(|| {
+                        "TUN scaffold only. No utun//dev/net/tun open; not working host capture."
+                            .to_string()
+                    });
+                    ui.label(egui::RichText::new(label).monospace().weak())
+                        .on_hover_text(tip);
+                }
+
                 ui.separator();
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Filter by method, host, path or status")
+                        .hint_text("Filter by method, host, path, status or connection")
                         .desired_width(320.0),
                 );
                 ui.checkbox(&mut self.only_errors, "Errors only");
@@ -427,7 +477,21 @@ impl Inspector {
                                 }
                             ),
                         );
-                        fact(ui, "HTTP", &format!("{:?}", flow.request.http_version));
+                        fact(ui, "HTTP", flow.request.http_version.as_label());
+                        // transport is orthogonal: omit on TCP (including H2);
+                        // "quic" only for H3. connectionId/streamId group H2+H3.
+                        if let Some(transport) = flow.transport {
+                            fact(ui, "Transport", transport.as_str());
+                        }
+                        if let Some(conn) = &flow.connection_id {
+                            fact(ui, "Connection", conn);
+                        }
+                        if let Some(stream) = flow.stream_id {
+                            fact(ui, "Stream id", &stream.to_string());
+                        }
+                        if let Some(upstream) = flow.upstream_stream_id {
+                            fact(ui, "Upstream stream id", &upstream.to_string());
+                        }
                         if let Some(end) = flow.timings.end {
                             fact(
                                 ui,
@@ -455,11 +519,7 @@ impl Inspector {
                     ui.add_space(6.0);
                     ui.colored_label(ERROR, &error.message);
                     if error.likely_pinning == Some(true) {
-                        ui.colored_label(
-                            WARN,
-                            "This app pins its certificates. Exclude the host with --skip to let \
-                             it through untouched.",
-                        );
+                        ui.colored_label(WARN, LIKELY_PINNING_NOTE);
                     }
                 }
 
@@ -486,11 +546,21 @@ impl Inspector {
                             crate::types::WsDirection::Send => "->",
                             crate::types::WsDirection::Recv => "<-",
                         };
+                        let mut mark = String::new();
+                        if message.injected {
+                            mark.push_str(" [injected]");
+                        }
+                        // Observe-side inflate: text is readable; size stays wire length.
+                        if message.compressed {
+                            mark.push_str(" [compressed]");
+                        }
                         let text = message
                             .text
                             .clone()
                             .unwrap_or_else(|| format!("{} bytes", message.size));
-                        ui.label(egui::RichText::new(format!("{arrow} {text}")).monospace());
+                        ui.label(
+                            egui::RichText::new(format!("{arrow}{mark} {text}")).monospace(),
+                        );
                     }
                 }
             });
@@ -647,15 +717,53 @@ fn status_line(flow: &Flow) -> String {
 }
 
 fn haystack(flow: &FlowSummary) -> String {
+    // Include multiplex session keys so typing a connection/stream id groups
+    // sibling H2 TLS or H3 QUIC streams the same way the web inspector does.
     format!(
-        "{} {}{} {} {}",
+        "{} {}{} {} {} {} {} {} {}",
         flow.method,
         flow.authority,
         flow.path,
         flow.status.map(|s| s.to_string()).unwrap_or_default(),
         flow.content_type.clone().unwrap_or_default(),
+        flow.http_version.as_label(),
+        flow.transport.map(|t| t.as_str()).unwrap_or(""),
+        flow.connection_id.as_deref().unwrap_or(""),
+        flow.stream_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
     )
     .to_ascii_lowercase()
+}
+
+/// Compact toolbar label for a bound QUIC/UDP listener. `None` when no UDP
+/// socket is listening so the classic TCP proxy status line stays quiet.
+fn quic_status_label(status: &ServerStatus) -> Option<String> {
+    let port = status.quic_port?;
+    let label = match status.reverse_h3.as_deref() {
+        Some(upstream) => format!("quic :{port} reverse {upstream}"),
+        None => format!("quic :{port} accept-only"),
+    };
+    Some(label)
+}
+
+/// Compact toolbar label for a bound WireGuard scaffold UDP port. `None` when
+/// no WG socket is listening. Always says "scaffold" so the UI never looks like
+/// a working device tunnel.
+fn wireguard_status_label(status: &ServerStatus) -> Option<String> {
+    let port = status.wireguard_port?;
+    Some(format!("wg :{port} scaffold"))
+}
+
+/// Compact toolbar label when the TUN scaffold task was requested. `None` when
+/// TUN was never started. Always says "scaffold" so the UI never looks like
+/// working host packet capture.
+fn tun_status_label(status: &ServerStatus) -> Option<String> {
+    if status.tun_active == Some(true) {
+        Some("tun scaffold".to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -687,6 +795,9 @@ mod tests {
             error: None,
             likely_pinning: false,
             client: "127.0.0.1".to_string(),
+            transport: None,
+            connection_id: None,
+            stream_id: None,
         }
     }
 
@@ -725,6 +836,24 @@ mod tests {
         assert_eq!(row_color(&flow), WARN, "a pinned host must be told apart from a plain failure");
     }
 
+    /// P11 honesty: the native pane must not treat likely_pinning as pure
+    /// app-pinning proof (Chrome user-CA refusal for QUIC is the same class).
+    #[test]
+    fn likely_pinning_copy_is_not_pure_pinning_proof() {
+        assert!(
+            LIKELY_PINNING_NOTE.contains("not pure pinning proof"),
+            "gui detail must not claim pure app pinning for likely_pinning"
+        );
+        assert!(
+            LIKELY_PINNING_NOTE.contains("user-CA"),
+            "gui detail must name user-CA policy as an alternate cause"
+        );
+        assert!(
+            LIKELY_PINNING_NOTE.contains("TCP/HTTP2"),
+            "gui detail should point operators at force-TCP when cert reject fires"
+        );
+    }
+
     #[test]
     fn a_four_hundred_counts_as_a_failure() {
         assert!(is_failure(&summary("GET", "api.example.com", "/", Some(404))));
@@ -740,6 +869,132 @@ mod tests {
         for needle in ["post", "api.example.com", "/v1/users", "201", "json"] {
             assert!(hay.contains(needle), "{needle} did not match {hay}");
         }
+    }
+
+    #[test]
+    fn haystack_matches_multiplex_and_quic_fields() {
+        use crate::types::Transport;
+        let mut flow = summary("GET", "h3.example", "/x", Some(200));
+        flow.http_version = HttpVersion::Http3;
+        flow.transport = Some(Transport::Quic);
+        flow.connection_id = Some("quic-conn-uuid".into());
+        flow.stream_id = Some(0);
+        let hay = haystack(&flow);
+        for needle in ["3.0", "quic", "quic-conn-uuid", "0"] {
+            assert!(hay.contains(needle), "{needle} did not match {hay}");
+        }
+    }
+
+    #[test]
+    fn quic_status_label_names_port_and_mode() {
+        let mut status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["127.0.0.1".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: true,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: false,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: false,
+            tun_active: None,
+            tun_note: None,
+        };
+        assert!(quic_status_label(&status).is_none());
+
+        status.quic_port = Some(9443);
+        assert_eq!(
+            quic_status_label(&status).as_deref(),
+            Some("quic :9443 accept-only")
+        );
+
+        status.reverse_h3 = Some("origin.example:443".into());
+        assert_eq!(
+            quic_status_label(&status).as_deref(),
+            Some("quic :9443 reverse origin.example:443")
+        );
+    }
+
+    #[test]
+    fn wireguard_status_label_names_scaffold_port() {
+        let mut status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["127.0.0.1".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: false,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: true,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: false,
+            tun_active: None,
+            tun_note: None,
+        };
+        assert!(wireguard_status_label(&status).is_none());
+
+        status.wireguard_port = Some(51820);
+        assert_eq!(
+            wireguard_status_label(&status).as_deref(),
+            Some("wg :51820 scaffold")
+        );
+        // Never looks like a working tunnel.
+        let label = wireguard_status_label(&status).expect("label");
+        assert!(label.contains("scaffold"), "{label}");
+        assert!(!label.contains("tunnel"), "{label}");
+    }
+
+    #[test]
+    fn tun_status_label_names_scaffold_when_active() {
+        let mut status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["127.0.0.1".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: false,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: false,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: true,
+            tun_active: None,
+            tun_note: None,
+        };
+        assert!(tun_status_label(&status).is_none());
+
+        status.tun_active = Some(true);
+        assert_eq!(
+            tun_status_label(&status).as_deref(),
+            Some("tun scaffold")
+        );
+        let label = tun_status_label(&status).expect("label");
+        assert!(label.contains("scaffold"), "{label}");
+        assert!(
+            !label.contains("capture") && !label.contains("tunnel"),
+            "must not look like working capture: {label}"
+        );
     }
 
     #[test]

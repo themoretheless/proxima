@@ -111,6 +111,7 @@ fn header(page: &mut String) {
   <div class="mark">PROXIMA</div>
   <h1>Set this device up</h1>
   <p class="lede">Two things have to happen: point this device's Wi-Fi proxy at Proxima, then trust its certificate. Both are reversible.</p>
+  <p class="lede aside">The system HTTP/HTTPS proxy is TCP CONNECT only. QUIC and HTTP/3 from apps are not captured that way. WireGuard userspace mode is a scaffold only (UDP bind; crypto not shipped), so device join is not available yet. Local TUN capture is also scaffold only (no utun//dev/net/tun open; not working host capture). Reverse H3 is a separate UDP path for clients you can point at Proxima.</p>
 </header>
 "#,
     );
@@ -124,6 +125,58 @@ fn address_card(page: &mut String, primary: &str, proxy_port: u16, status: &Serv
     page.push_str("  <div class=\"figure\"><span class=\"k\">Port</span><span class=\"v mono\">");
     page.push_str(&proxy_port.to_string());
     page.push_str("</span></div>\n");
+
+    // QUIC is a separate UDP listener. Never claim the TCP proxy port carries it.
+    if let Some(quic_port) = status.quic_port {
+        page.push_str(
+            "  <div class=\"figure\"><span class=\"k\">QUIC UDP</span><span class=\"v mono\">",
+        );
+        page.push_str(&quic_port.to_string());
+        page.push_str("</span></div>\n");
+        if let Some(upstream) = status.reverse_h3.as_deref() {
+            page.push_str(
+                "  <p class=\"aside\">Reverse HTTP/3 is listening on that UDP port and \
+                 forwards to <code>",
+            );
+            page.push_str(&escape(upstream));
+            page.push_str(
+                "</code>. Phone Wi-Fi proxy settings do not feed this path; \
+                 point H3 clients at Proxima as the origin.</p>\n",
+            );
+        } else {
+            page.push_str(
+                "  <p class=\"aside\">A QUIC UDP listener is bound (accept-only). \
+                 Regular TCP CONNECT still cannot see app QUIC traffic.</p>\n",
+            );
+        }
+    }
+
+    // WireGuard scaffold: may show a bound port; never claim crypto/device join works.
+    if let Some(wg_port) = status.wireguard_port {
+        page.push_str(
+            "  <div class=\"figure\"><span class=\"k\">WG UDP</span><span class=\"v mono\">",
+        );
+        page.push_str(&wg_port.to_string());
+        page.push_str("</span></div>\n");
+        page.push_str(
+            "  <p class=\"aside\">WireGuard userspace scaffold is bound on that UDP port \
+             (listen only). Noise/WG crypto and a working device tunnel are not shipped. \
+             Phone Wi-Fi proxy settings do not feed this path.</p>\n",
+        );
+    }
+
+    // TUN scaffold: may mark active when requested; never claim host packet capture.
+    if status.tun_active == Some(true) {
+        page.push_str(
+            "  <div class=\"figure\"><span class=\"k\">TUN</span><span class=\"v mono\">scaffold</span></div>\n",
+        );
+        page.push_str(
+            "  <p class=\"aside\">Local TUN / packet-capture mode is scaffold only \
+             (shutdown watch; no utun//dev/net/tun open). macOS needs Network Extension \
+             (no TPROXY); Linux /dev/net/tun + CAP_NET_ADMIN. Not working host capture. \
+             Phone Wi-Fi proxy settings do not feed this path.</p>\n",
+        );
+    }
 
     if status.addresses.len() > 1 {
         page.push_str("  <p class=\"aside\">If that address does not work, this machine is also reachable at ");
@@ -692,5 +745,187 @@ mod tests {
                 "the setup page must not reference {fragment}"
             );
         }
+    }
+
+    #[test]
+    fn address_card_surfaces_quic_udp_without_claiming_tcp() {
+        let mut page = String::new();
+        let status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["192.168.1.5".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: true,
+            quic_port: Some(9443),
+            quic_note: Some("note".into()),
+            reverse_h3: Some("origin.example:443".into()),
+            wireguard_enabled: false,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: false,
+            tun_active: None,
+            tun_note: None,
+        };
+        address_card(&mut page, "192.168.1.5", 9090, &status);
+        assert!(page.contains("QUIC UDP"), "must name the UDP listener: {page}");
+        assert!(page.contains("9443"), "must show the bound QUIC port: {page}");
+        assert!(
+            page.contains("origin.example:443"),
+            "must name reverse upstream: {page}"
+        );
+        assert!(
+            page.contains("Phone Wi-Fi proxy"),
+            "must not imply phone CONNECT feeds QUIC: {page}"
+        );
+        // TCP proxy port figure still present and distinct.
+        assert!(page.contains(">Port</span>"), "{page}");
+        assert!(page.contains(">9090</span>"), "{page}");
+    }
+
+    #[test]
+    fn address_card_surfaces_wireguard_scaffold_without_claiming_tunnel() {
+        let mut page = String::new();
+        let status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["192.168.1.5".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: false,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: true,
+            wireguard_port: Some(51820),
+            wireguard_note: Some("scaffold only".into()),
+            tun_enabled: false,
+            tun_active: None,
+            tun_note: None,
+        };
+        address_card(&mut page, "192.168.1.5", 9090, &status);
+        assert!(page.contains("WG UDP"), "must name the WG UDP listener: {page}");
+        assert!(page.contains("51820"), "must show the bound WG port: {page}");
+        assert!(
+            page.contains("scaffold") || page.contains("not shipped"),
+            "must not claim a working device tunnel: {page}"
+        );
+        assert!(
+            page.contains("Phone Wi-Fi proxy"),
+            "must not imply phone CONNECT feeds WireGuard: {page}"
+        );
+        assert!(!page.contains("QUIC UDP"), "WG-only card must not invent QUIC: {page}");
+        assert!(page.contains(">9090</span>"), "TCP proxy port still present: {page}");
+    }
+
+    #[test]
+    fn header_states_wireguard_is_scaffold_only() {
+        let mut page = String::new();
+        header(&mut page);
+        assert!(
+            page.contains("WireGuard") && page.contains("scaffold"),
+            "setup lede must name WG scaffold: {page}"
+        );
+        assert!(
+            page.contains("crypto not shipped") || page.contains("not available yet"),
+            "setup lede must not claim device join works: {page}"
+        );
+    }
+
+    #[test]
+    fn address_card_surfaces_tun_scaffold_without_claiming_capture() {
+        let mut page = String::new();
+        let status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["192.168.1.5".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: false,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: false,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: true,
+            tun_active: Some(true),
+            tun_note: Some("scaffold only".into()),
+        };
+        address_card(&mut page, "192.168.1.5", 9090, &status);
+        assert!(page.contains(">TUN</span>"), "must name the TUN mode: {page}");
+        assert!(
+            page.contains("scaffold"),
+            "must label TUN as scaffold only: {page}"
+        );
+        assert!(
+            page.contains("not working") || page.contains("no utun") || page.contains("not shipped"),
+            "must not claim working host capture: {page}"
+        );
+        assert!(
+            page.contains("Phone Wi-Fi proxy"),
+            "must not imply phone CONNECT feeds TUN: {page}"
+        );
+        assert!(!page.contains("WG UDP"), "TUN-only card must not invent WG: {page}");
+        assert!(page.contains(">9090</span>"), "TCP proxy port still present: {page}");
+    }
+
+    #[test]
+    fn address_card_omits_tun_when_idle() {
+        let mut page = String::new();
+        let status = ServerStatus {
+            proxy_port: 9090,
+            ui_port: 9091,
+            addresses: vec!["192.168.1.5".into()],
+            ca_fingerprint: "ab".into(),
+            ca_not_after: "2035-01-01T00:00:00Z".into(),
+            flow_count: 0,
+            capturing: true,
+            archiving: false,
+            archive_dropped: 0,
+            quic_enabled: false,
+            quic_port: None,
+            quic_note: None,
+            reverse_h3: None,
+            wireguard_enabled: false,
+            wireguard_port: None,
+            wireguard_note: None,
+            tun_enabled: true,
+            tun_active: None,
+            tun_note: Some("compiled in but not requested".into()),
+        };
+        address_card(&mut page, "192.168.1.5", 9090, &status);
+        assert!(
+            !page.contains(">TUN</span>"),
+            "idle TUN must not show a TUN figure: {page}"
+        );
+    }
+
+    #[test]
+    fn header_states_tun_is_scaffold_only() {
+        let mut page = String::new();
+        header(&mut page);
+        assert!(
+            page.contains("TUN") && page.contains("scaffold"),
+            "setup lede must name TUN scaffold: {page}"
+        );
+        assert!(
+            page.contains("no utun")
+                || page.contains("not working host capture")
+                || page.contains("not working"),
+            "setup lede must not claim host capture works: {page}"
+        );
     }
 }
