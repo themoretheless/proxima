@@ -112,9 +112,11 @@ const BODY: &str = r#"<header>
   <span id="count" class="count"></span>
   <button id="theme" class="btn" type="button" title="Light, dark, or whatever this machine is set to">Theme: system</button>
   <button id="view" class="btn on" type="button">Hide tree</button>
-  <button id="break" class="btn" type="button" title="Hold WebSocket frames before they are forwarded">Breakpoints</button>
+  <button id="break" class="btn" type="button" title="Hold WebSocket frames or HTTP messages before they are forwarded">Breakpoints</button>
   <button id="rewrite" class="btn" type="button" title="Replace or drop matching WebSocket frames on the wire">WS rewrite</button>
+  <button id="httprewrite" class="btn" type="button" title="Answer matching HTTP requests from a mock status, headers and body without dialling the origin">HTTP rewrite</button>
   <button id="compose" class="btn" type="button">Compose</button>
+  <button id="archive" class="btn" type="button" title="Totals, busiest hosts, status classes, slowest paths and heaviest responses from the on-disk archive">Archive</button>
   <button id="clear" class="btn" type="button">Clear</button>
   <a class="btn" href="/setup">Set up a device</a>
 </header>
@@ -187,8 +189,19 @@ const BODY: &str = r#"<header>
     <div id="c-out"></div>
   </section>
   <section id="breaker" hidden>
-    <p class="hint">Hold matching WebSocket frames before they are forwarded. Rules are runtime-only and lost on restart. Empty hosts matches any host. By default only text and binary frames pause; ping, pong and close keep flowing so keepalive and the close handshake do not stall. Injected frames skip breakpoints.</p>
+    <p class="hint">Hold matching WebSocket frames or HTTP messages before they are forwarded. Rules are runtime-only and lost on restart. Empty hosts matches any host. For WebSocket, by default only text and binary frames pause; ping, pong and close keep flowing so keepalive and the close handshake do not stall. For HTTP, empty methods matches any method. Injected frames skip breakpoints.</p>
     <div class="c-line">
+      <select id="b-kind" aria-label="Kind">
+        <option value="ws">WebSocket</option>
+        <option value="http">HTTP</option>
+      </select>
+      <select id="b-http-half" aria-label="HTTP half" title="Which half of the exchange to hold" hidden>
+        <option value="request">request</option>
+        <option value="response">response</option>
+      </select>
+      <input id="b-methods" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Methods, comma-separated (empty = any)" aria-label="HTTP methods"
+             title="Comma-separated methods for HTTP rules; empty matches any" hidden>
       <input id="b-hosts" type="text" spellcheck="false" autocomplete="off"
              placeholder="Hosts, comma-separated (empty = any)" aria-label="Hosts">
       <input id="b-path" type="text" spellcheck="false" autocomplete="off"
@@ -237,6 +250,65 @@ const BODY: &str = r#"<header>
     <p id="w-status" class="hint"></p>
     <div id="w-list"></div>
   </section>
+  <section id="httprewriter" hidden>
+    <p class="hint">Rewrite matching HTTP traffic in flight, or answer it from a mock without dialling the origin (map local). Path and query replacements use one find=&gt;replace per line. Request and response body rewrites are find/replace with an optional maxBytes cap. Rules are runtime-only and lost on restart unless you save again. Empty hosts matches any host. Empty methods matches any method. Empty path prefix matches any path. The last matching mock wins. This form saves one rule; save again to replace the list.</p>
+    <div class="c-line">
+      <input id="hr-hosts" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Hosts, comma-separated (empty = any)" aria-label="Hosts">
+      <input id="hr-methods" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Methods, comma-separated (empty = any)" aria-label="Methods">
+      <input id="hr-path" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Path prefix (empty = any)" aria-label="Path prefix">
+      <input id="hr-mock-status" type="number" min="100" max="599" step="1" value="200"
+             aria-label="Mock status" title="HTTP status for the mock response">
+    </div>
+    <label class="c-label" for="hr-headers">Mock response headers, one per line, as Name: value</label>
+    <textarea id="hr-headers" spellcheck="false" placeholder="content-type: application/json"></textarea>
+    <label class="c-label" for="hr-body">Mock body</label>
+    <textarea id="hr-body" spellcheck="false" placeholder="{&quot;ok&quot;: true}"></textarea>
+    <div class="c-line">
+      <input id="hr-body-file" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Optional body file path (wins over body when readable)" aria-label="Body file path">
+    </div>
+    <label class="c-label" for="hr-path-repl">Path replacements, one find=&gt;replace per line</label>
+    <textarea id="hr-path-repl" spellcheck="false" placeholder="/v1/=&gt;/v2/"></textarea>
+    <label class="c-label" for="hr-query-repl">Query replacements, one find=&gt;replace per line</label>
+    <textarea id="hr-query-repl" spellcheck="false" placeholder="debug=1=&gt;debug=0"></textarea>
+    <label class="c-label" for="hr-req-body-find">Request body find / replace</label>
+    <div class="c-line">
+      <input id="hr-req-body-find" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Find" aria-label="Request body find">
+      <input id="hr-req-body-replace" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Replace" aria-label="Request body replace">
+      <input id="hr-req-body-max" type="number" min="1" step="1"
+             placeholder="maxBytes" aria-label="Request body max bytes"
+             title="Optional: only rewrite request bodies up to this many bytes">
+    </div>
+    <label class="c-label" for="hr-res-body-find">Response body find / replace</label>
+    <div class="c-line">
+      <input id="hr-res-body-find" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Find" aria-label="Response body find">
+      <input id="hr-res-body-replace" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Replace" aria-label="Response body replace">
+      <input id="hr-res-body-max" type="number" min="1" step="1"
+             placeholder="maxBytes" aria-label="Response body max bytes"
+             title="Optional: only rewrite response bodies up to this many bytes">
+    </div>
+    <div class="c-line">
+      <button id="hr-save" class="btn" type="button">Save rules</button>
+      <button id="hr-clear" class="btn" type="button">Clear all rules</button>
+    </div>
+    <p id="hr-status" class="hint"></p>
+    <div id="hr-list"></div>
+  </section>
+  <section id="archiver" hidden>
+    <div class="c-line">
+      <button id="a-refresh" class="btn" type="button">Refresh</button>
+      <span id="a-dropped" class="hint" hidden></span>
+    </div>
+    <p id="a-status" class="hint"></p>
+    <div id="a-body"></div>
+  </section>
 </main>
 "#;
 
@@ -278,6 +350,10 @@ const CSS: &str = r#"
   --err-bg: light-dark(#fbeeea, #2a1c18);
   --err-ink: light-dark(#7a2f24, #f0c9c0);
   --pin-ink: light-dark(#33260a, #2a1d05);
+  --mock-ink: light-dark(#0e2a38, #0a2030);
+  --mock-line: light-dark(#b8d4e4, #2f4d5e);
+  --mock-bg: light-dark(#eaf4f9, #1a2830);
+  --mock-title: light-dark(#1f5a75, #86bcd8);
 }
 :root[data-theme="light"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; }
@@ -335,18 +411,27 @@ main.flat > #list, main.flat > #detail { grid-column: 1; }
 #detail { overflow: auto; padding: 12px 14px 40px; min-height: 0; }
 /* Composing takes the list and the pane under it, and leaves the tree alone: a
    saved request is opened from that tree, and covering it would put away the
-   thing being picked from. Breakpoints and WS rewrite rules use the same seat. */
-main.composing, main.breaking, main.rewriting { grid-template-rows: minmax(0, 1fr); }
+   thing being picked from. Breakpoints, WS rewrite, HTTP rewrite and archive
+   stats use the same seat. */
+main.composing, main.breaking, main.rewriting, main.httprewriting, main.archiving {
+  grid-template-rows: minmax(0, 1fr);
+}
 main.composing > #list, main.composing > #detail,
 main.breaking > #list, main.breaking > #detail,
-main.rewriting > #list, main.rewriting > #detail { display: none; }
+main.rewriting > #list, main.rewriting > #detail,
+main.httprewriting > #list, main.httprewriting > #detail,
+main.archiving > #list, main.archiving > #detail { display: none; }
 main.composing > #composer { grid-column: 2; grid-row: 1; }
 main.composing.flat > #composer { grid-column: 1; }
 main.breaking > #breaker { grid-column: 2; grid-row: 1; }
 main.breaking.flat > #breaker { grid-column: 1; }
 main.rewriting > #rewriter { grid-column: 2; grid-row: 1; }
 main.rewriting.flat > #rewriter { grid-column: 1; }
-#composer, #breaker, #rewriter {
+main.httprewriting > #httprewriter { grid-column: 2; grid-row: 1; }
+main.httprewriting.flat > #httprewriter { grid-column: 1; }
+main.archiving > #archiver { grid-column: 2; grid-row: 1; }
+main.archiving.flat > #archiver { grid-column: 1; }
+#composer, #breaker, #rewriter, #httprewriter, #archiver {
   overflow: auto; min-height: 0; padding: 12px 14px 40px;
   display: flex; flex-direction: column; gap: 8px;
 }
@@ -354,18 +439,54 @@ main.rewriting.flat > #rewriter { grid-column: 1; }
 #c-url { flex: 1; min-width: 0; }
 #composer select, #composer input, #composer textarea,
 #breaker select, #breaker input, #breaker textarea,
-#rewriter select, #rewriter input, #rewriter textarea {
+#rewriter select, #rewriter input, #rewriter textarea,
+#httprewriter select, #httprewriter input, #httprewriter textarea {
   background: var(--bg); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 5px 9px; font: inherit;
 }
 #composer select:focus, #composer input:focus, #composer textarea:focus,
 #breaker select:focus, #breaker input:focus, #breaker textarea:focus,
-#rewriter select:focus, #rewriter input:focus, #rewriter textarea:focus {
+#rewriter select:focus, #rewriter input:focus, #rewriter textarea:focus,
+#httprewriter select:focus, #httprewriter input:focus, #httprewriter textarea:focus {
   outline: 1px solid var(--accent); border-color: var(--accent);
 }
-#composer textarea { min-height: 92px; resize: vertical; }
-#b-hosts, #b-path, #w-hosts, #w-path, #w-regex, #w-replace { flex: 1; min-width: 8rem; }
+/* Archive stats: canned report tables from GET /api/archive/stats. */
+.a-section { margin-bottom: 14px; }
+.a-section h2 {
+  margin: 0 0 6px; color: var(--dim); font-size: 11px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.a-table {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.a-table th, .a-table td {
+  text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--rule);
+  vertical-align: top; word-break: break-all;
+}
+.a-table th {
+  color: var(--dim); font-size: 11px; font-weight: 600;
+  letter-spacing: .04em; text-transform: uppercase; white-space: nowrap;
+}
+.a-table tr:hover td { background: var(--hover); }
+.a-totals {
+  display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0 0 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+}
+.a-totals .a-metric { display: flex; flex-direction: column; gap: 2px; min-width: 5.5rem; }
+.a-totals .a-label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.a-totals .a-value { color: var(--ink); }
+#composer textarea, #httprewriter textarea { min-height: 92px; resize: vertical; }
+#httprewriter #hr-path-repl, #httprewriter #hr-query-repl { min-height: 56px; }
+#b-hosts, #b-path, #b-methods, #w-hosts, #w-path, #w-regex, #w-replace,
+#hr-hosts, #hr-methods, #hr-path, #hr-body-file,
+#hr-req-body-find, #hr-req-body-replace, #hr-res-body-find, #hr-res-body-replace {
+  flex: 1; min-width: 8rem;
+}
 #b-timeout { width: 7.5rem; }
+#hr-mock-status { width: 5.5rem; }
+#hr-req-body-max, #hr-res-body-max { width: 7rem; }
+#b-kind, #b-http-half { min-width: 7rem; }
 .b-check { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); white-space: nowrap; }
 .c-label {
   color: var(--dim); font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
@@ -390,13 +511,28 @@ main.rewriting.flat > #rewriter { grid-column: 1; }
   font: inherit; cursor: pointer; text-decoration: underline;
 }
 .pause .p-flow:hover { color: var(--ink); }
-.pause .p-payload {
+.pause .p-payload, .pause .p-headers {
   width: 100%; min-height: 56px; resize: vertical;
   background: var(--bg); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 5px 9px; font: inherit;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.pause .p-payload:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.pause .p-headers { min-height: 48px; }
+.pause .p-payload:focus, .pause .p-headers:focus {
+  outline: 1px solid var(--accent); border-color: var(--accent);
+}
+.pause .p-line {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.pause .p-field {
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px; font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.pause .p-field:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.pause .p-method { width: 6.5rem; }
+.pause .p-url { flex: 1; min-width: 10rem; }
+.pause .p-code { width: 5rem; }
 .pause .p-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .pause .p-status { margin: 0; color: var(--dim); font-size: 12px; }
 .rule {
@@ -430,6 +566,14 @@ main.rewriting.flat > #rewriter { grid-column: 1; }
 .pin {
   flex: none; display: inline-block; padding: 0 4px; border-radius: 3px;
   background: var(--warn); color: var(--pin-ink); font-size: 10px; font-weight: 700;
+}
+/* Status column holds the code and, when map-local, a short mock badge. */
+.row .st { display: flex; gap: 4px; align-items: baseline; min-width: 0; }
+.row .st .status { min-width: 0; }
+.mock {
+  flex: none; display: inline-block; padding: 0 3px; border-radius: 3px;
+  background: var(--info); color: var(--mock-ink); font-size: 9px; font-weight: 700;
+  letter-spacing: .03em; text-transform: lowercase;
 }
 .size, .dur { color: var(--dim); text-align: right; }
 .s2 .status { color: var(--good); }
@@ -580,6 +724,14 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 .icon.on { border-color: var(--accent); color: var(--accent); }
 /* Not the same thing as an open menu: this one says the menu was used. */
 .icon.set { border-color: var(--accent); color: var(--accent); }
+/* Subtle active structured-filter count on the live sift control. */
+#sift-live[data-count] { position: relative; }
+#sift-live[data-count]::after {
+  content: attr(data-count);
+  position: absolute; top: -4px; right: -5px; min-width: 12px; height: 12px;
+  padding: 0 3px; border-radius: 6px; background: var(--accent); color: var(--card);
+  font-size: 9px; font-weight: 700; line-height: 12px; text-align: center;
+}
 /* The menu hangs off the pair of buttons, so they are what it is measured
    from. No shadow: nothing else on this page is raised, and a border against
    the card colour is enough to read as in front. */
@@ -649,6 +801,17 @@ pre.body, pre.copy {
 }
 .etitle { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .error p { margin: 8px 0 0; color: var(--err-ink); }
+/* Map-local mock: not an error, but must not be buried under rewrite notes. */
+.mock-banner {
+  margin: 0 0 14px; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--mock-line); background: var(--mock-bg);
+}
+.mtitle {
+  color: var(--mock-title);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; font-weight: 600;
+}
+.mock-banner p { margin: 6px 0 0; color: var(--dim); }
 /* The switch over the bottom pane. Request and response are the same shape and
    are usually read against each other, so both fitting on one screen is worth
    a mode of its own rather than a second click every time. */
@@ -710,7 +873,8 @@ pre.body, pre.copy {
   main > #tree { display: none; }
   main > #list, main > #detail,
   main.composing > #composer, main.breaking > #breaker,
-  main.rewriting > #rewriter { grid-column: 1; }
+  main.rewriting > #rewriter, main.httprewriting > #httprewriter,
+  main.archiving > #archiver { grid-column: 1; }
   .head, .row { grid-template-columns: 3.6rem minmax(4rem, 8rem) minmax(0, 1fr) 3.4rem 4.2rem; }
   .head span:last-child, .row .dur { display: none; }
   /* Two columns of headers at this width are two columns of ellipsis. */
@@ -768,7 +932,14 @@ const SCRIPT: &str = r#"
   // What the menus on the two bars are set to. Read back from storage further
   // down, once the functions that act on them exist.
   var liveGroup = 'host';
-  var onlyBad = false;
+  // Structured list filters map to FlowQuery (method/status/kind/onlyErrors/
+  // onlyMocked). Free-text #filter stays as search: client-side as you type,
+  // and on the next server fetch. Live socket rows use the same client predicates.
+  var listMethod = '';
+  var listStatus = '';
+  var listKind = '';
+  var onlyErrors = false;
+  var onlyMocked = false;
   var bookGroup = 'book';
   var selectedId = null;
   var detailToken = 0;
@@ -881,7 +1052,13 @@ const SCRIPT: &str = r#"
     host.appendChild(pin);
     row.appendChild(host);
     row.appendChild(el('span', 'path'));
-    row.appendChild(el('span', 'status'));
+    var st = el('span', 'st');
+    var mock = el('span', 'mock', 'mock');
+    mock.hidden = true;
+    mock.title = 'Map-local mock; origin was not dialed';
+    st.appendChild(mock);
+    st.appendChild(el('span', 'status'));
+    row.appendChild(st);
     row.appendChild(el('span', 'size'));
     row.appendChild(el('span', 'dur'));
     return row;
@@ -892,6 +1069,7 @@ const SCRIPT: &str = r#"
     row.querySelector('.hostname').textContent = str(flow.authority);
     row.querySelector('.pin').hidden = !flow.likelyPinning;
     row.querySelector('.path').textContent = str(flow.path);
+    row.querySelector('.mock').hidden = !flow.mocked;
     row.querySelector('.status').textContent = statusLabel(flow);
     row.querySelector('.size').textContent = size(flow.responseSize);
     row.querySelector('.dur').textContent =
@@ -906,6 +1084,7 @@ const SCRIPT: &str = r#"
     if (flow.streamId != null && flow.streamId !== undefined) {
       tips.push('stream ' + String(flow.streamId));
     }
+    if (flow.mocked) { tips.push('mocked (map local)'); }
     row.title = tips.join(' · ');
 
     var mark = statusClass(flow);
@@ -917,11 +1096,14 @@ const SCRIPT: &str = r#"
     // with, or a flow that never got one at all.
     bads.set(flow.id, mark === 's4' || mark === 's5' || mark === 'serr');
 
+    // Synthetic "mock" token so typing mock in the filter finds map-local rows
+    // even when the path/host never mention it.
     needles.set(flow.id, [
       str(flow.method), str(flow.authority), str(flow.path),
       statusLabel(flow), str(flow.error), str(flow.client),
       str(flow.httpVersion), str(flow.transport),
-      str(flow.connectionId), str(flow.streamId)
+      str(flow.connectionId), str(flow.streamId),
+      flow.mocked ? 'mock mocked' : ''
     ].join(' ').toLowerCase());
     summaries.set(flow.id, flow);
     settle(flow);
@@ -1000,14 +1182,66 @@ const SCRIPT: &str = r#"
     tally();
   }
 
+  // Status filter: same shapes parse_status_range accepts (2xx, exact code).
+  function statusInFilter(flow) {
+    if (!listStatus) { return true; }
+    var code = typeof flow.status === 'number' ? flow.status : 0;
+    if (!(code >= 100 && code <= 599)) { return false; }
+    var token = listStatus.toLowerCase();
+    if (token.length === 3 && token.charAt(1) === 'x' && token.charAt(2) === 'x') {
+      var band = parseInt(token.charAt(0), 10);
+      if (!isFinite(band)) { return false; }
+      return code >= band * 100 && code <= band * 100 + 99;
+    }
+    var exact = parseInt(token, 10);
+    return isFinite(exact) && code === exact;
+  }
+
+  // FlowQuery-shaped cuts shared by the list and the branch counts. Server
+  // reload applies the same cuts; this keeps live ws rows honest between
+  // fetches.
+  function matchesListFilters(id) {
+    if (onlyErrors && !bads.get(id)) { return false; }
+    var flow = summaries.get(id);
+    if (!flow) { return true; }
+    if (onlyMocked && !flow.mocked) { return false; }
+    if (listMethod && str(flow.method).toUpperCase() !== listMethod) { return false; }
+    if (listKind && str(flow.kind).toLowerCase() !== listKind) { return false; }
+    if (listStatus && !statusInFilter(flow)) { return false; }
+    return true;
+  }
+
+  // GET /api/flows query string from the current structured filters + search.
+  function flowsQueryUrl() {
+    var parts = ['limit=' + MAX_ROWS];
+    var search = filterEl.value.trim();
+    if (search) { parts.push('search=' + encodeURIComponent(search)); }
+    if (listMethod) { parts.push('method=' + encodeURIComponent(listMethod)); }
+    if (listStatus) { parts.push('status=' + encodeURIComponent(listStatus)); }
+    if (listKind) { parts.push('kind=' + encodeURIComponent(listKind)); }
+    if (onlyErrors) { parts.push('onlyErrors=1'); }
+    if (onlyMocked) { parts.push('onlyMocked=1'); }
+    return '/api/flows?' + parts.join('&');
+  }
+
+  function structuredFilterCount() {
+    var n = 0;
+    if (listMethod) { n += 1; }
+    if (listStatus) { n += 1; }
+    if (listKind) { n += 1; }
+    if (onlyErrors) { n += 1; }
+    if (onlyMocked) { n += 1; }
+    return n;
+  }
+
   // The narrowings are one decision: a row survives the typed needle, the
-  // device the chips picked, whatever the menu on the bar is asking for, and
-  // the branch that was clicked, or it is not on screen.
+  // device the chips picked, the structured FlowQuery filters, and the
+  // branch that was clicked, or it is not on screen.
   function filterRow(row, id) {
     var text = needles.get(id) || '';
     var hide = (needle !== '' && text.indexOf(needle) < 0)
       || (device !== '' && homes.get(id) !== device)
-      || (onlyBad && !bads.get(id))
+      || !matchesListFilters(id)
       || !inScope(id);
     if (row.hidden !== hide) {
       row.hidden = hide;
@@ -1078,9 +1312,13 @@ const SCRIPT: &str = r#"
     var total = rows.size;
     emptyEl.hidden = total > 0;
     if (!total) { countEl.textContent = ''; return; }
-    countEl.textContent = visible === total
+    var base = visible === total
       ? total + ' flows'
       : visible + ' of ' + total + ' flows';
+    var n = structuredFilterCount();
+    countEl.textContent = n
+      ? base + ' · ' + n + ' filter' + (n === 1 ? '' : 's')
+      : base;
   }
 
   filterEl.addEventListener('input', function () {
@@ -1291,7 +1529,7 @@ const SCRIPT: &str = r#"
     var text = needles.get(id) || '';
     if (needle !== '' && text.indexOf(needle) < 0) { return 0; }
     if (device !== '' && homes.get(id) !== device) { return 0; }
-    if (onlyBad && !bads.get(id)) { return 0; }
+    if (!matchesListFilters(id)) { return 0; }
     return 1;
   }
 
@@ -1364,11 +1602,13 @@ const SCRIPT: &str = r#"
   function scopeTo(key, fromUser) {
     if (fromUser !== false) {
       // Picking a host/path is going back to live traffic. Composer / breaker /
-      // rewrite hide #list; without leaving them the tree looks broken: scope
-      // changes and nothing appears beside it.
+      // rewrite / archive hide #list; without leaving them the tree looks
+      // broken: scope changes and nothing appears beside it.
       composing(false);
       breaking(false);
       rewriting(false);
+      httpRewriting(false);
+      archiveView(false);
     }
 
     scope = scope === key ? '' : key;
@@ -1510,18 +1750,20 @@ const SCRIPT: &str = r#"
     detailEl.appendChild(el('p', 'hint', text));
   }
 
-  // `showLive` (default true): leave the composer / breakpoints / rewrite
-  // seats so #list and #detail are visible again. Automatic redraws of the
-  // open flow pass false, so a background update does not yank the composer
-  // closed under someone who just opened a saved request.
+  // `showLive` (default true): leave the composer / breakpoints / rewrite /
+  // archive seats so #list and #detail are visible again. Automatic redraws
+  // of the open flow pass false, so a background update does not yank the
+  // composer closed under someone who just opened a saved request.
   async function select(id, showLive) {
     if (showLive !== false) {
       // Live traffic uses #list/#detail. Those are display:none while composer
-      // (or breaker/rewriter) owns the seat; without this a click on a capture
-      // after opening a saved request looks like it does nothing.
+      // (or breaker/rewriter/archiver) owns the seat; without this a click on
+      // a capture after opening a saved request looks like it does nothing.
       composing(false);
       breaking(false);
       rewriting(false);
+      httpRewriting(false);
+      archiveView(false);
     }
 
     // Both views carry the selection, so switching between them keeps it.
@@ -1570,6 +1812,15 @@ const SCRIPT: &str = r#"
     }
     head.appendChild(durl);
     detailEl.appendChild(head);
+
+    // Banner, not only a rewrite note: map-local must be obvious at a glance.
+    if (flow.mocked) {
+      var banner = el('div', 'mock-banner');
+      banner.appendChild(el('div', 'mtitle', 'Mocked response (map local)'));
+      banner.appendChild(el('p', null,
+        'This response was produced by a map-local mock rule; the origin was not dialed.'));
+      detailEl.appendChild(banner);
+    }
 
     sides(flow, request, response);
   }
@@ -1700,6 +1951,7 @@ const SCRIPT: &str = r#"
       ? str(response.status) + ' ' + str(response.statusText)
       : statusLabel({ state: flow.state, kind: flow.kind, error: flow.error })]);
     pairs.push(['Kind', str(flow.kind) + (flow.intercepted ? ', decrypted' : ', not decrypted')]);
+    if (flow.mocked) { pairs.push(['Mocked', 'map local (no origin dial)']); }
     pairs.push(['HTTP', str(request.httpVersion)]);
     // transport is orthogonal to multiplex: omit for TCP (including H2);
     // "quic" only for H3. connectionId/streamId are the shared H2+H3 session
@@ -2484,6 +2736,10 @@ const SCRIPT: &str = r#"
            stateEl.textContent.indexOf('TUN') < 0))) {
         link('live', 'live · ' + stripBits.slice(0, 3).join(' · '));
       }
+      // Archive button only when this run is recording finished flows to disk.
+      // Without --archive (or a build without the feature) there is nothing
+      // for GET /api/archive/stats to answer.
+      setArchiveEnabled(!!st.archiving, st.archiveDropped);
       // The first one is the handshake. A later one means the socket dropped
       // events on the floor and this list has holes in it.
       if (greeted) { reload(); } else { greeted = true; }
@@ -2514,7 +2770,7 @@ const SCRIPT: &str = r#"
     // survived the round trip.
     var reopen = selectedId;
     try {
-      var page = await getJson('/api/flows?limit=' + MAX_ROWS);
+      var page = await getJson(flowsQueryUrl());
       wipe();
       var list = page && Array.isArray(page.flows) ? page.flows : [];
       for (var i = 0; i < list.length; i++) { upsert(list[i], false); }
@@ -2553,11 +2809,13 @@ const SCRIPT: &str = r#"
   }
 
   function pausePayloadText(pause) {
-    var ws = pause && pause.ws ? pause.ws : null;
-    if (!ws) { return ''; }
-    if (typeof ws.text === 'string') { return ws.text; }
-    if (ws.dataBase64) {
-      try { return fromBase64(ws.dataBase64); }
+    var body = null;
+    if (pause && pause.kind === 'http' && pause.http) { body = pause.http; }
+    else if (pause && pause.ws) { body = pause.ws; }
+    if (!body) { return ''; }
+    if (typeof body.text === 'string') { return body.text; }
+    if (body.dataBase64) {
+      try { return fromBase64(body.dataBase64); }
       catch (error) { return ''; }
     }
     return '';
@@ -2565,6 +2823,22 @@ const SCRIPT: &str = r#"
 
   function pauseOpcodeLabel(code) {
     return opcode(code);
+  }
+
+  function pauseIsHttp(pause) {
+    return !!(pause && (pause.kind === 'http' || pause.http));
+  }
+
+  function headerSummary(headers) {
+    var list = Array.isArray(headers) ? headers : [];
+    if (!list.length) { return '0 headers'; }
+    var names = [];
+    for (var i = 0; i < list.length && names.length < 4; i++) {
+      if (Array.isArray(list[i]) && list[i][0]) { names.push(str(list[i][0])); }
+    }
+    var more = list.length > names.length ? ' +' + (list.length - names.length) : '';
+    return list.length + ' header' + (list.length === 1 ? '' : 's') +
+      (names.length ? ' (' + names.join(', ') + more + ')' : '');
   }
 
   function secondsLeft(expiresAt) {
@@ -2603,13 +2877,13 @@ const SCRIPT: &str = r#"
   }
 
   function pauseCard(pause) {
-    var ws = pause.ws || {};
-    var card = el('div', 'pause');
-    card.setAttribute('data-pause-id', pause.pauseId);
+    if (pauseIsHttp(pause)) { return pauseCardHttp(pause); }
+    return pauseCardWs(pause);
+  }
 
+  function pauseCardHead(pause, titleText, metaText) {
     var head = el('div', 'p-head');
-    var title = el('span', 'mono', 'Held WebSocket frame');
-    head.appendChild(title);
+    head.appendChild(el('span', 'mono', titleText));
     var flowBtn = el('button', 'p-flow mono', str(pause.flowId));
     flowBtn.type = 'button';
     flowBtn.title = 'Open this flow';
@@ -2617,14 +2891,47 @@ const SCRIPT: &str = r#"
       if (rows.has(pause.flowId)) { select(pause.flowId); }
     });
     head.appendChild(flowBtn);
-    var dir = ws.direction === 'send' ? 'client to server' : 'server to client';
-    head.appendChild(el('span', 'p-meta mono',
-      dir + ' · ' + pauseOpcodeLabel(ws.opcode) + ' · ' + size(ws.size) +
-      (ws.truncated ? ' · cut short' : '')));
+    if (metaText) { head.appendChild(el('span', 'p-meta mono', metaText)); }
     var clock = el('span', 'p-meta mono', secondsLeft(pause.expiresAt) + 's left');
     clock.setAttribute('data-expires', String(pause.expiresAt || 0));
     head.appendChild(clock);
-    card.appendChild(head);
+    return head;
+  }
+
+  function pauseActions(releaseTitle, editTitle, dropTitle) {
+    var actions = el('div', 'p-actions');
+    var releaseBtn = el('button', 'btn', 'Release');
+    releaseBtn.type = 'button';
+    releaseBtn.title = releaseTitle;
+    var releaseEditBtn = el('button', 'btn', 'Release edited');
+    releaseEditBtn.type = 'button';
+    releaseEditBtn.title = editTitle;
+    var dropBtn = el('button', 'btn', 'Drop');
+    dropBtn.type = 'button';
+    dropBtn.title = dropTitle;
+    var status = el('p', 'p-status');
+    actions.appendChild(releaseBtn);
+    actions.appendChild(releaseEditBtn);
+    actions.appendChild(dropBtn);
+    actions.appendChild(status);
+    return {
+      el: actions,
+      releaseBtn: releaseBtn,
+      releaseEditBtn: releaseEditBtn,
+      dropBtn: dropBtn,
+      status: status
+    };
+  }
+
+  function pauseCardWs(pause) {
+    var ws = pause.ws || {};
+    var card = el('div', 'pause');
+    card.setAttribute('data-pause-id', pause.pauseId);
+
+    var dir = ws.direction === 'send' ? 'client to server' : 'server to client';
+    var meta = dir + ' · ' + pauseOpcodeLabel(ws.opcode) + ' · ' + size(ws.size) +
+      (ws.truncated ? ' · cut short' : '');
+    card.appendChild(pauseCardHead(pause, 'Held WebSocket frame', meta));
 
     var payload = document.createElement('textarea');
     payload.className = 'p-payload';
@@ -2633,34 +2940,116 @@ const SCRIPT: &str = r#"
     payload.value = pausePayloadText(pause);
     card.appendChild(payload);
 
-    var actions = el('div', 'p-actions');
-    var releaseBtn = el('button', 'btn', 'Release');
-    releaseBtn.type = 'button';
-    releaseBtn.title = 'Forward the original frame unchanged';
-    var releaseEditBtn = el('button', 'btn', 'Release edited');
-    releaseEditBtn.type = 'button';
-    releaseEditBtn.title = 'Forward the payload in the box';
-    var dropBtn = el('button', 'btn', 'Drop');
-    dropBtn.type = 'button';
-    dropBtn.title = 'Do not forward this frame';
-    var status = el('p', 'p-status');
-    actions.appendChild(releaseBtn);
-    actions.appendChild(releaseEditBtn);
-    actions.appendChild(dropBtn);
-    actions.appendChild(status);
-    card.appendChild(actions);
+    var actions = pauseActions(
+      'Forward the original frame unchanged',
+      'Forward the payload in the box',
+      'Do not forward this frame'
+    );
+    card.appendChild(actions.el);
 
-    releaseBtn.addEventListener('click', function () {
-      resolvePause(pause.pauseId, 'release', null, releaseBtn, status);
+    actions.releaseBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'release', null, actions.releaseBtn, actions.status);
     });
-    releaseEditBtn.addEventListener('click', function () {
+    actions.releaseEditBtn.addEventListener('click', function () {
       var body = { opcode: typeof ws.opcode === 'number' ? ws.opcode : 1 };
       if (body.opcode === 2) { body.dataBase64 = toBase64(payload.value); }
       else { body.text = payload.value; }
-      resolvePause(pause.pauseId, 'release', body, releaseEditBtn, status);
+      resolvePause(pause.pauseId, 'release', body, actions.releaseEditBtn, actions.status);
     });
-    dropBtn.addEventListener('click', function () {
-      resolvePause(pause.pauseId, 'drop', null, dropBtn, status);
+    actions.dropBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'drop', null, actions.dropBtn, actions.status);
+    });
+    return card;
+  }
+
+  function pauseCardHttp(pause) {
+    var http = pause.http || {};
+    var half = str(http.half || 'request');
+    var isResponse = half === 'response';
+    var card = el('div', 'pause');
+    card.setAttribute('data-pause-id', pause.pauseId);
+
+    var meta = half + ' · ' + str(http.method || '') + ' · ' + size(http.size) +
+      (typeof http.status === 'number' ? ' · ' + http.status : '') +
+      (http.truncated ? ' · cut short' : '') +
+      ' · ' + headerSummary(http.headers);
+    var title = isResponse ? 'Held HTTP response' : 'Held HTTP request';
+    card.appendChild(pauseCardHead(pause, title, meta));
+    if (http.url) {
+      card.appendChild(el('div', 'p-meta mono', str(http.url)));
+    }
+
+    var line = el('div', 'p-line');
+    var methodIn = document.createElement('input');
+    methodIn.type = 'text';
+    methodIn.className = 'p-field p-method';
+    methodIn.spellcheck = false;
+    methodIn.setAttribute('aria-label', 'Method');
+    methodIn.value = str(http.method || 'GET');
+    line.appendChild(methodIn);
+
+    var urlIn = document.createElement('input');
+    urlIn.type = 'text';
+    urlIn.className = 'p-field p-url';
+    urlIn.spellcheck = false;
+    urlIn.setAttribute('aria-label', 'URL');
+    urlIn.value = str(http.url || '');
+    line.appendChild(urlIn);
+
+    var statusIn = null;
+    if (isResponse) {
+      statusIn = document.createElement('input');
+      statusIn.type = 'number';
+      statusIn.className = 'p-field p-code';
+      statusIn.min = '100';
+      statusIn.max = '599';
+      statusIn.setAttribute('aria-label', 'Status');
+      statusIn.title = 'HTTP status code';
+      statusIn.value = typeof http.status === 'number' ? String(http.status) : '200';
+      line.appendChild(statusIn);
+    }
+    card.appendChild(line);
+
+    var headersArea = document.createElement('textarea');
+    headersArea.className = 'p-headers';
+    headersArea.spellcheck = false;
+    headersArea.setAttribute('aria-label', 'Headers, one per line, as Name: value');
+    headersArea.placeholder = 'Headers, one per line, as Name: value';
+    headersArea.value = headerLines(http.headers);
+    card.appendChild(headersArea);
+
+    var payload = document.createElement('textarea');
+    payload.className = 'p-payload';
+    payload.spellcheck = false;
+    payload.setAttribute('aria-label', 'Body');
+    payload.value = pausePayloadText(pause);
+    card.appendChild(payload);
+
+    var actions = pauseActions(
+      'Forward the original message unchanged',
+      'Forward with the edits in the fields',
+      'Do not forward this message'
+    );
+    card.appendChild(actions.el);
+
+    actions.releaseBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'release', null, actions.releaseBtn, actions.status);
+    });
+    actions.releaseEditBtn.addEventListener('click', function () {
+      var body = {
+        method: methodIn.value.trim() || str(http.method || 'GET'),
+        url: urlIn.value.trim() || str(http.url || ''),
+        headers: readHeaders(headersArea.value),
+        text: payload.value
+      };
+      if (isResponse && statusIn) {
+        var code = parseInt(statusIn.value, 10);
+        if (isFinite(code)) { body.status = code; }
+      }
+      resolvePause(pause.pauseId, 'release', body, actions.releaseEditBtn, actions.status);
+    });
+    actions.dropBtn.addEventListener('click', function () {
+      resolvePause(pause.pauseId, 'drop', null, actions.dropBtn, actions.status);
     });
     return card;
   }
@@ -2714,7 +3103,7 @@ const SCRIPT: &str = r#"
   }
 
   function breaking(on) {
-    if (on) { composing(false); rewriting(false); }
+    if (on) { composing(false); rewriting(false); httpRewriting(false); archiveView(false); }
     mainEl.classList.toggle('breaking', on);
     breakerEl.hidden = !on;
     if (on) { loadRules(); }
@@ -2734,10 +3123,26 @@ const SCRIPT: &str = r#"
     }
   }
 
+  function breakKindIsHttp() {
+    var kindEl = document.getElementById('b-kind');
+    return !!(kindEl && kindEl.value === 'http');
+  }
+
+  function dressBreakKind() {
+    var http = breakKindIsHttp();
+    var halfEl = document.getElementById('b-http-half');
+    var methodsEl = document.getElementById('b-methods');
+    var dirEl = document.getElementById('b-dir');
+    if (halfEl) { halfEl.hidden = !http; }
+    if (methodsEl) { methodsEl.hidden = !http; }
+    if (dirEl) { dirEl.hidden = http; }
+  }
+
   function paintRules() {
     strip(breakListEl);
     if (!breakRules.length) {
-      breakListEl.appendChild(el('p', 'hint', 'No rules. Save one above to start holding frames.'));
+      breakListEl.appendChild(el('p', 'hint',
+        'No rules. Save one above to start holding WebSocket frames or HTTP messages.'));
       dressBreak();
       return;
     }
@@ -2746,21 +3151,31 @@ const SCRIPT: &str = r#"
       var row = el('div', 'rule');
       row.appendChild(el('span', rule.enabled ? 'on' : 'off',
         rule.enabled ? 'enabled' : 'disabled'));
-      row.appendChild(el('span', 'mono', str(rule.kind || 'ws')));
+      var kind = str(rule.kind || 'ws');
+      row.appendChild(el('span', 'mono', kind));
       var hosts = Array.isArray(rule.hosts) && rule.hosts.length
         ? rule.hosts.join(', ')
         : 'any host';
       row.appendChild(el('span', 'mono', hosts));
       var path = rule.pathPrefix ? str(rule.pathPrefix) : 'any path';
       row.appendChild(el('span', 'mono', path));
-      var dirs = Array.isArray(rule.directions) && rule.directions.length
-        ? rule.directions.join(', ')
-        : 'both';
-      row.appendChild(el('span', 'mono', dirs));
-      var ops = Array.isArray(rule.opcodes) && rule.opcodes.length
-        ? rule.opcodes.map(pauseOpcodeLabel).join(', ')
-        : 'text, binary';
-      row.appendChild(el('span', 'mono', ops));
+      if (kind === 'http') {
+        var half = rule.httpHalf ? str(rule.httpHalf) : 'request';
+        row.appendChild(el('span', 'mono', half));
+        var methods = Array.isArray(rule.methods) && rule.methods.length
+          ? rule.methods.join(', ')
+          : 'any method';
+        row.appendChild(el('span', 'mono', methods));
+      } else {
+        var dirs = Array.isArray(rule.directions) && rule.directions.length
+          ? rule.directions.join(', ')
+          : 'both';
+        row.appendChild(el('span', 'mono', dirs));
+        var ops = Array.isArray(rule.opcodes) && rule.opcodes.length
+          ? rule.opcodes.map(pauseOpcodeLabel).join(', ')
+          : 'text, binary';
+        row.appendChild(el('span', 'mono', ops));
+      }
       row.appendChild(el('span', 'mono', str(rule.timeoutMs) + ' ms'));
       breakListEl.appendChild(row);
     }
@@ -2779,12 +3194,19 @@ const SCRIPT: &str = r#"
         document.getElementById('b-path').value = rule.pathPrefix || '';
         document.getElementById('b-timeout').value =
           typeof rule.timeoutMs === 'number' ? rule.timeoutMs : 30000;
+        var kindEl = document.getElementById('b-kind');
+        kindEl.value = rule.kind === 'http' ? 'http' : 'ws';
+        var halfEl = document.getElementById('b-http-half');
+        halfEl.value = rule.httpHalf === 'response' ? 'response' : 'request';
+        document.getElementById('b-methods').value =
+          Array.isArray(rule.methods) ? rule.methods.join(', ') : '';
         var dir = document.getElementById('b-dir');
         if (Array.isArray(rule.directions) && rule.directions.length === 1) {
           dir.value = rule.directions[0];
         } else {
           dir.value = '';
         }
+        dressBreakKind();
       }
       breakStatusEl.textContent = breakRules.length
         ? (breakRules.length + ' rule' + (breakRules.length === 1 ? '' : 's') + ' loaded')
@@ -2808,17 +3230,32 @@ const SCRIPT: &str = r#"
     var timeout = parseInt(document.getElementById('b-timeout').value, 10);
     if (!isFinite(timeout) || timeout < 1000) { timeout = 30000; }
     if (timeout > 300000) { timeout = 300000; }
+    var kind = document.getElementById('b-kind').value === 'http' ? 'http' : 'ws';
     var dir = document.getElementById('b-dir').value;
     var rule = {
-      id: 'ws-1',
+      id: kind === 'http' ? 'http-1' : 'ws-1',
       enabled: document.getElementById('b-enabled').checked,
-      kind: 'ws',
+      kind: kind,
       hosts: hosts,
       pathPrefix: path || null,
-      directions: dir ? [dir] : [],
+      directions: kind === 'ws' && dir ? [dir] : [],
       opcodes: [],
-      timeoutMs: timeout
+      timeoutMs: timeout,
+      methods: [],
+      httpHalf: null
     };
+    if (kind === 'http') {
+      var half = document.getElementById('b-http-half').value;
+      rule.httpHalf = half === 'response' ? 'response' : 'request';
+      var methodsRaw = document.getElementById('b-methods').value;
+      var methods = [];
+      var mparts = methodsRaw.split(',');
+      for (var mi = 0; mi < mparts.length; mi++) {
+        var m = mparts[mi].trim();
+        if (m) { methods.push(m.toUpperCase()); }
+      }
+      rule.methods = methods;
+    }
     breakStatusEl.textContent = 'Saving...';
     try {
       var response = await fetch('/api/breakpoints', {
@@ -2837,9 +3274,16 @@ const SCRIPT: &str = r#"
         return;
       }
       breakRules = parsed && Array.isArray(parsed.rules) ? parsed.rules : [rule];
-      breakStatusEl.textContent = rule.enabled
-        ? 'Saved. Matching WebSocket frames will pause until release, drop, or timeout.'
-        : 'Saved. Rule is disabled; traffic is not held.';
+      if (!rule.enabled) {
+        breakStatusEl.textContent = 'Saved. Rule is disabled; traffic is not held.';
+      } else if (kind === 'http') {
+        breakStatusEl.textContent =
+          'Saved. Matching HTTP ' + str(rule.httpHalf || 'request') +
+          's will pause until release, drop, or timeout.';
+      } else {
+        breakStatusEl.textContent =
+          'Saved. Matching WebSocket frames will pause until release, drop, or timeout.';
+      }
       paintRules();
     } catch (error) {
       breakStatusEl.textContent = 'Could not save: ' + error.message;
@@ -2865,7 +3309,11 @@ const SCRIPT: &str = r#"
       document.getElementById('b-timeout').value = '30000';
       document.getElementById('b-enabled').checked = true;
       document.getElementById('b-dir').value = '';
-      breakStatusEl.textContent = 'All rules cleared. WebSocket traffic is no longer held.';
+      document.getElementById('b-kind').value = 'ws';
+      document.getElementById('b-http-half').value = 'request';
+      document.getElementById('b-methods').value = '';
+      dressBreakKind();
+      breakStatusEl.textContent = 'All rules cleared. Traffic is no longer held.';
       paintRules();
     } catch (error) {
       breakStatusEl.textContent = 'Could not clear: ' + error.message;
@@ -2883,7 +3331,7 @@ const SCRIPT: &str = r#"
   var rewriteRules = [];
 
   function rewriting(on) {
-    if (on) { composing(false); breaking(false); }
+    if (on) { composing(false); breaking(false); httpRewriting(false); archiveView(false); }
     mainEl.classList.toggle('rewriting', on);
     rewriterEl.hidden = !on;
     if (on) { loadRewriteRules(); }
@@ -3056,6 +3504,353 @@ const SCRIPT: &str = r#"
     }
   }
 
+  /* ---------------------------------------------------------------- */
+  /* HTTP rewrite / map-local mock rules                               */
+  /* ---------------------------------------------------------------- */
+
+  var httpRewriteBtn = document.getElementById('httprewrite');
+  var httpRewriterEl = document.getElementById('httprewriter');
+  var httpRewriteStatusEl = document.getElementById('hr-status');
+  var httpRewriteListEl = document.getElementById('hr-list');
+  var httpRewriteRules = [];
+
+  function httpRewriting(on) {
+    if (on) { composing(false); breaking(false); rewriting(false); archiveView(false); }
+    mainEl.classList.toggle('httprewriting', on);
+    httpRewriterEl.hidden = !on;
+    if (on) { loadHttpRewriteRules(); }
+    else { dressHttpRewrite(); }
+  }
+
+  function parseFindReplaceLines(text) {
+    var out = [];
+    var lines = String(text || '').split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      if (!line || !line.trim()) { continue; }
+      var idx = line.indexOf('=>');
+      if (idx < 0) { continue; }
+      out.push({
+        find: line.slice(0, idx),
+        replace: line.slice(idx + 2)
+      });
+    }
+    return out;
+  }
+
+  function formatFindReplaceLines(list) {
+    if (!Array.isArray(list) || !list.length) { return ''; }
+    var lines = [];
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i];
+      if (!item || item.find == null) { continue; }
+      lines.push(str(item.find) + '=>' + str(item.replace != null ? item.replace : ''));
+    }
+    return lines.join('\n');
+  }
+
+  function readBodyRewrite(findId, replaceId, maxId) {
+    var find = document.getElementById(findId).value;
+    var replace = document.getElementById(replaceId).value;
+    var maxRaw = document.getElementById(maxId).value.trim();
+    // Backend BodyRewrite.maxBytes is u64; 0 means the server default (1 MiB).
+    var maxBytes = 0;
+    if (maxRaw !== '') {
+      var n = parseInt(maxRaw, 10);
+      if (isFinite(n) && n > 0) { maxBytes = n; }
+    }
+    var replacements = [];
+    if (find !== '') {
+      replacements.push({ find: find, replace: replace });
+    }
+    if (!replacements.length) { return null; }
+    return { replacements: replacements, maxBytes: maxBytes };
+  }
+
+  function fillBodyRewrite(body, findId, replaceId, maxId) {
+    var findEl = document.getElementById(findId);
+    var replaceEl = document.getElementById(replaceId);
+    var maxEl = document.getElementById(maxId);
+    findEl.value = '';
+    replaceEl.value = '';
+    maxEl.value = '';
+    if (!body) { return; }
+    var list = Array.isArray(body.replacements) ? body.replacements : [];
+    if (list.length && list[0]) {
+      findEl.value = list[0].find != null ? str(list[0].find) : '';
+      replaceEl.value = list[0].replace != null ? str(list[0].replace) : '';
+    }
+    if (typeof body.maxBytes === 'number' && body.maxBytes > 0) {
+      maxEl.value = String(body.maxBytes);
+    }
+  }
+
+  function ruleHasPathBodyRewrites(rule) {
+    if (!rule) { return false; }
+    if (Array.isArray(rule.pathReplacements) && rule.pathReplacements.length) { return true; }
+    if (Array.isArray(rule.queryReplacements) && rule.queryReplacements.length) { return true; }
+    if (rule.requestBody && Array.isArray(rule.requestBody.replacements) &&
+        rule.requestBody.replacements.length) { return true; }
+    if (rule.responseBody && Array.isArray(rule.responseBody.replacements) &&
+        rule.responseBody.replacements.length) { return true; }
+    return false;
+  }
+
+  function dressHttpRewrite() {
+    var armed = httpRewriteRules.some(function (r) {
+      return r && (r.mock || r.to || ruleHasPathBodyRewrites(r) ||
+        (Array.isArray(r.requestHeaders) && r.requestHeaders.length) ||
+        (Array.isArray(r.responseHeaders) && r.responseHeaders.length));
+    });
+    httpRewriteBtn.classList.toggle('on', !httpRewriterEl.hidden || armed);
+    if (armed) {
+      httpRewriteBtn.textContent = 'HTTP rewrite · on';
+    } else {
+      httpRewriteBtn.textContent = 'HTTP rewrite';
+    }
+  }
+
+  function paintHttpRewriteRules() {
+    strip(httpRewriteListEl);
+    if (!httpRewriteRules.length) {
+      httpRewriteListEl.appendChild(el('p', 'hint',
+        'No rules. Save one above to mock or rewrite matching HTTP traffic.'));
+      dressHttpRewrite();
+      return;
+    }
+    for (var i = 0; i < httpRewriteRules.length; i++) {
+      var rule = httpRewriteRules[i];
+      var row = el('div', 'rule');
+      if (rule.mock) {
+        row.appendChild(el('span', 'on', 'mock ' + str(rule.mock.status || 200)));
+      } else if (rule.to) {
+        row.appendChild(el('span', 'on', 'map-host'));
+      } else if (ruleHasPathBodyRewrites(rule)) {
+        row.appendChild(el('span', 'on', 'rewrite'));
+      } else {
+        row.appendChild(el('span', 'on', 'headers'));
+      }
+      var hosts = Array.isArray(rule.hosts) && rule.hosts.length
+        ? rule.hosts.join(', ')
+        : 'any host';
+      row.appendChild(el('span', 'mono', hosts));
+      var methods = Array.isArray(rule.methods) && rule.methods.length
+        ? rule.methods.join(', ')
+        : 'any method';
+      row.appendChild(el('span', 'mono', methods));
+      var path = rule.pathPrefix ? str(rule.pathPrefix) : 'any path';
+      row.appendChild(el('span', 'mono', path));
+      if (rule.mock) {
+        if (rule.mock.bodyFile) {
+          row.appendChild(el('span', 'mono', 'file: ' + str(rule.mock.bodyFile)));
+        } else if (rule.mock.body != null && str(rule.mock.body) !== '') {
+          row.appendChild(el('span', 'mono', 'body: ' + str(rule.mock.body).slice(0, 40)));
+        }
+      }
+      if (Array.isArray(rule.pathReplacements) && rule.pathReplacements.length) {
+        row.appendChild(el('span', 'mono',
+          'path×' + rule.pathReplacements.length));
+      }
+      if (Array.isArray(rule.queryReplacements) && rule.queryReplacements.length) {
+        row.appendChild(el('span', 'mono',
+          'query×' + rule.queryReplacements.length));
+      }
+      if (rule.requestBody && Array.isArray(rule.requestBody.replacements) &&
+          rule.requestBody.replacements.length) {
+        row.appendChild(el('span', 'mono', 'req-body'));
+      }
+      if (rule.responseBody && Array.isArray(rule.responseBody.replacements) &&
+          rule.responseBody.replacements.length) {
+        row.appendChild(el('span', 'mono', 'res-body'));
+      }
+      if (rule.to && rule.to.host) {
+        var target = str(rule.to.host);
+        if (rule.to.port) { target += ':' + str(rule.to.port); }
+        row.appendChild(el('span', 'mono', '-> ' + target));
+      }
+      httpRewriteListEl.appendChild(row);
+    }
+    dressHttpRewrite();
+  }
+
+  function fillHttpRewriteForm(rule) {
+    document.getElementById('hr-hosts').value =
+      Array.isArray(rule.hosts) ? rule.hosts.join(', ') : '';
+    document.getElementById('hr-methods').value =
+      Array.isArray(rule.methods) ? rule.methods.join(', ') : '';
+    document.getElementById('hr-path').value = rule.pathPrefix || '';
+    var mock = rule.mock || {};
+    document.getElementById('hr-mock-status').value =
+      typeof mock.status === 'number' && mock.status > 0 ? mock.status : 200;
+    var headerLines = [];
+    var headers = Array.isArray(mock.headers) ? mock.headers : [];
+    for (var hi = 0; hi < headers.length; hi++) {
+      var pair = headers[hi];
+      if (Array.isArray(pair) && pair.length >= 2) {
+        headerLines.push(str(pair[0]) + ': ' + str(pair[1]));
+      }
+    }
+    document.getElementById('hr-headers').value = headerLines.join('\n');
+    document.getElementById('hr-body').value = mock.body != null ? str(mock.body) : '';
+    document.getElementById('hr-body-file').value = mock.bodyFile || '';
+    document.getElementById('hr-path-repl').value =
+      formatFindReplaceLines(rule.pathReplacements);
+    document.getElementById('hr-query-repl').value =
+      formatFindReplaceLines(rule.queryReplacements);
+    fillBodyRewrite(rule.requestBody, 'hr-req-body-find', 'hr-req-body-replace', 'hr-req-body-max');
+    fillBodyRewrite(rule.responseBody, 'hr-res-body-find', 'hr-res-body-replace', 'hr-res-body-max');
+  }
+
+  async function loadHttpRewriteRules() {
+    try {
+      var page = await getJson('/api/rewrite');
+      httpRewriteRules = page && Array.isArray(page.rules) ? page.rules : [];
+      if (httpRewriteRules.length) {
+        var pick = httpRewriteRules[0];
+        for (var i = 0; i < httpRewriteRules.length; i++) {
+          if (httpRewriteRules[i] && (httpRewriteRules[i].mock ||
+              ruleHasPathBodyRewrites(httpRewriteRules[i]))) {
+            pick = httpRewriteRules[i];
+            break;
+          }
+        }
+        fillHttpRewriteForm(pick);
+      }
+      httpRewriteStatusEl.textContent = httpRewriteRules.length
+        ? (httpRewriteRules.length + ' rule' + (httpRewriteRules.length === 1 ? '' : 's') + ' loaded')
+        : 'No rules yet';
+    } catch (error) {
+      httpRewriteStatusEl.textContent = 'Could not load rules: ' + error.message;
+      httpRewriteRules = [];
+    }
+    paintHttpRewriteRules();
+  }
+
+  async function saveHttpRewriteRules() {
+    var hostsRaw = document.getElementById('hr-hosts').value;
+    var hosts = [];
+    var parts = hostsRaw.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var h = parts[i].trim();
+      if (h) { hosts.push(h); }
+    }
+    var methodsRaw = document.getElementById('hr-methods').value;
+    var methods = [];
+    var mparts = methodsRaw.split(',');
+    for (var mi = 0; mi < mparts.length; mi++) {
+      var m = mparts[mi].trim();
+      if (m) { methods.push(m.toUpperCase()); }
+    }
+    var path = document.getElementById('hr-path').value.trim();
+    var status = parseInt(document.getElementById('hr-mock-status').value, 10);
+    if (!isFinite(status) || status < 100 || status > 599) { status = 200; }
+    var bodyText = document.getElementById('hr-body').value;
+    var bodyFile = document.getElementById('hr-body-file').value.trim();
+    var mockHeaders = readHeaders(document.getElementById('hr-headers').value);
+    var pathReplacements = parseFindReplaceLines(
+      document.getElementById('hr-path-repl').value);
+    var queryReplacements = parseFindReplaceLines(
+      document.getElementById('hr-query-repl').value);
+    var requestBody = readBodyRewrite(
+      'hr-req-body-find', 'hr-req-body-replace', 'hr-req-body-max');
+    var responseBody = readBodyRewrite(
+      'hr-res-body-find', 'hr-res-body-replace', 'hr-res-body-max');
+    var hasMockContent = bodyText !== '' || bodyFile || mockHeaders.length ||
+      status !== 200;
+    var hasRewrites = pathReplacements.length || queryReplacements.length ||
+      requestBody || responseBody;
+    // Keep mock when the form has mock content, or when there is nothing else
+    // (map-local default). Pure path/query/body rewrite rules omit mock so the
+    // origin is still dialled.
+    var mock = null;
+    if (hasMockContent || !hasRewrites) {
+      mock = {
+        status: status,
+        headers: mockHeaders,
+        body: bodyText !== '' ? bodyText : null,
+        bodyFile: bodyFile || null
+      };
+    }
+    var rule = {
+      hosts: hosts,
+      methods: methods,
+      pathPrefix: path || null,
+      requestHeaders: [],
+      responseHeaders: [],
+      to: null,
+      pathReplacements: pathReplacements,
+      queryReplacements: queryReplacements,
+      requestBody: requestBody,
+      responseBody: responseBody,
+      mock: mock
+    };
+    httpRewriteStatusEl.textContent = 'Saving...';
+    try {
+      var response = await fetch('/api/rewrite', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [rule] }),
+        cache: 'no-store'
+      });
+      var raw = await response.text();
+      var parsed = null;
+      try { parsed = JSON.parse(raw); } catch (error) { /* may not be JSON */ }
+      if (!response.ok) {
+        httpRewriteStatusEl.textContent = (parsed && parsed.error)
+          ? String(parsed.error)
+          : ('Save failed (' + response.status + ')');
+        return;
+      }
+      httpRewriteRules = parsed && Array.isArray(parsed.rules) ? parsed.rules : [rule];
+      if (mock) {
+        httpRewriteStatusEl.textContent =
+          'Saved. Matching requests get a mock ' + status + ' without dialling the origin.';
+      } else {
+        httpRewriteStatusEl.textContent =
+          'Saved. Matching requests get path, query and body rewrites on the wire.';
+      }
+      paintHttpRewriteRules();
+    } catch (error) {
+      httpRewriteStatusEl.textContent = 'Could not save: ' + error.message;
+    }
+  }
+
+  async function clearHttpRewriteRules() {
+    httpRewriteStatusEl.textContent = 'Clearing...';
+    try {
+      var response = await fetch('/api/rewrite', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ rules: [] }),
+        cache: 'no-store'
+      });
+      if (!response.ok) {
+        httpRewriteStatusEl.textContent = 'Clear failed (' + response.status + ')';
+        return;
+      }
+      httpRewriteRules = [];
+      document.getElementById('hr-hosts').value = '';
+      document.getElementById('hr-methods').value = '';
+      document.getElementById('hr-path').value = '';
+      document.getElementById('hr-mock-status').value = '200';
+      document.getElementById('hr-headers').value = '';
+      document.getElementById('hr-body').value = '';
+      document.getElementById('hr-body-file').value = '';
+      document.getElementById('hr-path-repl').value = '';
+      document.getElementById('hr-query-repl').value = '';
+      document.getElementById('hr-req-body-find').value = '';
+      document.getElementById('hr-req-body-replace').value = '';
+      document.getElementById('hr-req-body-max').value = '';
+      document.getElementById('hr-res-body-find').value = '';
+      document.getElementById('hr-res-body-replace').value = '';
+      document.getElementById('hr-res-body-max').value = '';
+      httpRewriteStatusEl.textContent = 'All HTTP rewrite rules cleared. Requests go upstream again.';
+      paintHttpRewriteRules();
+    } catch (error) {
+      httpRewriteStatusEl.textContent = 'Could not clear: ' + error.message;
+    }
+  }
+
   function link(kind, text) {
     dotEl.className = 'dot ' + kind;
     stateEl.textContent = text;
@@ -3100,11 +3895,212 @@ const SCRIPT: &str = r#"
   var outEl = document.getElementById('c-out');
 
   function composing(on) {
-    if (on) { breaking(false); rewriting(false); }
+    if (on) { breaking(false); rewriting(false); httpRewriting(false); archiveView(false); }
     mainEl.classList.toggle('composing', on);
     composerEl.hidden = !on;
     composeBtn.classList.toggle('on', on);
     if (on) { document.getElementById('c-url').focus(); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* archive stats (canned report when --archive is on)                */
+  /* ---------------------------------------------------------------- */
+
+  var archiveBtn = document.getElementById('archive');
+  var archiverEl = document.getElementById('archiver');
+  var archiveStatusEl = document.getElementById('a-status');
+  var archiveBodyEl = document.getElementById('a-body');
+  var archiveDroppedEl = document.getElementById('a-dropped');
+  var archiveEnabled = false;
+  var archiveDroppedCount = 0;
+
+  function setArchiveEnabled(on, dropped) {
+    archiveEnabled = !!on;
+    archiveDroppedCount = typeof dropped === 'number' && isFinite(dropped) ? dropped : 0;
+    // Button stays visible either way: when off, opening the panel explains
+    // that this run (or build) is not recording, instead of a silent missing
+    // control.
+    archiveBtn.classList.toggle('on', !archiverEl.hidden && archiveEnabled);
+    if (!archiverEl.hidden) {
+      // Status can flip mid-session (reconnect). Refresh the open panel so the
+      // hint or the live report matches the new flag.
+      if (archiveEnabled) {
+        dressArchiveDropped();
+        loadArchiveStats();
+      } else {
+        strip(archiveBodyEl);
+        archiveStatusEl.textContent =
+          'Archive is not enabled. Start Proxima with --archive (and a build that includes the archive feature) to record finished flows to disk.';
+        dressArchiveDropped();
+      }
+    } else {
+      dressArchiveDropped();
+    }
+  }
+
+  function dressArchiveDropped() {
+    if (!archiveDroppedEl) { return; }
+    if (archiveEnabled && archiveDroppedCount > 0) {
+      archiveDroppedEl.hidden = false;
+      archiveDroppedEl.textContent =
+        archiveDroppedCount + ' flow' + (archiveDroppedCount === 1 ? '' : 's') +
+        ' dropped when the archive writer was full';
+    } else {
+      archiveDroppedEl.hidden = true;
+      archiveDroppedEl.textContent = '';
+    }
+  }
+
+  function archiveView(on) {
+    if (on) { composing(false); breaking(false); rewriting(false); httpRewriting(false); }
+    mainEl.classList.toggle('archiving', on);
+    archiverEl.hidden = !on;
+    archiveBtn.classList.toggle('on', on && archiveEnabled);
+    if (on) {
+      dressArchiveDropped();
+      if (!archiveEnabled) {
+        strip(archiveBodyEl);
+        archiveStatusEl.textContent =
+          'Archive is not enabled. Start Proxima with --archive (and a build that includes the archive feature) to record finished flows to disk.';
+        return;
+      }
+      loadArchiveStats();
+    }
+  }
+
+  function cellText(column, value) {
+    if (value === null || value === undefined) { return ''; }
+    var name = str(column).toLowerCase();
+    if (typeof value === 'number' && isFinite(value)) {
+      if (name.indexOf('byte') >= 0) { return size(value); }
+      if (name === 'p95_ms' || name === 'median_ms' || name.slice(-3) === '_ms') {
+        return millis(value);
+      }
+      if (name === 'flows' || name === 'failures' || name === 'hosts' ||
+          name === 'class' || name.indexOf('count') >= 0) {
+        return String(value);
+      }
+      // Plain counts and other numbers: keep them compact and readable.
+      if (Math.abs(value) >= 1000 && value % 1 === 0) {
+        return String(value);
+      }
+      return String(value);
+    }
+    return str(value);
+  }
+
+  function paintQueryTable(title, result) {
+    var section = el('section', 'a-section block');
+    section.appendChild(el('h2', null, title));
+    if (!result || !Array.isArray(result.columns) || !Array.isArray(result.rows)) {
+      section.appendChild(el('p', 'hint', 'No data in this section.'));
+      return section;
+    }
+    if (!result.rows.length) {
+      section.appendChild(el('p', 'hint', 'No rows yet.'));
+      return section;
+    }
+    var table = el('table', 'a-table');
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    for (var c = 0; c < result.columns.length; c++) {
+      headRow.appendChild(el('th', null, str(result.columns[c])));
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    for (var r = 0; r < result.rows.length; r++) {
+      var row = result.rows[r];
+      var tr = document.createElement('tr');
+      var cells = Array.isArray(row) ? row : [];
+      for (var i = 0; i < result.columns.length; i++) {
+        tr.appendChild(el('td', null, cellText(result.columns[i], cells[i])));
+      }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    section.appendChild(table);
+    if (result.truncated) {
+      section.appendChild(el('p', 'hint', 'Result was truncated at the server limit.'));
+    }
+    return section;
+  }
+
+  function paintTotals(result) {
+    var section = el('section', 'a-section block');
+    section.appendChild(el('h2', null, 'Totals'));
+    if (!result || !Array.isArray(result.columns) || !Array.isArray(result.rows) ||
+        !result.rows.length) {
+      section.appendChild(el('p', 'hint', 'No totals yet. Capture some traffic.'));
+      return section;
+    }
+    var cols = result.columns;
+    var vals = Array.isArray(result.rows[0]) ? result.rows[0] : [];
+    var metrics = el('div', 'a-totals');
+    for (var i = 0; i < cols.length; i++) {
+      var metric = el('div', 'a-metric');
+      metric.appendChild(el('span', 'a-label', str(cols[i]).replace(/_/g, ' ')));
+      metric.appendChild(el('span', 'a-value', cellText(cols[i], vals[i])));
+      metrics.appendChild(metric);
+    }
+    section.appendChild(metrics);
+    return section;
+  }
+
+  function paintArchiveStats(stats) {
+    strip(archiveBodyEl);
+    if (!stats || typeof stats !== 'object') {
+      archiveBodyEl.appendChild(el('p', 'hint', 'The archive answered with nothing useful.'));
+      return;
+    }
+    var totals = stats.totals;
+    var flowCount = 0;
+    if (totals && Array.isArray(totals.rows) && totals.rows.length &&
+        Array.isArray(totals.rows[0])) {
+      flowCount = Number(totals.rows[0][0]) || 0;
+    }
+    if (flowCount === 0 &&
+        (!totals || !Array.isArray(totals.rows) || !totals.rows.length)) {
+      archiveBodyEl.appendChild(el('p', 'hint',
+        'Archive is empty. Capture some traffic while recording is on.'));
+      return;
+    }
+    archiveBodyEl.appendChild(paintTotals(stats.totals));
+    archiveBodyEl.appendChild(paintQueryTable('Busiest hosts', stats.hosts));
+    archiveBodyEl.appendChild(paintQueryTable('Status classes', stats.statuses));
+    archiveBodyEl.appendChild(paintQueryTable('Slowest paths', stats.slowest));
+    archiveBodyEl.appendChild(paintQueryTable('Heaviest responses', stats.heaviest));
+    if (flowCount === 0) {
+      archiveBodyEl.appendChild(el('p', 'hint',
+        'No flows archived yet. Traffic that finishes while --archive is on will appear here.'));
+    }
+  }
+
+  async function loadArchiveStats() {
+    strip(archiveBodyEl);
+    archiveStatusEl.textContent = 'Loading archive stats...';
+    dressArchiveDropped();
+    try {
+      var response = await fetch('/api/archive/stats', { cache: 'no-store' });
+      var text = await response.text();
+      if (!response.ok) {
+        var message = 'the server answered ' + response.status;
+        try {
+          var parsed = JSON.parse(text);
+          if (parsed && parsed.error) { message = str(parsed.error); }
+        } catch (ignore) {
+          if (text) { message = text.slice(0, 400); }
+        }
+        throw new Error(message);
+      }
+      var stats = JSON.parse(text);
+      archiveStatusEl.textContent = '';
+      paintArchiveStats(stats);
+    } catch (error) {
+      archiveStatusEl.textContent = 'Could not load archive stats: ' + error.message;
+      archiveBodyEl.appendChild(el('p', 'hint',
+        'Nothing to show. The archive may be busy, missing, or this build may not record flows.'));
+    }
   }
 
   function readHeaders(text) {
@@ -3212,10 +4208,19 @@ const SCRIPT: &str = r#"
   composeBtn.addEventListener('click', function () { composing(composerEl.hidden); });
   breakBtn.addEventListener('click', function () { breaking(breakerEl.hidden); });
   rewriteBtn.addEventListener('click', function () { rewriting(rewriterEl.hidden); });
+  httpRewriteBtn.addEventListener('click', function () { httpRewriting(httpRewriterEl.hidden); });
+  archiveBtn.addEventListener('click', function () { archiveView(archiverEl.hidden); });
+  document.getElementById('a-refresh').addEventListener('click', function () {
+    if (!archiverEl.hidden) { loadArchiveStats(); }
+  });
   document.getElementById('b-save').addEventListener('click', saveRules);
   document.getElementById('b-clear').addEventListener('click', clearRules);
+  document.getElementById('b-kind').addEventListener('change', dressBreakKind);
+  dressBreakKind();
   document.getElementById('w-save').addEventListener('click', saveRewriteRules);
   document.getElementById('w-clear').addEventListener('click', clearRewriteRules);
+  document.getElementById('hr-save').addEventListener('click', saveHttpRewriteRules);
+  document.getElementById('hr-clear').addEventListener('click', clearHttpRewriteRules);
   document.getElementById('c-send').addEventListener('click', fire);
   document.addEventListener('keydown', function (event) {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !composerEl.hidden) {
@@ -4002,9 +5007,33 @@ const SCRIPT: &str = r#"
     head('Group by');
     pick('Host', liveGroup === 'host', function () { regroupLive('host'); });
     pick('Device, then host', liveGroup === 'device', function () { regroupLive('device'); });
+    head('Method');
+    pick('Any', listMethod === '', function () { setListMethod(''); });
+    pick('GET', listMethod === 'GET', function () { setListMethod('GET'); });
+    pick('POST', listMethod === 'POST', function () { setListMethod('POST'); });
+    pick('PUT', listMethod === 'PUT', function () { setListMethod('PUT'); });
+    pick('PATCH', listMethod === 'PATCH', function () { setListMethod('PATCH'); });
+    pick('DELETE', listMethod === 'DELETE', function () { setListMethod('DELETE'); });
+    pick('HEAD', listMethod === 'HEAD', function () { setListMethod('HEAD'); });
+    pick('OPTIONS', listMethod === 'OPTIONS', function () { setListMethod('OPTIONS'); });
+    head('Status');
+    pick('Any', listStatus === '', function () { setListStatus(''); });
+    pick('2xx', listStatus === '2xx', function () { setListStatus('2xx'); });
+    pick('3xx', listStatus === '3xx', function () { setListStatus('3xx'); });
+    pick('4xx', listStatus === '4xx', function () { setListStatus('4xx'); });
+    pick('5xx', listStatus === '5xx', function () { setListStatus('5xx'); });
+    head('Kind');
+    pick('Any', listKind === '', function () { setListKind(''); });
+    pick('HTTP', listKind === 'http', function () { setListKind('http'); });
+    pick('WebSocket', listKind === 'websocket', function () { setListKind('websocket'); });
+    pick('Tunnel', listKind === 'tunnel', function () { setListKind('tunnel'); });
     head('Show');
-    pick('Everything', !onlyBad, function () { showBad(false); });
-    pick('Failures only', onlyBad, function () { showBad(true); });
+    pick('Everything', !onlyErrors && !onlyMocked, function () {
+      setOnlyErrors(false);
+      setOnlyMocked(false);
+    });
+    pick('Failures only', onlyErrors, function () { setOnlyErrors(true); });
+    pick('Mocks only', onlyMocked, function () { setOnlyMocked(true); });
   });
 
   function regroupLive(how) {
@@ -4014,15 +5043,41 @@ const SCRIPT: &str = r#"
     regroup();
   }
 
-  // The counts on the branches answer the same question the list does, so the
-  // tree is re-added up rather than left describing traffic nothing shows.
-  function showBad(only) {
-    if (onlyBad === only) { return; }
-    onlyBad = only;
+  // Structured cuts re-fetch so the retained window matches the store, then
+  // live socket rows keep the same predicates via matchesListFilters.
+  function setListMethod(method) {
+    if (listMethod === method) { return; }
+    listMethod = method;
     dressSift();
-    rows.forEach(function (row, id) { filterRow(row, id); });
-    restack();
-    tally();
+    reload();
+  }
+
+  function setListStatus(status) {
+    if (listStatus === status) { return; }
+    listStatus = status;
+    dressSift();
+    reload();
+  }
+
+  function setListKind(kind) {
+    if (listKind === kind) { return; }
+    listKind = kind;
+    dressSift();
+    reload();
+  }
+
+  function setOnlyErrors(only) {
+    if (onlyErrors === only) { return; }
+    onlyErrors = only;
+    dressSift();
+    reload();
+  }
+
+  function setOnlyMocked(only) {
+    if (onlyMocked === only) { return; }
+    onlyMocked = only;
+    dressSift();
+    reload();
   }
 
   siftBox('sift-saved', function (head, pick) {
@@ -4045,7 +5100,8 @@ const SCRIPT: &str = r#"
   function rememberSift() {
     try {
       localStorage.setItem('proxima.sift', JSON.stringify({
-        live: liveGroup, bad: onlyBad, saved: bookGroup
+        live: liveGroup, bad: onlyErrors, mock: onlyMocked, saved: bookGroup,
+        method: listMethod, status: listStatus, kind: listKind
       }));
     } catch (error) { /* not fatal */ }
   }
@@ -4058,7 +5114,21 @@ const SCRIPT: &str = r#"
     // Anything not one of ours is left at the default rather than trusted.
     if (held.live === 'device') { liveGroup = 'device'; }
     if (held.saved === 'method' || held.saved === 'host') { bookGroup = held.saved; }
-    onlyBad = held.bad === true;
+    onlyErrors = held.bad === true;
+    onlyMocked = held.mock === true;
+    var methods = {
+      GET: 1, POST: 1, PUT: 1, PATCH: 1, DELETE: 1, HEAD: 1, OPTIONS: 1
+    };
+    if (typeof held.method === 'string' && methods[held.method]) {
+      listMethod = held.method;
+    }
+    if (held.status === '2xx' || held.status === '3xx' ||
+        held.status === '4xx' || held.status === '5xx') {
+      listStatus = held.status;
+    }
+    if (held.kind === 'http' || held.kind === 'websocket' || held.kind === 'tunnel') {
+      listKind = held.kind;
+    }
     dressSift();
   }
 
@@ -4068,8 +5138,16 @@ const SCRIPT: &str = r#"
      so the second needs one of its own or it would close with it. */
 
   function dressSift() {
-    document.getElementById('sift-live').classList
-      .toggle('set', onlyBad || liveGroup !== 'host');
+    var n = structuredFilterCount();
+    var liveBtn = document.getElementById('sift-live');
+    liveBtn.classList.toggle('set', n > 0 || liveGroup !== 'host');
+    var label = n
+      ? ('Grouping and filters, ' + n + ' active')
+      : 'Grouping and filters';
+    liveBtn.title = label;
+    liveBtn.setAttribute('aria-label', label);
+    if (n > 0) { liveBtn.setAttribute('data-count', String(n)); }
+    else { liveBtn.removeAttribute('data-count'); }
     document.getElementById('sift-saved').classList.toggle('set', bookGroup !== 'book');
   }
 
@@ -4247,9 +5325,9 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 19] = [
+    const KNOWN_PATHS: [&str; 21] = [
         "/api/flows",
-        "/api/flows?limit=",
+        "/api/flows?",
         "/api/flows/",
         "/api/stream",
         "/api/send",
@@ -4259,6 +5337,8 @@ mod tests {
         "/api/environments/active",
         "/api/breakpoints",
         "/api/ws-rewrite",
+        "/api/rewrite",
+        "/api/archive/stats",
         "/api/pauses",
         "/api/pauses/",
         "/body/",
@@ -4428,7 +5508,7 @@ mod tests {
             "a branch whose last flow left has to be pruned, not kept empty"
         );
         assert!(
-            SCRIPT.contains("if (rec.key === scope) { scopeTo(scope); }"),
+            SCRIPT.contains("if (rec.key === scope) { scopeTo(scope, false); }"),
             "a pruned branch cannot go on being the thing the list is narrowed to"
         );
     }
@@ -4913,6 +5993,77 @@ mod tests {
         }
     }
 
+    /// List load builds FlowQuery params (method/status/onlyErrors/kind) and
+    /// free-text stays `search`. Live rows re-apply the same predicates.
+    #[test]
+    fn the_list_fetch_sends_structured_flow_query_filters() {
+        let build = SCRIPT
+            .split_once("function flowsQueryUrl() {")
+            .expect("flowsQueryUrl builds GET /api/flows")
+            .1;
+        let body = build
+            .split_once("function structuredFilterCount() {")
+            .expect("structuredFilterCount follows flowsQueryUrl")
+            .0;
+        for fragment in [
+            "parts.push('method=' + encodeURIComponent(listMethod))",
+            "parts.push('status=' + encodeURIComponent(listStatus))",
+            "parts.push('kind=' + encodeURIComponent(listKind))",
+            "parts.push('onlyErrors=1')",
+            "parts.push('onlyMocked=1')",
+            "parts.push('search=' + encodeURIComponent(search))",
+            "'/api/flows?' + parts.join('&')",
+        ] {
+            assert!(
+                body.contains(fragment),
+                "flowsQueryUrl must still assemble {fragment}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("if (onlyMocked && !flow.mocked)"),
+            "live filter must cut on FlowSummary.mocked when Mocks only is set"
+        );
+        assert!(
+            SCRIPT.contains("var page = await getJson(flowsQueryUrl());"),
+            "reload must fetch through flowsQueryUrl, not a bare limit"
+        );
+        // Client-side twin for live ws events between server reloads.
+        assert!(
+            SCRIPT.contains("function matchesListFilters(id) {"),
+            "live rows must honour structured filters without waiting for reload"
+        );
+        let filter = SCRIPT
+            .split_once("function filterRow(row, id) {")
+            .expect("filterRow still exists")
+            .1;
+        assert!(
+            filter.contains("!matchesListFilters(id)"),
+            "filterRow must apply structured FlowQuery cuts"
+        );
+        // Menu maps onto the same state the query builder reads.
+        for control in [
+            "setListMethod('GET')",
+            "setListStatus('2xx')",
+            "setListKind('websocket')",
+            "setOnlyErrors(true)",
+        ] {
+            assert!(
+                SCRIPT.contains(control),
+                "the live sift menu must offer {control}"
+            );
+        }
+        // Active filter count is visible somewhere subtle (count strip + badge).
+        assert!(
+            SCRIPT.contains("structuredFilterCount()"),
+            "active structured filters must be counted for the UI"
+        );
+        assert!(
+            CSS.contains("#sift-live[data-count]::after")
+                || SCRIPT.contains("' filter'"),
+            "active filter count has to surface in the chrome"
+        );
+    }
+
     #[test]
     fn a_kept_host_goes_to_the_top_and_stays_there() {
         // Hosts arrive in the order the device asks for them, so the one being
@@ -5270,6 +6421,7 @@ mod tests {
             transport: None,
             connection_id: None,
             stream_id: None,
+            mocked: false,
         };
         let json = serde_json::to_value(&summary).expect("a summary serialises");
         let object = json.as_object().expect("a summary is an object");
@@ -5293,6 +6445,15 @@ mod tests {
                 "the flow list reads {field}, which FlowSummary no longer sends"
             );
         }
+        // mocked is omit-when-false; the list still reads the key when present.
+        assert!(
+            !object.contains_key("mocked"),
+            "ordinary rows omit mocked so list JSON stays quiet"
+        );
+        let mut mocked = summary.clone();
+        mocked.mocked = true;
+        let mocked_json = serde_json::to_value(&mocked).expect("mocked summary serialises");
+        assert_eq!(mocked_json["mocked"], true);
     }
 
     #[test]
@@ -5751,8 +6912,104 @@ mod tests {
         );
     }
 
+    /// HTTP rewrite / map-local mock: GET|PUT /api/rewrite, one-rule form
+    /// (hosts, methods, path, mock, path/query/body rewrites) and a rules list.
+    #[test]
+    fn the_inspector_surfaces_http_rewrite_mock_rules() {
+        assert!(
+            BODY.contains("id=\"httprewrite\""),
+            "the header must offer an HTTP rewrite control"
+        );
+        assert!(
+            BODY.contains("id=\"httprewriter\""),
+            "HTTP rewrite rules must have a panel of their own"
+        );
+        assert!(
+            BODY.contains("id=\"hr-hosts\"")
+                && BODY.contains("id=\"hr-methods\"")
+                && BODY.contains("id=\"hr-path\"")
+                && BODY.contains("id=\"hr-mock-status\"")
+                && BODY.contains("id=\"hr-headers\"")
+                && BODY.contains("id=\"hr-body\"")
+                && BODY.contains("id=\"hr-body-file\"")
+                && BODY.contains("id=\"hr-path-repl\"")
+                && BODY.contains("id=\"hr-query-repl\"")
+                && BODY.contains("id=\"hr-req-body-find\"")
+                && BODY.contains("id=\"hr-req-body-replace\"")
+                && BODY.contains("id=\"hr-req-body-max\"")
+                && BODY.contains("id=\"hr-res-body-find\"")
+                && BODY.contains("id=\"hr-res-body-replace\"")
+                && BODY.contains("id=\"hr-res-body-max\"")
+                && BODY.contains("id=\"hr-save\"")
+                && BODY.contains("id=\"hr-clear\"")
+                && BODY.contains("id=\"hr-list\""),
+            "the form must expose hosts, methods, path, mock fields, path/query/body rewrites, save, clear and list"
+        );
+        assert!(
+            SCRIPT.contains("async function saveHttpRewriteRules()"),
+            "the rules form must PUT /api/rewrite"
+        );
+        assert!(
+            SCRIPT.contains("getJson('/api/rewrite')"),
+            "the panel must load current rules"
+        );
+        assert!(
+            SCRIPT.contains("fetch('/api/rewrite'"),
+            "save and clear must hit the HTTP rewrite endpoint"
+        );
+        assert!(
+            SCRIPT.contains("function httpRewriting(on)"),
+            "HTTP rewrite must own a seat mode like compose/break/ws-rewrite"
+        );
+        assert!(
+            CSS.contains("main.httprewriting") && CSS.contains("#httprewriter"),
+            "HTTP rewrite panel must share the side-panel seat styles"
+        );
+        for field in [
+            "hosts:",
+            "methods:",
+            "pathPrefix:",
+            "requestHeaders:",
+            "responseHeaders:",
+            "pathReplacements:",
+            "queryReplacements:",
+            "requestBody:",
+            "responseBody:",
+            "mock:",
+            "status:",
+            "headers:",
+            "body:",
+            "bodyFile:",
+            "maxBytes:",
+            "replacements:",
+        ] {
+            assert!(
+                SCRIPT.contains(field),
+                "HTTP rewrite UI must still send {field}"
+            );
+        }
+        assert!(
+            SCRIPT.contains("path×"),
+            "list paint must surface path rewrites when present"
+        );
+        assert!(
+            SCRIPT.contains("req-body") && SCRIPT.contains("res-body"),
+            "list paint must surface request and response body rewrites"
+        );
+        assert!(
+            SCRIPT.contains("ruleHasPathBodyRewrites"),
+            "armed state and list badges must notice path/query/body rewrites"
+        );
+        assert!(
+            BODY.contains("map local") || BODY.contains("without dialling"),
+            "the UI must state that mock answers without dialling the origin"
+        );
+    }
+
     /// Breakpoints and held pauses are first-class UI: rules via PUT, resolve
     /// via POST, and both pause events on the stream strip under the header.
+    /// Kind is selectable (ws / http); HTTP pauses edit method, url, headers,
+    /// body and optional status.
     #[test]
     fn the_inspector_surfaces_ws_breakpoints_and_held_pauses() {
         assert!(
@@ -5766,6 +7023,22 @@ mod tests {
         assert!(
             BODY.contains("id=\"pauses\""),
             "held frames must land in a strip the page can fill"
+        );
+        assert!(
+            BODY.contains("id=\"b-kind\""),
+            "rules form must offer kind ws/http"
+        );
+        assert!(
+            BODY.contains("id=\"b-http-half\""),
+            "rules form must offer HTTP half"
+        );
+        assert!(
+            BODY.contains("id=\"b-methods\""),
+            "rules form must offer HTTP methods"
+        );
+        assert!(
+            BODY.contains("WebSocket frames or HTTP messages"),
+            "breakpoint hint must cover both kinds"
         );
         assert!(
             SCRIPT.contains("event.type === 'pause:hit'"),
@@ -5782,6 +7055,14 @@ mod tests {
         assert!(
             SCRIPT.contains("function resolvePause(pauseId, action, body, button, status)"),
             "release and drop must post through one helper"
+        );
+        assert!(
+            SCRIPT.contains("function pauseCardHttp(pause)"),
+            "HTTP pauses need their own card builder"
+        );
+        assert!(
+            SCRIPT.contains("function pauseCardWs(pause)"),
+            "WS pauses need their own card builder"
         );
         assert!(
             SCRIPT.contains("async function saveRules()"),
@@ -5802,20 +7083,34 @@ mod tests {
         // Field names the form and release body put on the wire.
         for field in [
             "enabled:",
-            "kind: 'ws'",
+            "kind: kind",
             "hosts:",
             "pathPrefix:",
             "directions:",
             "opcodes:",
             "timeoutMs:",
+            "httpHalf:",
+            "methods:",
             "dataBase64",
             "opcode:",
+            "method:",
+            "url:",
+            "headers:",
+            "body.status",
         ] {
             assert!(
                 SCRIPT.contains(field),
                 "breakpoint UI must still send {field}"
             );
         }
+        assert!(
+            SCRIPT.contains("? 'http' : 'ws'"),
+            "saveRules must still emit kind ws or http"
+        );
+        assert!(
+            SCRIPT.contains("Held HTTP request") || SCRIPT.contains("Held HTTP response"),
+            "HTTP pause cards must label the half"
+        );
     }
 
     /// Frames tab live replay: form posts history (or one index) through
@@ -6160,6 +7455,57 @@ mod tests {
             SCRIPT.contains("st.tunActive"),
             "status strip must gate the TUN label on tunActive"
         );
+        // Archive stats panel: gated on ServerStatus.archiving, loads the
+        // canned report, seats mutually exclusive with compose/break/rewrite.
+        assert!(
+            SCRIPT.contains("st.archiving"),
+            "status events must read ServerStatus.archiving for the archive button"
+        );
+        assert!(
+            SCRIPT.contains("st.archiveDropped"),
+            "status events must read archiveDropped for the archive drop note"
+        );
+        assert!(
+            SCRIPT.contains("/api/archive/stats"),
+            "archive panel must call GET /api/archive/stats"
+        );
+        assert!(
+            BODY.contains("id=\"archive\"")
+                && BODY.contains("id=\"archiver\"")
+                && BODY.contains("id=\"a-status\"")
+                && BODY.contains("id=\"a-body\"")
+                && BODY.contains("id=\"a-refresh\"")
+                && BODY.contains("id=\"a-dropped\""),
+            "archive panel needs its shell ids: archive, archiver, a-status, a-body, a-refresh, a-dropped"
+        );
+        assert!(
+            SCRIPT.contains("function archiveView(on)"),
+            "archive panel must use a seat toggler like the other full-seat panels"
+        );
+        assert!(
+            SCRIPT.contains("archiveView(false)"),
+            "compose/break/rewrite/select/scope must release the archive seat"
+        );
+        assert!(
+            SCRIPT.contains("mainEl.classList.toggle('archiving', on)"),
+            "archive seat must toggle the archiving class on main"
+        );
+        assert!(
+            CSS.contains("main.archiving > #archiver"),
+            "archive seat CSS must place #archiver like the other full-seat panels"
+        );
+        assert!(
+            SCRIPT.contains("Archive is not enabled"),
+            "when archiving is off the panel must explain rather than call a dead endpoint only"
+        );
+        assert!(
+            SCRIPT.contains("paintArchiveStats")
+                && SCRIPT.contains("Busiest hosts")
+                && SCRIPT.contains("Status classes")
+                && SCRIPT.contains("Slowest paths")
+                && SCRIPT.contains("Heaviest responses"),
+            "archive panel must render totals, hosts, statuses, slowest and heaviest sections"
+        );
         // P11: likelyPinning is a cert-reject signal, not pure pinning proof.
         assert!(
             SCRIPT.contains("not pure pinning proof")
@@ -6171,6 +7517,25 @@ mod tests {
             SCRIPT.contains("pin.title")
                 && SCRIPT.contains("Not pure pinning proof"),
             "PINNED badge tooltip must state cert-reject is not pure pinning proof"
+        );
+
+        // Map-local mock: list badge + filter token + detail banner, not only
+        // rewrite notes. flow.mocked drives every surface.
+        assert!(
+            SCRIPT.contains("row.querySelector('.mock').hidden = !flow.mocked"),
+            "list row must show the mock badge from summary.mocked"
+        );
+        assert!(
+            SCRIPT.contains("flow.mocked ? 'mock mocked' : ''"),
+            "filter haystack must include a synthetic mock token for map-local rows"
+        );
+        assert!(
+            SCRIPT.contains("Mocked response (map local)"),
+            "detail pane must banner map-local mocks, not bury them in rewrites"
+        );
+        assert!(
+            SCRIPT.contains("if (flow.mocked)"),
+            "detail rendering must branch on flow.mocked"
         );
 
         // FlowSummary still serialises the optional keys the list reads.
@@ -6196,6 +7561,7 @@ mod tests {
             transport: None,
             connection_id: Some("tls-session-uuid".into()),
             stream_id: Some(3),
+            mocked: false,
         };
         let json = serde_json::to_value(&summary).expect("summary serialises");
         assert_eq!(json["connectionId"], "tls-session-uuid");
@@ -6208,6 +7574,10 @@ mod tests {
         assert!(
             json.as_object().unwrap().get("upstreamStreamId").is_none(),
             "upstreamStreamId is full-Flow only, not on FlowSummary"
+        );
+        assert!(
+            json.as_object().unwrap().get("mocked").is_none(),
+            "ordinary summary omits mocked when false"
         );
     }
 }

@@ -14,9 +14,9 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use proxima::config::{
-    default_archive_path, default_data_dir, Config, DecryptMode, DecryptRules, DialTarget,
-    HeaderEdit, ListenMode, QuicCliFields, RewriteRule, RewriteRules, TunCliFields, UpstreamHttp2,
-    WgCliFields, DEFAULT_QUIC_PORT, DEFAULT_WG_PORT,
+    default_archive_path, default_data_dir, BodyRewrite, Config, DecryptMode, DecryptRules,
+    DialTarget, HeaderEdit, ListenMode, MockResponse, QuicCliFields, RewriteRule, RewriteRules,
+    TextReplace, TunCliFields, UpstreamHttp2, WgCliFields, DEFAULT_QUIC_PORT, DEFAULT_WG_PORT,
 };
 use proxima::runtime::Servers;
 use proxima::types::ServerStatus;
@@ -91,6 +91,27 @@ struct Cli {
     /// "api.example.com=127.0.0.1:3000"
     #[arg(long, value_name = "host=target")]
     map_host: Vec<String>,
+
+    /// answer matching requests without dialling the origin (repeatable).
+    /// Syntax: host[/path_prefix]=@file | host[/path_prefix]=STATUS:body |
+    /// host[/path_prefix]=body. Examples:
+    /// "api.example.com/api/foo=@./fixture.json",
+    /// "api.example.com=200:{\"ok\":true}",
+    /// "api.example.com=hello". @file defaults to status 200; bare body too.
+    #[arg(long, value_name = "host[/path]=@file|STATUS:body|body")]
+    map_local: Vec<String>,
+
+    /// literal find=>replace on the request path+query for all traffic
+    /// (repeatable). Applies before the flow is recorded. Example:
+    /// --replace-path '/v1/=>/v2/'
+    #[arg(long, value_name = "find=>replace")]
+    replace_path: Vec<String>,
+
+    /// literal find=>replace on the request body for all traffic (repeatable).
+    /// UTF-8 only; bodies over 1 MiB are left alone (default size gate). Example:
+    /// --replace-body 'secret=>redacted'
+    #[arg(long, value_name = "find=>replace")]
+    replace_body: Vec<String>,
 
     /// force HTTP/1.1 upstream
     #[arg(long)]
@@ -340,14 +361,17 @@ fn tun_cli_fields(cli: &Cli) -> TunCliFields {
 
 /// Turns the rewrite flags into rules.
 ///
-/// The header flags apply to every host. That is what they are for: the reason
-/// to reach for one is almost always "put my token on everything I am about to
-/// send". Scoping a rule to a host, a method or a path is expressible in
-/// [`RewriteRule`] and is what the API will offer; the command line stays
-/// unambiguous instead of growing a syntax for it.
+/// The header, path, and body flags apply to every host. That is what they are
+/// for: the reason to reach for one is almost always "put my token on
+/// everything I am about to send" or "swap this path/token everywhere". Scoping
+/// a rule to a host, a method or a path is expressible in [`RewriteRule`] and
+/// is what the API offers; the command line stays unambiguous instead of
+/// growing a syntax for it.
 ///
-/// Order matters and follows the flags: headers first, then the host mappings,
-/// so a later rule overriding an earlier one reads the way the list does.
+/// Order matters and follows the flags: global header/path/body edits first,
+/// then host mappings, then map-local mocks, so a later rule overriding an
+/// earlier one reads the way the list does. Last matching mock wins, same as
+/// the engine.
 fn rewrite_from(cli: &Cli) -> std::result::Result<RewriteRules, String> {
     let mut edits = RewriteRule::default();
     for text in &cli.set_header {
@@ -366,6 +390,22 @@ fn rewrite_from(cli: &Cli) -> std::result::Result<RewriteRules, String> {
             .response_headers
             .push(parse_remove("--remove-response-header", text)?);
     }
+    for text in &cli.replace_path {
+        edits
+            .path_replacements
+            .push(parse_text_replace("--replace-path", text)?);
+    }
+    let mut body_replacements = Vec::new();
+    for text in &cli.replace_body {
+        body_replacements.push(parse_text_replace("--replace-body", text)?);
+    }
+    if !body_replacements.is_empty() {
+        edits.request_body = Some(BodyRewrite {
+            replacements: body_replacements,
+            // Zero means the engine default (1 MiB).
+            max_bytes: 0,
+        });
+    }
 
     let mut rules = Vec::new();
     if !edits.is_noop() {
@@ -374,7 +414,30 @@ fn rewrite_from(cli: &Cli) -> std::result::Result<RewriteRules, String> {
     for text in &cli.map_host {
         rules.push(parse_map_host(text)?);
     }
+    for text in &cli.map_local {
+        rules.push(parse_map_local(text)?);
+    }
     Ok(RewriteRules { rules })
+}
+
+/// `find=>replace`. The separator is `=>` so a find or replace that contains
+/// `=` (JSON, query strings) does not need escaping. Empty `find` is refused.
+fn parse_text_replace(flag: &str, text: &str) -> std::result::Result<TextReplace, String> {
+    let (find, replace) = text.split_once("=>").ok_or_else(|| {
+        format!(
+            "{flag} takes \"find=>replace\", and {text:?} has no => in it. \
+             For example: {flag} '/v1/=>/v2/' or {flag} 'secret=>redacted'."
+        )
+    })?;
+    if find.is_empty() {
+        return Err(format!(
+            "{flag} needs a non-empty find string before =>: {text:?}"
+        ));
+    }
+    Ok(TextReplace {
+        find: find.to_string(),
+        replace: replace.to_string(),
+    })
 }
 
 /// `name: value`, the way the header reads on the wire.
@@ -431,6 +494,98 @@ fn parse_map_host(text: &str) -> std::result::Result<RewriteRule, String> {
         hosts: vec![from.to_string()],
         to: Some(parse_target(to.trim())?),
         ..RewriteRule::default()
+    })
+}
+
+/// `host[/path_prefix]=@file`, `host[/path_prefix]=STATUS:body`, or
+/// `host[/path_prefix]=body`. The left side is a host, optionally followed by
+/// a path that starts with `/`. The right side is a body file (`@path`, status
+/// 200), an explicit status plus body, or a bare body (status 200).
+fn parse_map_local(text: &str) -> std::result::Result<RewriteRule, String> {
+    let (left, right) = text.split_once('=').ok_or_else(|| {
+        format!(
+            "--map-local takes \"host[/path]=@file\", \"host[/path]=STATUS:body\", \
+             or \"host[/path]=body\", and {text:?} has no = in it. \
+             For example: --map-local api.example.com=@./fixture.json \
+             or --map-local api.example.com=200:{{\"ok\":true}}."
+        )
+    })?;
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() {
+        return Err(format!("--map-local was given no host to match: {text:?}"));
+    }
+    if right.is_empty() {
+        return Err(format!(
+            "--map-local was given nothing to answer with: {text:?}. \
+             Use @path for a body file, STATUS:body for an inline response, \
+             or a bare body (status 200)."
+        ));
+    }
+
+    let (host, path_prefix) = match left.find('/') {
+        Some(i) => {
+            let host = left[..i].trim();
+            if host.is_empty() {
+                return Err(format!(
+                    "--map-local needs a host before the path: {text:?}. \
+                     For example: --map-local api.example.com/api/foo=@./fixture.json."
+                ));
+            }
+            (host, Some(left[i..].to_string()))
+        }
+        None => (left, None),
+    };
+
+    Ok(RewriteRule {
+        hosts: vec![host.to_string()],
+        path_prefix,
+        mock: Some(parse_map_local_response(right)?),
+        ..RewriteRule::default()
+    })
+}
+
+fn parse_map_local_response(right: &str) -> std::result::Result<MockResponse, String> {
+    if let Some(path) = right.strip_prefix('@') {
+        if path.is_empty() {
+            return Err(
+                "--map-local was given @ with no file path. \
+                 For example: --map-local api.example.com=@./fixture.json."
+                    .to_string(),
+            );
+        }
+        return Ok(MockResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: None,
+            body_file: Some(path.to_string()),
+        });
+    }
+
+    // STATUS:body only when the part before the first colon is all digits, so a
+    // bare JSON object or a URL is not misread as a status code.
+    if let Some((status_str, body)) = right.split_once(':') {
+        if !status_str.is_empty() && status_str.bytes().all(|b| b.is_ascii_digit()) {
+            let status: u16 = status_str.parse().map_err(|_| {
+                format!(
+                    "--map-local status {status_str:?} is not a valid HTTP status \
+                     (need a number that fits in 0..=65535)."
+                )
+            })?;
+            return Ok(MockResponse {
+                status,
+                headers: Vec::new(),
+                body: Some(body.to_string()),
+                body_file: None,
+            });
+        }
+    }
+
+    Ok(MockResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: Some(right.to_string()),
+        body_file: None,
     })
 }
 
@@ -797,12 +952,27 @@ fn rewrite_summary(config: &Config) -> String {
             };
             parts.push(format!("{host} to {}{port}", target.host));
         }
+        if rule.mock.is_some() {
+            let host = rule.hosts.join(", ");
+            parts.push(format!("mocking {host}"));
+        }
         for edit in rule.request_headers.iter().chain(&rule.response_headers) {
             let verb = match edit {
                 HeaderEdit::Set { .. } => "setting",
                 HeaderEdit::Remove { .. } => "removing",
             };
             parts.push(format!("{verb} {}", edit.name()));
+        }
+        for rep in &rule.path_replacements {
+            parts.push(format!("path '{}' -> '{}'", rep.find, rep.replace));
+        }
+        if let Some(body) = &rule.request_body {
+            for rep in &body.replacements {
+                parts.push(format!(
+                    "request body '{}' -> '{}'",
+                    rep.find, rep.replace
+                ));
+            }
         }
     }
     parts.join(", ")
@@ -1558,6 +1728,121 @@ mod tests {
     }
 
     #[test]
+    fn map_local_file_scopes_host_and_optional_path() {
+        let config = config_of(&[
+            "--map-local",
+            "api.example.com/api/foo=@./fixture.json",
+        ]);
+        let rule = &config.rewrite.rules[0];
+        assert_eq!(rule.hosts, vec!["api.example.com"]);
+        assert_eq!(rule.path_prefix.as_deref(), Some("/api/foo"));
+        assert_eq!(
+            rule.mock,
+            Some(MockResponse {
+                status: 200,
+                headers: vec![],
+                body: None,
+                body_file: Some("./fixture.json".into()),
+            })
+        );
+
+        let host_only = config_of(&["--map-local", "api.example.com=@./body.bin"]);
+        assert_eq!(host_only.rewrite.rules[0].hosts, vec!["api.example.com"]);
+        assert_eq!(host_only.rewrite.rules[0].path_prefix, None);
+        assert_eq!(
+            host_only.rewrite.rules[0]
+                .mock
+                .as_ref()
+                .and_then(|m| m.body_file.as_deref()),
+            Some("./body.bin")
+        );
+    }
+
+    #[test]
+    fn map_local_inline_status_and_bare_body() {
+        let with_status = config_of(&["--map-local", r#"api.example.com=200:{"ok":true}"#]);
+        assert_eq!(
+            with_status.rewrite.rules[0].mock,
+            Some(MockResponse {
+                status: 200,
+                headers: vec![],
+                body: Some(r#"{"ok":true}"#.into()),
+                body_file: None,
+            })
+        );
+
+        let not_found = config_of(&["--map-local", "api.example.com/missing=404:gone"]);
+        let rule = &not_found.rewrite.rules[0];
+        assert_eq!(rule.path_prefix.as_deref(), Some("/missing"));
+        assert_eq!(
+            rule.mock,
+            Some(MockResponse {
+                status: 404,
+                headers: vec![],
+                body: Some("gone".into()),
+                body_file: None,
+            })
+        );
+
+        // Bare body (no STATUS:) is status 200; a colon inside JSON is not a status.
+        let bare = config_of(&["--map-local", r#"api.example.com={"ok":true}"#]);
+        assert_eq!(
+            bare.rewrite.rules[0].mock,
+            Some(MockResponse {
+                status: 200,
+                headers: vec![],
+                body: Some(r#"{"ok":true}"#.into()),
+                body_file: None,
+            })
+        );
+    }
+
+    #[test]
+    fn map_local_appends_after_map_host_and_shows_in_summary() {
+        let config = config_of(&[
+            "--map-host",
+            "other.example.com=127.0.0.1:3000",
+            "--map-local",
+            "api.example.com=200:{}",
+        ]);
+        assert_eq!(config.rewrite.rules.len(), 2);
+        assert!(config.rewrite.rules[0].to.is_some());
+        assert!(config.rewrite.rules[1].mock.is_some());
+
+        let text = banner(&status(&["192.168.1.24"]), Path::new("/tmp/ca.crt"), &config);
+        assert!(
+            text.contains("mocking api.example.com"),
+            "banner should name the mocked host: {text}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_map_local_flag_says_what_it_wanted() {
+        let err = config_from(&cli(&["--map-local", "api.example.com"]))
+            .expect_err("a mock with no response is not a mock");
+        assert!(
+            err.contains("--map-local") && err.contains("host[/path]"),
+            "{err}"
+        );
+
+        let err = config_from(&cli(&["--map-local", "api.example.com="]))
+            .expect_err("empty right side");
+        assert!(err.contains("nothing to answer with"), "{err}");
+
+        let err = config_from(&cli(&["--map-local", "=@./fixture.json"]))
+            .expect_err("no host");
+        assert!(err.contains("no host"), "{err}");
+
+        let err = config_from(&cli(&["--map-local", "/api/foo=@./fixture.json"]))
+            .expect_err("path without host");
+        assert!(err.contains("host before the path"), "{err}");
+
+        let err = config_from(&cli(&["--map-local", "api.example.com=@"]))
+            .expect_err("@ with no path");
+        assert!(err.contains("@ with no file path"), "{err}");
+    }
+
+    #[test]
     fn an_ipv6_target_is_read_by_its_brackets() {
         let bracketed = config_of(&["--map-host", "api.example.com=[::1]:3000"]);
         assert_eq!(
@@ -1596,6 +1881,81 @@ mod tests {
         let err = config_from(&cli(&["--map-host", "api.example.com=127.0.0.1:notaport"]))
             .expect_err("that is not a port");
         assert!(err.contains("not a port"), "{err}");
+
+        let err = config_from(&cli(&["--replace-path", "/v1//v2/"]))
+            .expect_err("path replace needs =>");
+        assert!(
+            err.contains("--replace-path") && err.contains("find=>replace"),
+            "{err}"
+        );
+
+        let err = config_from(&cli(&["--replace-body", "=>redacted"]))
+            .expect_err("empty find");
+        assert!(err.contains("non-empty find"), "{err}");
+    }
+
+    #[test]
+    fn replace_path_and_body_seed_a_global_rule() {
+        let config = config_of(&[
+            "--replace-path",
+            "/v1/=>/v2/",
+            "--replace-path",
+            "old=>new",
+            "--replace-body",
+            "secret=>redacted",
+            "--replace-body",
+            r#""ok":true=>"ok":false"#,
+        ]);
+        assert_eq!(config.rewrite.rules.len(), 1);
+        let rule = &config.rewrite.rules[0];
+        assert!(
+            rule.hosts.is_empty() && rule.methods.is_empty() && rule.path_prefix.is_none(),
+            "CLI path/body replaces apply to everything"
+        );
+        assert_eq!(
+            rule.path_replacements,
+            vec![
+                TextReplace {
+                    find: "/v1/".into(),
+                    replace: "/v2/".into(),
+                },
+                TextReplace {
+                    find: "old".into(),
+                    replace: "new".into(),
+                },
+            ]
+        );
+        let body = rule
+            .request_body
+            .as_ref()
+            .expect("request body rewrite must be set");
+        assert_eq!(body.max_bytes, 0, "zero means the engine default size gate");
+        assert_eq!(
+            body.replacements,
+            vec![
+                TextReplace {
+                    find: "secret".into(),
+                    replace: "redacted".into(),
+                },
+                TextReplace {
+                    find: r#""ok":true"#.into(),
+                    replace: r#""ok":false"#.into(),
+                },
+            ]
+        );
+
+        let text = banner(&status(&["192.168.1.24"]), Path::new("/tmp/ca.crt"), &config);
+        assert!(text.contains("path '/v1/'"), "{text}");
+        assert!(text.contains("request body 'secret'"), "{text}");
+    }
+
+    #[test]
+    fn replace_body_allows_equals_inside_find_or_replace() {
+        // `=>` is the separator so JSON with `=` is not split wrongly.
+        let rule = header_rule(&["--replace-body", "a=b=>c=d"]);
+        let body = rule.request_body.as_ref().expect("body");
+        assert_eq!(body.replacements[0].find, "a=b");
+        assert_eq!(body.replacements[0].replace, "c=d");
     }
 
     #[test]

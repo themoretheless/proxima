@@ -69,6 +69,144 @@ from a real one, so each flow also carries a note per change under `rewrites`,
 and the startup banner lists every rule in force. A debugging tool that quietly
 alters the thing being debugged is worse than one that cannot alter it at all.
 
+### Map local / mock
+
+A matching request can be answered from a configured response **without dialling
+the origin**. That is map-local: a fixture while the real API is down, or a
+forced status the client must handle. Request header rewrites still run first,
+so an injected token still shows on the captured request half; then the mock
+wins and nothing is sent upstream.
+
+Rules are ordered. The **last matching rule that sets `mock` wins**, same
+stacking as `to` / `--map-host`. The capture is marked `mocked: true` (omitted
+when false) and gets a note under `rewrites`, for example
+`mocked response 200 (map local)` or the same line with `from file <path>` when
+the body came from disk. A faked answer is never left looking like a real
+origin response.
+
+Mocks run on the **TCP proxy path** that Wi-Fi system-proxy clients hit
+(`--port`, default 9090). They are not related to the optional QUIC reverse
+HTTP/3 listener. WebSocket upgrades are not mocked; only ordinary HTTP
+request/response flows take this path.
+
+#### `GET|PUT /api/rewrite`
+
+Live HTTP rewrite rules, including map-host, map-local, and path/body text
+replace. Body is camelCase `{ "rules": [ ... ] }`. PUT replaces the whole list
+(including anything the process started with from `--set-header` / `--map-host`
+/ `--replace-path` / `--replace-body`); GET returns what is in force. Empty
+condition fields match everything. Each rule may carry header edits, path and
+query find/replace, request/response body find/replace, `to` (dial elsewhere),
+and/or `mock`. PUT does not strip unknown-to-UI fields: whatever
+`RewriteRule` accepts round-trips.
+
+`mock` fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `status` | number | HTTP status; defaults to 200 when omitted or zero |
+| `headers` | `[name, value][]` | full response headers (not an overlay on an origin) |
+| `body` | string | UTF-8 literal body |
+| `bodyFile` | string | path absolute, or relative to the process working directory; wins over `body` when the file can be read |
+
+If `bodyFile` is set and unreadable, the proxy falls back to `body` when that
+is present; with neither a readable file nor a body, the mock fails closed.
+
+#### Path, query, and body text replace
+
+Literal find/replace (not regex) on path, query, and bodies, all optional per rule:
+
+| Field | Wire name | Notes |
+| --- | --- | --- |
+| `path_replacements` | `pathReplacements` | full path+query string as sent |
+| `query_replacements` | `queryReplacements` | only the substring after the first `?` |
+| `request_body` | `requestBody` | collected request body; UTF-8 only |
+| `response_body` | `responseBody` | collected response body; UTF-8 only |
+
+Each replacement is `{ "find": "...", "replace": "..." }`. Empty `find` is a
+no-op. Body rewrites buffer the body only when a matching rule has replacements;
+bodies larger than `maxBytes` (default **1 MiB** when omitted or zero) are left
+alone with a note under `rewrites`. Non-UTF-8 bodies are also skipped with a
+note. Content-Length is updated when the length changes.
+
+```bash
+# Path + request body replace (live rules)
+curl -s localhost:9091/api/rewrite -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "hosts": ["api.example.com"],
+    "pathReplacements": [{"find": "/v1/", "replace": "/v2/"}],
+    "requestBody": {
+      "replacements": [{"find": "secret", "replace": "redacted"}],
+      "maxBytes": 1048576
+    }
+  }]
+}'
+```
+
+CLI seed (global, all hosts; repeatable). Separator is `=>` so find/replace may
+contain `=`:
+
+```bash
+--replace-path '/v1/=>/v2/'
+--replace-body 'secret=>redacted'
+```
+
+Scoped or multi-field rules (query-only, response body, host/method match) use
+`GET|PUT /api/rewrite` or the inspector **HTTP rewrite** panel.
+
+```bash
+# Inline JSON body, fixed status and headers
+curl -s localhost:9091/api/rewrite -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "hosts": ["api.example.com"],
+    "methods": ["GET"],
+    "pathPrefix": "/v1/profile",
+    "mock": {
+      "status": 200,
+      "headers": [["content-type", "application/json"]],
+      "body": "{\"id\":1,\"name\":\"fixture\"}"
+    }
+  }]
+}'
+
+# Body from a file on disk (still no origin dial)
+curl -s localhost:9091/api/rewrite -H 'content-type: application/json' -X PUT -d '{
+  "rules": [{
+    "hosts": ["api.example.com"],
+    "pathPrefix": "/static/app.js",
+    "mock": {
+      "status": 200,
+      "headers": [["content-type", "application/javascript"]],
+      "bodyFile": "./fixtures/app.js"
+    }
+  }]
+}'
+
+# What is in force
+curl -s localhost:9091/api/rewrite
+```
+
+#### CLI `--map-local`
+
+Seed map-local mocks at startup (repeatable). Syntax:
+
+```bash
+# Body from a file (status 200)
+--map-local api.example.com/api/foo=@./fixture.json
+
+# Status and inline body
+--map-local api.example.com=200:{"ok":true}
+
+# Bare body (status 200); JSON colons are not treated as a status separator
+--map-local api.example.com={"ok":true}
+```
+
+Left side is host, optional path starting with `/`. Right side is `@file`,
+`STATUS:body`, or bare body. The inspector **HTTP rewrite** panel and
+`GET|PUT /api/rewrite` can change the live list after start. Do not confuse
+mock with `--map-host`: the latter still dials a target and forwards the real
+response; mock never dials.
+
 ## Searching and counting what you captured
 
 The inspector holds the last few thousand flows in memory and forgets them on
@@ -117,6 +255,43 @@ every question with the state of the file at startup.
 `archive` is off by default for the same reason as `gui`: it compiles DuckDB's
 C++ amalgamation, which is minutes of cold build and tens of megabytes of
 binary.
+
+There is **no archive stats panel in the inspector** yet. The JSON from
+`GET /api/archive/stats` (and free-form SQL via `POST /api/archive/query`) is
+the product surface today; open those with curl or any HTTP client while the
+archive feature is on.
+
+## Live list filters
+
+The inspector list is filtered **in the browser** over the live ring of
+summaries (initial load is `GET /api/flows?limit=…`, then the event socket). It
+does not re-call the store with structured `FlowQuery` parameters for every
+keystroke. The REST query surface still exists for scripts:
+`search`, `host`, `method`, `status` (`200`, `200-299`, `2xx`), `kind`,
+`onlyErrors` / `only_errors`, and `onlyMocked` / `only_mocked`.
+
+What the page actually ships:
+
+| Control | Where | What it does |
+| --- | --- | --- |
+| Search box | header | Case-insensitive substring over method, host, path, status label, error text, client address, HTTP version, transport, `connectionId`, and `streamId` |
+| Mock needle | same box | Type `mock` or `mocked` to keep map-local rows (`FlowSummary.mocked`); those tokens are synthetic, not part of the path |
+| Failures only | Requests tree ▽ menu → Show | Keeps 4xx, 5xx, and failed/aborted flows; choice is remembered in `localStorage` |
+| Tree / device | left column | Click a host or path, or a device chip when more than one client is present, to scope the list |
+| Connection | detail pane | Click the connection id to put that id in the search box and show sibling multiplex streams |
+
+What it does **not** ship: a method multi-select, status-class chips (beyond
+typing a code or class fragment in search, and Failures only), a dedicated
+"mocks only" toggle (use the `mock` needle or `?onlyMocked=true` on the API),
+or an archive stats view inside the page.
+
+Map-local rows still show a short **mock** badge in the status column and a
+banner in the detail pane when opened. The **HTTP rewrite** panel edits live
+mock rules; that is separate from list filtering.
+
+The optional native window (`--features gui`) has a single filter field and an
+**Errors only** checkbox; it does not add method/status/mock controls or archive
+stats either.
 
 ## Pointing a phone at it
 
@@ -266,6 +441,10 @@ curl -s localhost:9091/api/pauses/$PAUSE_ID/release -X POST
 curl -s localhost:9091/api/pauses/$PAUSE_ID/release -H 'content-type: application/json' \
   -d '{"text":"edited payload"}' -X POST
 curl -s localhost:9091/api/pauses/$PAUSE_ID/drop -X POST
+
+# HTTP response pauses: release may include status (and method/url/headers/body)
+curl -s localhost:9091/api/pauses/$PAUSE_ID/release -H 'content-type: application/json' \
+  -d '{"status":503,"text":"service unavailable"}' -X POST
 ```
 
 `GET|PUT /api/breakpoints` replaces the whole rule list. Empty `hosts` matches
@@ -273,9 +452,10 @@ any host; empty `directions` matches both; empty `opcodes` defaults to text and
 binary only so keepalive and the close handshake are never stalled by a rule.
 Each rule has a `timeoutMs`: if nobody releases or drops in time, the original
 frame is auto-forwarded. The live event socket emits `pause:hit` and
-`pause:resolved` (kind-tagged body: `ws` now, `http` later). Injected frames
-are never paused. With no enabled rules the proxy keeps its zero-latency
-byte-copy path.
+`pause:resolved` (kind-tagged `ws` / `http` body). For HTTP response half
+pauses, `POST .../release` may include `status` to override the status code
+(omit it to keep the held value). Injected frames are never paused. With no
+enabled rules the proxy keeps its zero-latency byte-copy path.
 
 **WebSocket rewrite and drop:** matching frames can have their full payload
 replaced, or be dropped, before they are written. Rules apply per frame (not

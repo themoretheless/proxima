@@ -3,8 +3,22 @@
 //!
 //! The rules themselves live in [`crate::config`], which is where the decision
 //! of what to change belongs. This module is the part that touches a
-//! [`HeaderMap`], because manipulating headers on the wire is the proxy's job
-//! and pulling `http` types into the configuration to do it would be backwards.
+//! [`HeaderMap`], path/query strings, and request/response bodies, because
+//! manipulating those on the wire is the proxy's job and pulling `http` types
+//! into the configuration to do it would be backwards.
+//!
+//! Surfaces covered here:
+//!
+//! - **Headers** via [`apply`]: set/remove on a [`HeaderMap`].
+//! - **Path** via [`apply_path`]: literal find/replace on the full path-and-query.
+//! - **Query** via [`apply_query`]: literal find/replace on the query only
+//!   (everything after the first `?`).
+//! - **Body** via [`apply_body`]: literal find/replace on a collected body for
+//!   one [`Half`], with a per-rule size gate and a UTF-8 check.
+//!
+//! All text replacements are literal (not regex): every non-overlapping
+//! left-to-right occurrence of `find` becomes `replace`. An empty `find` is a
+//! no-op so we never interpret it as "insert between every character".
 //!
 //! Two things are deliberate about *when* this runs.
 //!
@@ -17,15 +31,15 @@
 //! reason from the other direction. What the inspector shows is what the client
 //! received.
 //!
-//! Both record a note per change on the flow, so a header nobody typed is
-//! traceable to the rule that put it there.
+//! Each change leaves a note on the flow, so a header, path segment, or body
+//! token nobody typed is traceable to the rule that put it there.
 
 use std::sync::Arc;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use parking_lot::Mutex;
 
-use crate::config::{HeaderEdit, RewriteRules, RewriteRulesBody};
+use crate::config::{HeaderEdit, RewriteRules, RewriteRulesBody, TextReplace};
 
 /// Which half of the exchange is being edited. Only used to word the note left
 /// on the flow, but a note that does not say which half is nearly useless.
@@ -114,6 +128,181 @@ fn apply_one(half: Half, edit: &HeaderEdit, headers: &mut HeaderMap) -> Option<S
 }
 
 /* ------------------------------------------------------------------ */
+/* path / query / body text rewrites                                   */
+/* ------------------------------------------------------------------ */
+
+/// Apply path+query replacements to `path` (the path-and-query string as sent).
+///
+/// Matching uses the path value at call time. Every matching rule's
+/// `path_replacements` run in order; later rules see earlier edits. Returns one
+/// note per replacement that actually changed the string.
+pub fn apply_path(
+    rules: &RewriteRules,
+    host: &str,
+    method: &str,
+    path: &mut String,
+) -> Vec<String> {
+    // Indices so matching can borrow `path` without locking it for the later
+    // mutable rewrites (matching ties its lifetime to the path string).
+    let indices = matching_indices(rules, host, method, path.as_str());
+    let mut notes = Vec::new();
+    for i in indices {
+        apply_text_replacements(
+            path,
+            &rules.rules[i].path_replacements,
+            "path",
+            &mut notes,
+        );
+    }
+    notes
+}
+
+/// Apply query-only replacements: when `path` contains `?`, only the substring
+/// after the first `?` is rewritten. The path segment and the `?` itself are
+/// left alone. No query means no work and no notes.
+pub fn apply_query(
+    rules: &RewriteRules,
+    host: &str,
+    method: &str,
+    path: &mut String,
+) -> Vec<String> {
+    let Some(qpos) = path.find('?') else {
+        return Vec::new();
+    };
+    let indices = matching_indices(rules, host, method, path.as_str());
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut query = path[qpos + 1..].to_string();
+    let mut notes = Vec::new();
+    for i in indices {
+        apply_text_replacements(
+            &mut query,
+            &rules.rules[i].query_replacements,
+            "query",
+            &mut notes,
+        );
+    }
+    path.replace_range(qpos + 1.., &query);
+    notes
+}
+
+/// True when any matching rule wants a non-empty body rewrite for `half`.
+///
+/// Used by the forwarder to decide whether to collect a body that would
+/// otherwise stream. Empty rule lists keep the zero-buffer path.
+pub fn needs_body_rewrite(
+    rules: &RewriteRules,
+    half: Half,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> bool {
+    rules.matching(host, method, path).any(|rule| {
+        let br = match half {
+            Half::Request => rule.request_body.as_ref(),
+            Half::Response => rule.response_body.as_ref(),
+        };
+        br.is_some_and(|b| !b.is_noop())
+    })
+}
+
+/// Apply body text replacements for `half`.
+///
+/// The body is treated as UTF-8 text. If the bytes are not valid UTF-8 and at
+/// least one matching rule wants a body rewrite, the body is left unchanged and
+/// a single skip note is returned. If `body.len()` is over a rule's effective
+/// `max_bytes` gate, that rule is skipped with a note and later rules still run.
+pub fn apply_body(
+    rules: &RewriteRules,
+    half: Half,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: &mut Vec<u8>,
+) -> Vec<String> {
+    let indices = matching_indices(rules, host, method, path);
+    let rewrites: Vec<_> = indices
+        .into_iter()
+        .filter_map(|i| {
+            let br = match half {
+                Half::Request => rules.rules[i].request_body.as_ref(),
+                Half::Response => rules.rules[i].response_body.as_ref(),
+            }?;
+            if br.is_noop() {
+                None
+            } else {
+                Some(br)
+            }
+        })
+        .collect();
+    if rewrites.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(mut text) = std::str::from_utf8(body).map(|s| s.to_string()) else {
+        return vec![format!(
+            "{} body rewrite skipped: not valid UTF-8",
+            half.name()
+        )];
+    };
+
+    let body_len = body.len() as u64;
+    let note_prefix = format!("{} body", half.name());
+    let mut notes = Vec::new();
+    for br in rewrites {
+        if body_len > br.effective_max_bytes() {
+            notes.push(format!(
+                "{} body rewrite skipped: over size gate",
+                half.name()
+            ));
+            continue;
+        }
+        apply_text_replacements(&mut text, &br.replacements, &note_prefix, &mut notes);
+    }
+
+    *body = text.into_bytes();
+    notes
+}
+
+/// Indices of rules that match, so callers can re-borrow `rules` after releasing
+/// the path string used for matching.
+fn matching_indices(rules: &RewriteRules, host: &str, method: &str, path: &str) -> Vec<usize> {
+    rules
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.matches(host, method, path))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Literal find/replace: every non-overlapping left-to-right match of `find`
+/// becomes `replace`. Empty `find` is skipped. A note is recorded only when the
+/// text actually changes.
+fn apply_text_replacements(
+    text: &mut String,
+    replacements: &[TextReplace],
+    surface: &str,
+    notes: &mut Vec<String>,
+) {
+    for rep in replacements {
+        if rep.find.is_empty() {
+            continue;
+        }
+        let next = text.replace(&rep.find, &rep.replace);
+        if next != *text {
+            *text = next;
+            notes.push(format!(
+                "{} replaced '{}' → '{}'",
+                surface, rep.find, rep.replace
+            ));
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* live rule hub                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -153,7 +342,7 @@ impl RewriteHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DialTarget, RewriteRule};
+    use crate::config::{BodyRewrite, DialTarget, RewriteRule, TextReplace};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -180,6 +369,13 @@ mod tests {
     fn remove(name: &str) -> HeaderEdit {
         HeaderEdit::Remove {
             name: name.to_string(),
+        }
+    }
+
+    fn text(find: &str, replace: &str) -> TextReplace {
+        TextReplace {
+            find: find.to_string(),
+            replace: replace.to_string(),
         }
     }
 
@@ -400,5 +596,203 @@ mod tests {
             ..RewriteRule::default()
         }])
         .is_empty());
+    }
+
+    #[test]
+    fn path_replacements_rewrite_the_full_path_and_query() {
+        let rules = rules(vec![RewriteRule {
+            path_replacements: vec![text("/v1/", "/v2/"), text("old", "new")],
+            ..RewriteRule::default()
+        }]);
+        let mut path = "/v1/users?token=old".to_string();
+        let notes = apply_path(&rules, "api.example.com", "GET", &mut path);
+        assert_eq!(path, "/v2/users?token=new");
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("path replaced '/v1/' → '/v2/'"));
+        assert!(notes[1].contains("path replaced 'old' → 'new'"));
+    }
+
+    #[test]
+    fn path_empty_find_is_a_noop_and_misses_leave_no_note() {
+        let rules = rules(vec![RewriteRule {
+            path_replacements: vec![text("", "x"), text("missing", "y")],
+            ..RewriteRule::default()
+        }]);
+        let mut path = "/keep".to_string();
+        let notes = apply_path(&rules, "h", "GET", &mut path);
+        assert_eq!(path, "/keep");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn path_replacements_are_non_overlapping_left_to_right() {
+        let rules = rules(vec![RewriteRule {
+            // "aa" in "aaa" matches once at the start, leaving a trailing "a".
+            path_replacements: vec![text("aa", "b")],
+            ..RewriteRule::default()
+        }]);
+        let mut path = "/aaa".to_string();
+        apply_path(&rules, "h", "GET", &mut path);
+        assert_eq!(path, "/ba");
+    }
+
+    #[test]
+    fn query_replacements_touch_only_after_the_question_mark() {
+        let rules = rules(vec![RewriteRule {
+            query_replacements: vec![text("user", "admin"), text("/v1", "/nope")],
+            ..RewriteRule::default()
+        }]);
+        let mut path = "/v1/user?name=user&role=user".to_string();
+        let notes = apply_query(&rules, "api.example.com", "GET", &mut path);
+        assert_eq!(path, "/v1/user?name=admin&role=admin");
+        assert!(
+            !path.contains("/nope"),
+            "path segment must not be rewritten by query rules: {path}"
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("query replaced 'user' → 'admin'"));
+    }
+
+    #[test]
+    fn query_without_question_mark_is_untouched() {
+        let rules = rules(vec![RewriteRule {
+            query_replacements: vec![text("user", "admin")],
+            ..RewriteRule::default()
+        }]);
+        let mut path = "/v1/user".to_string();
+        let notes = apply_query(&rules, "h", "GET", &mut path);
+        assert_eq!(path, "/v1/user");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn request_body_replacements_rewrite_utf8_bytes() {
+        let rules = rules(vec![RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("foo", "bar"), text("x", "y")],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = b"foo and x".to_vec();
+        let notes = apply_body(
+            &rules,
+            Half::Request,
+            "api.example.com",
+            "POST",
+            "/v1",
+            &mut body,
+        );
+        assert_eq!(body, b"bar and y");
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("request body replaced 'foo' → 'bar'"));
+        assert!(notes[1].contains("request body replaced 'x' → 'y'"));
+    }
+
+    #[test]
+    fn response_body_does_not_use_request_body_rules() {
+        let rules = rules(vec![RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("a", "b")],
+                max_bytes: 0,
+            }),
+            response_body: Some(BodyRewrite {
+                replacements: vec![text("c", "d")],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = b"a c".to_vec();
+        let notes = apply_body(&rules, Half::Response, "h", "GET", "/", &mut body);
+        assert_eq!(body, b"a d");
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("response body replaced 'c' → 'd'"));
+    }
+
+    #[test]
+    fn body_over_size_gate_is_skipped_with_a_note() {
+        let rules = rules(vec![RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("secret", "redacted")],
+                max_bytes: 4,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = b"secret-token".to_vec();
+        let notes = apply_body(&rules, Half::Request, "h", "POST", "/", &mut body);
+        assert_eq!(body, b"secret-token", "oversize body must not be rewritten");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("request body rewrite skipped: over size gate"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn body_at_size_gate_is_still_rewritten() {
+        let payload = b"abcd";
+        let rules = rules(vec![RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("ab", "xy")],
+                max_bytes: payload.len() as u64,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = payload.to_vec();
+        let notes = apply_body(&rules, Half::Request, "h", "POST", "/", &mut body);
+        assert_eq!(body, b"xycd");
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn non_utf8_body_is_skipped_with_a_note() {
+        let rules = rules(vec![RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("a", "b")],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = vec![0xff, 0xfe, 0xfd];
+        let notes = apply_body(&rules, Half::Request, "h", "POST", "/", &mut body);
+        assert_eq!(body, vec![0xff, 0xfe, 0xfd]);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("request body rewrite skipped: not valid UTF-8"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn body_rules_respect_match_conditions() {
+        let rules = rules(vec![RewriteRule {
+            hosts: vec!["api.example.com".into()],
+            request_body: Some(BodyRewrite {
+                replacements: vec![text("a", "b")],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        }]);
+        let mut body = b"a".to_vec();
+        let notes = apply_body(&rules, Half::Request, "other.net", "POST", "/", &mut body);
+        assert_eq!(body, b"a");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn later_path_rules_see_earlier_edits() {
+        let rules = rules(vec![
+            RewriteRule {
+                path_replacements: vec![text("/old", "/mid")],
+                ..RewriteRule::default()
+            },
+            RewriteRule {
+                path_replacements: vec![text("/mid", "/new")],
+                ..RewriteRule::default()
+            },
+        ]);
+        let mut path = "/old/x".to_string();
+        apply_path(&rules, "h", "GET", &mut path);
+        assert_eq!(path, "/new/x");
     }
 }

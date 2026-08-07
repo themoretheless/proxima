@@ -719,8 +719,10 @@ fn status_line(flow: &Flow) -> String {
 fn haystack(flow: &FlowSummary) -> String {
     // Include multiplex session keys so typing a connection/stream id groups
     // sibling H2 TLS or H3 QUIC streams the same way the web inspector does.
+    // "mock" is a synthetic token so filtering mocked map-local rows matches
+    // the web inspector needle.
     format!(
-        "{} {}{} {} {} {} {} {} {}",
+        "{} {}{} {} {} {} {} {} {} {}",
         flow.method,
         flow.authority,
         flow.path,
@@ -732,6 +734,7 @@ fn haystack(flow: &FlowSummary) -> String {
         flow.stream_id
             .map(|id| id.to_string())
             .unwrap_or_default(),
+        if flow.mocked { "mock" } else { "" },
     )
     .to_ascii_lowercase()
 }
@@ -798,6 +801,7 @@ mod tests {
             transport: None,
             connection_id: None,
             stream_id: None,
+            mocked: false,
         }
     }
 

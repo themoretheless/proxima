@@ -648,6 +648,8 @@ struct ReleasePauseBody {
     /// HTTP release overrides (ignored for WS pauses).
     method: Option<String>,
     url: Option<String>,
+    /// HTTP response-half status override (0 / ignored for request half).
+    status: Option<u16>,
     headers: Option<Vec<(String, String)>>,
 }
 
@@ -665,6 +667,7 @@ async fn release_pause(
             data_base64: None,
             method: None,
             url: None,
+            status: None,
             headers: None,
         }
     } else {
@@ -704,6 +707,7 @@ async fn release_pause(
         crate::proxy::breakpoint::PauseDecision::HttpRelease {
             method: request.method.unwrap_or_else(|| http.method.clone()),
             url: request.url.unwrap_or_else(|| http.url.clone()),
+            status: request.status.unwrap_or_else(|| http.status.unwrap_or(0)),
             headers: request
                 .headers
                 .unwrap_or_else(|| http.headers.clone()),
@@ -1287,6 +1291,12 @@ fn parse_flow_query(raw: Option<&str>) -> Result<FlowQuery, ApiError> {
         flag(&params, "onlyErrors")?
     } else {
         flag(&params, "only_errors")?
+    };
+
+    query.only_mocked = if params.iter().any(|(name, _)| name == "onlyMocked") {
+        flag(&params, "onlyMocked")?
+    } else {
+        flag(&params, "only_mocked")?
     };
 
     if let Some(limit) = first(&params, "limit") {
@@ -2325,6 +2335,219 @@ mod tests {
         assert!(cleared.rules.is_empty());
     }
 
+    /// HTTP rewrite / map-local rules round-trip through GET|PUT, including the
+    /// `mock` field the inspector and clients use to seed map-local answers.
+    #[tokio::test]
+    async fn rewrite_round_trip_preserves_mock_field() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let empty: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert!(empty.rules.is_empty());
+
+        let rules = serde_json::json!({
+            "rules": [{
+                "hosts": ["api.example.com"],
+                "pathPrefix": "/v1/",
+                "methods": ["GET"],
+                "mock": {
+                    "status": 418,
+                    "headers": [["x-map-local", "yes"]],
+                    "body": "from map local",
+                    "bodyFile": "/tmp/fixture.bin"
+                }
+            }]
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&rules).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(saved.rules.len(), 1);
+        assert_eq!(saved.rules[0].hosts, vec!["api.example.com"]);
+        assert_eq!(saved.rules[0].path_prefix.as_deref(), Some("/v1/"));
+        assert_eq!(saved.rules[0].methods, vec!["GET"]);
+        let mock = saved.rules[0]
+            .mock
+            .as_ref()
+            .expect("mock field must survive PUT");
+        assert_eq!(mock.status, 418);
+        assert_eq!(mock.body.as_deref(), Some("from map local"));
+        assert_eq!(mock.body_file.as_deref(), Some("/tmp/fixture.bin"));
+        assert_eq!(
+            mock.headers,
+            vec![("x-map-local".into(), "yes".into())]
+        );
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let again: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(again.rules.len(), 1);
+        let mock = again.rules[0]
+            .mock
+            .as_ref()
+            .expect("GET must return the same mock");
+        assert_eq!(mock.status, 418);
+        assert_eq!(mock.body.as_deref(), Some("from map local"));
+        assert_eq!(mock.body_file.as_deref(), Some("/tmp/fixture.bin"));
+
+        // Wire shape: camelCase field names the UI and curl both use.
+        let wire: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            wire["rules"][0]["mock"]["bodyFile"].is_string(),
+            "mock bodyFile must serialize as camelCase: {wire}"
+        );
+
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from_static(br#"{"rules":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cleared: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert!(cleared.rules.is_empty());
+    }
+
+    /// Path, query, and body rewrite fields round-trip through GET|PUT without
+    /// stripping. Wire shape is camelCase (`pathReplacements`, `requestBody`).
+    #[tokio::test]
+    async fn rewrite_round_trip_preserves_path_and_body_fields() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let rules = serde_json::json!({
+            "rules": [{
+                "hosts": ["api.example.com"],
+                "pathPrefix": "/v1/",
+                "pathReplacements": [
+                    {"find": "/v1/", "replace": "/v2/"},
+                    {"find": "old", "replace": "new"}
+                ],
+                "queryReplacements": [
+                    {"find": "draft", "replace": "live"}
+                ],
+                "requestBody": {
+                    "replacements": [
+                        {"find": "secret", "replace": "redacted"}
+                    ],
+                    "maxBytes": 2048
+                },
+                "responseBody": {
+                    "replacements": [
+                        {"find": "error", "replace": "ok"}
+                    ]
+                }
+            }]
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&rules).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let saved: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(saved.rules.len(), 1);
+        let rule = &saved.rules[0];
+        assert_eq!(rule.hosts, vec!["api.example.com"]);
+        assert_eq!(rule.path_prefix.as_deref(), Some("/v1/"));
+        assert_eq!(rule.path_replacements.len(), 2);
+        assert_eq!(rule.path_replacements[0].find, "/v1/");
+        assert_eq!(rule.path_replacements[0].replace, "/v2/");
+        assert_eq!(rule.path_replacements[1].find, "old");
+        assert_eq!(rule.query_replacements.len(), 1);
+        assert_eq!(rule.query_replacements[0].find, "draft");
+        let req_body = rule
+            .request_body
+            .as_ref()
+            .expect("requestBody must survive PUT");
+        assert_eq!(req_body.max_bytes, 2048);
+        assert_eq!(req_body.replacements.len(), 1);
+        assert_eq!(req_body.replacements[0].find, "secret");
+        assert_eq!(req_body.replacements[0].replace, "redacted");
+        let resp_body = rule
+            .response_body
+            .as_ref()
+            .expect("responseBody must survive PUT");
+        assert_eq!(resp_body.replacements[0].find, "error");
+        // Omitted maxBytes deserializes as 0 (engine default).
+        assert_eq!(resp_body.max_bytes, 0);
+
+        let (status, _, body) =
+            request_with_body(address, "GET", "/api/rewrite", &[], Bytes::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        let again: crate::config::RewriteRulesBody =
+            serde_json::from_slice(&body).expect("rules body");
+        assert_eq!(again.rules.len(), 1);
+        assert_eq!(again.rules[0].path_replacements.len(), 2);
+        assert_eq!(
+            again.rules[0]
+                .request_body
+                .as_ref()
+                .map(|b| b.max_bytes),
+            Some(2048)
+        );
+
+        // Wire shape: camelCase field names curl and the UI both use.
+        let wire: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            wire["rules"][0]["pathReplacements"].is_array(),
+            "pathReplacements must serialize as camelCase: {wire}"
+        );
+        assert!(
+            wire["rules"][0]["queryReplacements"].is_array(),
+            "queryReplacements must serialize as camelCase: {wire}"
+        );
+        assert_eq!(wire["rules"][0]["requestBody"]["maxBytes"], 2048);
+        assert!(
+            wire["rules"][0]["requestBody"]["replacements"][0]["find"].is_string(),
+            "{wire}"
+        );
+        assert!(
+            wire["rules"][0]["responseBody"]["replacements"].is_array(),
+            "{wire}"
+        );
+        // Empty lists are omitted on serialize so clients do not see noise.
+        let empty_rule = serde_json::json!({ "rules": [{ "hosts": ["x"] }] });
+        let (status, _, body) = request_with_body(
+            address,
+            "PUT",
+            "/api/rewrite",
+            &[("content-type", "application/json")],
+            Bytes::from(serde_json::to_vec(&empty_rule).expect("json")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let wire: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            wire["rules"][0].get("pathReplacements").is_none(),
+            "empty pathReplacements should be skipped: {wire}"
+        );
+        assert!(
+            wire["rules"][0].get("requestBody").is_none(),
+            "absent requestBody should stay absent: {wire}"
+        );
+    }
+
     /// WS rewrite rules round-trip through GET|PUT; invalid regex is a 400 and
     /// leaves the previous list alone.
     #[tokio::test]
@@ -2565,6 +2788,123 @@ mod tests {
         assert_eq!(pauses.pending_count(), 0);
     }
 
+    #[tokio::test]
+    async fn http_response_release_can_override_status() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let pauses = inner.pauses.clone();
+        let address = serve(inner).await;
+
+        let (pause_id, mut rx) = pauses
+            .hold_http_response(
+                &store,
+                "flow-resp".into(),
+                "GET".into(),
+                "https://example.com/api".into(),
+                200,
+                vec![("content-type".into(), "text/plain".into())],
+                b"ok",
+                false,
+                30_000,
+            )
+            .expect("held");
+
+        // Override status only; body and headers stay as held.
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/release"),
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({ "status": 503 })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resolved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            resolved.get("action").and_then(|v| v.as_str()),
+            Some("release")
+        );
+
+        let (decision, reason) = rx.try_recv().expect("decision delivered");
+        match decision {
+            crate::proxy::breakpoint::PauseDecision::HttpRelease {
+                method,
+                url,
+                status: code,
+                headers,
+                body: payload,
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(url, "https://example.com/api");
+                assert_eq!(code, 503);
+                assert_eq!(
+                    headers,
+                    vec![("content-type".into(), "text/plain".into())]
+                );
+                assert_eq!(payload, b"ok");
+            }
+            other => panic!("expected HttpRelease, got {other:?}"),
+        }
+        assert_eq!(reason, crate::types::PauseResolveReason::User);
+        assert_eq!(pauses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_response_empty_release_keeps_original_status() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let pauses = inner.pauses.clone();
+        let address = serve(inner).await;
+
+        let (pause_id, mut rx) = pauses
+            .hold_http_response(
+                &store,
+                "flow-resp-empty".into(),
+                "GET".into(),
+                "https://example.com/".into(),
+                404,
+                vec![],
+                b"missing",
+                false,
+                30_000,
+            )
+            .expect("held");
+
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            &format!("/api/pauses/{pause_id}/release"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resolved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            resolved.get("action").and_then(|v| v.as_str()),
+            Some("release")
+        );
+
+        let (decision, reason) = rx.try_recv().expect("decision delivered");
+        match decision {
+            crate::proxy::breakpoint::PauseDecision::HttpRelease {
+                status: code,
+                body: payload,
+                ..
+            } => {
+                assert_eq!(code, 404);
+                assert_eq!(payload, b"missing");
+            }
+            other => panic!("expected HttpRelease, got {other:?}"),
+        }
+        assert_eq!(reason, crate::types::PauseResolveReason::User);
+        assert_eq!(pauses.pending_count(), 0);
+    }
+
     #[test]
     fn parse_ws_direction_accepts_send_and_recv_only() {
         assert!(matches!(
@@ -2787,7 +3127,7 @@ mod tests {
     #[test]
     fn query_parsing_end_to_end() {
         let query = parse_flow_query(Some(
-            "search=token&host=API.Example.com&host=b.com&method=get&status=2xx&kind=ws&onlyErrors=1&limit=50&before=900",
+            "search=token&host=API.Example.com&host=b.com&method=get&status=2xx&kind=ws&onlyErrors=1&onlyMocked=1&limit=50&before=900",
         ))
         .unwrap();
 
@@ -2797,8 +3137,14 @@ mod tests {
         assert_eq!(query.status_range, Some((200, 299)));
         assert_eq!(query.kinds.len(), 1);
         assert!(query.only_errors);
+        assert!(query.only_mocked);
         assert_eq!(query.limit, Some(50));
         assert_eq!(query.before, Some(900));
+
+        let snake = parse_flow_query(Some("only_mocked=true")).unwrap();
+        assert!(snake.only_mocked);
+        let off = parse_flow_query(Some("onlyMocked=0")).unwrap();
+        assert!(!off.only_mocked);
     }
 
     #[test]
@@ -2808,6 +3154,32 @@ mod tests {
         assert!(query.hosts.is_empty());
         assert!(query.limit.is_none());
         assert!(!query.only_errors);
+        assert!(!query.only_mocked);
+    }
+
+    #[test]
+    fn query_parsing_accepts_snake_case_only_errors_and_multi_filters() {
+        // UI/REST use camelCase; snake_case is the documented alternate.
+        let query = parse_flow_query(Some(
+            "method=get&method=post&kind=http&kind=ws&only_errors=true&status=5xx",
+        ))
+        .unwrap();
+        assert_eq!(query.methods, vec!["GET", "POST"]);
+        assert_eq!(
+            query.kinds,
+            vec![
+                crate::types::FlowKind::Http,
+                crate::types::FlowKind::Websocket
+            ]
+        );
+        assert!(query.only_errors);
+        assert_eq!(query.status_range, Some((500, 599)));
+
+        let off = parse_flow_query(Some("onlyErrors=0")).unwrap();
+        assert!(!off.only_errors);
+
+        let bare = parse_flow_query(Some("onlyErrors")).unwrap();
+        assert!(bare.only_errors, "valueless onlyErrors is true");
     }
 
     #[test]
@@ -2819,6 +3191,9 @@ mod tests {
         assert!(parse_flow_query(Some("before=tomorrow")).is_err());
         assert!(parse_flow_query(Some("kind=carrier-pigeon")).is_err());
         assert!(parse_flow_query(Some("method=GET%20/etc/passwd")).is_err());
+        assert!(parse_flow_query(Some("onlyErrors=maybe")).is_err());
+        assert!(parse_flow_query(Some("onlyMocked=maybe")).is_err());
+        assert!(parse_flow_query(Some("status=99")).is_err());
 
         let long = "x".repeat(MAX_SEARCH_LEN + 1);
         assert!(parse_flow_query(Some(&format!("search={long}"))).is_err());
@@ -3248,6 +3623,273 @@ mod tests {
         assert!(
             json.get("tunPort").is_none(),
             "TUN is not a UDP listener: {json}"
+        );
+    }
+
+    /// List filters the UI pass relies on: method, kind, onlyErrors, status,
+    /// host, and search. Combinations must AND across dimensions and return
+    /// both the page and the unpaginated total.
+    #[tokio::test]
+    async fn list_flows_applies_method_kind_and_only_errors_filters() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let inner = state(dir.path());
+        let store = inner.store.clone();
+        let address = serve(inner).await;
+
+        let ok_get = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://api.example.com/ok".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "api.example.com".into(),
+                host: "api.example.com".into(),
+                port: 443,
+                path: "/ok".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        store.update(&ok_get, |flow| {
+            flow.response = Some(crate::types::FlowResponse {
+                status: 200,
+                status_text: "OK".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: None,
+            });
+        });
+        store.finish(&ok_get);
+
+        let bad_post = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Http,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "POST".into(),
+                url: "https://api.example.com/fail".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "api.example.com".into(),
+                host: "api.example.com".into(),
+                port: 443,
+                path: "/fail".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 2,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        store.update(&bad_post, |flow| {
+            flow.response = Some(crate::types::FlowResponse {
+                status: 500,
+                status_text: "Error".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: None,
+            });
+        });
+        store.finish(&bad_post);
+
+        let ws = store.create(crate::capture::FlowInit {
+            kind: crate::types::FlowKind::Websocket,
+            intercepted: true,
+            request: crate::types::FlowRequest {
+                method: "GET".into(),
+                url: "https://ws.example.com/socket".into(),
+                scheme: crate::types::Scheme::Https,
+                authority: "ws.example.com".into(),
+                host: "ws.example.com".into(),
+                port: 443,
+                path: "/socket".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            client: crate::types::FlowClient {
+                address: "127.0.0.1".into(),
+                port: 3,
+            },
+            server: crate::types::FlowServer::default(),
+            replay_of: None,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        });
+        store.finish(&ws);
+
+        // method + onlyErrors: the POST 500 is the only hit.
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?method=POST&onlyErrors=1",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 1);
+        let flows = page["flows"].as_array().expect("flows");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0]["id"], bad_post);
+        assert_eq!(flows[0]["method"], "POST");
+        assert_eq!(flows[0]["status"], 500);
+
+        // kind=ws alone.
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?kind=ws",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["flows"][0]["id"], ws);
+        assert_eq!(page["flows"][0]["kind"], "websocket");
+
+        // method=GET + kind=http + status=2xx (excludes the WS GET and the 500).
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?method=GET&kind=http&status=2xx",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["flows"][0]["id"], ok_get);
+
+        // host + search + onlyErrors: nothing matches (POST failure is not /ok).
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?host=api.example.com&search=%2Fok&onlyErrors=true",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["flows"].as_array().expect("flows").len(), 0);
+
+        // Multi-method OR via repeated params.
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?method=GET&method=POST&kind=http",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 2);
+
+        // onlyMocked: mark the 200 GET as map-local and filter to it.
+        store.update(&ok_get, |flow| {
+            flow.mocked = true;
+        });
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?onlyMocked=1&kind=http",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["flows"][0]["id"], ok_get);
+        assert_eq!(page["flows"][0]["mocked"], true);
+
+        // search=mock finds the same row via the synthetic needle.
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/flows?search=mock",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["flows"][0]["id"], ok_get);
+    }
+
+    /// Archive stats is always routed. Without `--archive` (and without the
+    /// feature-built DuckDB store) the handler refuses with 503 rather than
+    /// inventing empty totals. Full stats content lives behind
+    /// `cfg(feature = "archive")` in capture/archive.rs.
+    #[tokio::test]
+    async fn archive_stats_unavailable_when_no_archive_is_configured() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let address = serve(state(dir.path())).await;
+
+        let (status, _, body) = request_with_body(
+            address,
+            "GET",
+            "/api/archive/stats",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let text = json["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            text.contains("archive"),
+            "503 body should explain the archive is off: {text}"
+        );
+
+        let (status, _, body) = request_with_body(
+            address,
+            "POST",
+            "/api/archive/query",
+            &[("content-type", "application/json")],
+            Bytes::from(r#"{"sql":"SELECT 1"}"#.as_bytes().to_vec()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let text = json["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            text.contains("archive"),
+            "query without archive should also 503: {text}"
         );
     }
 }

@@ -20,17 +20,41 @@ chat logs.
 - **HTTP request breakpoints.** Same PauseHub as WS; `kind: http` +
   `http_half: request`; hold before dial; release with optional method/url/
   headers/body overrides; response-half still open.
+- **HTTP response breakpoints.** Same PauseHub; `http_half: response`; collect
+  after origin (only when a rule matches), hold before client tee; release with
+  status/headers/body overrides; drop fails the flow; 101 upgrades and map-local
+  mocks skip; inspector kind/half form + HTTP pause cards; release API `status`.
 - **`{{var}}` environments.** Active env on the store; `environmentId` on
   `SendSpec`; interpolate URL/headers/UTF-8 body on send/replay; composer env
   select + `GET|PUT /api/environments/active`.
 
+- **Mock / map-local product surface.** Engine + API already lived; product
+  surface now includes inspector **HTTP rewrite** panel (`GET|PUT /api/rewrite`),
+  CLI `--map-local` seed (`host[/path]=@file|STATUS:body|body`), list `mock`
+  badge + detail banner + filter token on `FlowSummary.mocked`, README examples,
+  and e2e/API/config tests (including RewriteHub seed fix in e2e harness).
+- **Inspector list filters (client-side).** Header search (method/host/path/
+  status/error/client/version/transport/`connectionId`/`streamId`, plus
+  synthetic `mock`/`mocked` needles), Requests sift menu **Failures only**,
+  host/path tree and device chips, connection-id click-to-filter. REST
+  `FlowQuery` also has structured `method` / `status` / `onlyErrors` /
+  `onlyMocked` for scripts; the page does not drive those query params live.
+- **The UI pass.** Structured list filters via `flowsQueryUrl` (`method`,
+  `status` 2xx-5xx, `kind`, `onlyErrors`, `onlyMocked`, `search`) with live
+  client re-filter; sift menu + filter count badge; archive stats panel
+  (`#archiver`, `GET /api/archive/stats` when `archiving`); `FlowQuery.only_mocked`.
+- **Body rewrite.** Literal `TextReplace` on path, query, request body, response
+  body with size gates (default 1 MiB); `apply_path` / `apply_query` /
+  `apply_body`; forward collects only when needed; CLI `--replace-path` /
+  `--replace-body` (`find=>replace`); inspector HTTP rewrite panel fields;
+  API round-trip on `/api/rewrite`.
+
 ## Next
 
-1. **HTTP response breakpoints.** Pause after origin response (collect or
-   size-gated), share release API with request half.
-2. **The UI pass.** Filters over `FlowQuery`, archive stats panel, rewrite /
-   map-local editor (API exists: `/api/rewrite`, `/api/archive/*`).
-3. **Body rewrite** (match-replace on path/query/body with size gates).
+The ordered product track above is cleared. Remaining work is the protocol
+coverage backlog (WS compose replay, retention, H2 fallback, WG/TUN crypto),
+independent items (throttling, body decoders, HAR import, archive reload), and
+Debts (archive rotation, scoped rewrite CLI/API polish).
 
 ## Protocol coverage (product requirement)
 

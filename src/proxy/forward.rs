@@ -99,24 +99,43 @@ pub async fn forward(
     let client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
 
     let (mut parts, body) = req.into_parts();
-    let path = parts
+    let mut path = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
 
     let rules = deps.rewrite.snapshot();
+    let method_str = parts.method.as_str().to_string();
 
     // Before the flow is recorded, so the capture shows what is actually sent.
     // A record that disagrees with the wire is worse than no record at all.
-    let notes = rewrite::apply(
+    let mut notes = rewrite::apply(
         &rules,
         rewrite::Half::Request,
         &ctx.host,
-        parts.method.as_str(),
+        &method_str,
         &path,
         &mut parts.headers,
     );
+    // Path and query text rewrites run after header match conditions, still
+    // before the flow is opened, so the inspector URL matches the wire.
+    notes.extend(rewrite::apply_path(
+        &rules,
+        &ctx.host,
+        &method_str,
+        &mut path,
+    ));
+    notes.extend(rewrite::apply_query(
+        &rules,
+        &ctx.host,
+        &method_str,
+        &mut path,
+    ));
+    if let Err(err) = set_request_path_and_query(&mut parts, &path) {
+        debug!(error = %err, "rewritten path was not a legal URI path-and-query");
+        notes.push(format!("path rewrite not applied to URI: {err}"));
+    }
 
     let id = deps.store.create(FlowInit {
         kind: if upgrading {
@@ -126,7 +145,7 @@ pub async fn forward(
         },
         intercepted: ctx.intercepted,
         request: FlowRequest {
-            method: parts.method.as_str().to_string(),
+            method: method_str.clone(),
             url: format!("{}://{}{}", ctx.scheme.as_str(), ctx.authority, path),
             scheme: ctx.scheme,
             authority: ctx.authority.clone(),
@@ -218,21 +237,37 @@ async fn exchange(
     // sees itself being addressed as that name.
     let rules = deps.rewrite.snapshot();
 
-    // HTTP request breakpoint: collect the body, hold, then dial with the
-    // released (possibly edited) message. WebSocket upgrades skip this path.
-    // After this branch the body is always a boxed stream so pause and
-    // non-pause share one send path type.
-    let (parts, body): (_, ProxyBody) = if !upgrading && deps.pauses.any_http_request_enabled() {
-        if let Some(rule) =
-            deps.pauses
-                .matching_http_request_rule(&ctx.host, &path, &method)
-        {
-            maybe_http_request_pause(parts, body, ctx, deps, id, &rule).await?
+    // Request body text rewrite, then HTTP request breakpoint. Both collect the
+    // body; rewrite runs first so a held pause (and the origin) see the edited
+    // payload. WebSocket upgrades skip both. After this branch the body is
+    // always a boxed stream so pause and non-pause share one send path type.
+    let (parts, body): (_, ProxyBody) = if upgrading {
+        (parts, body.boxed())
+    } else {
+        let (parts, body) = if rewrite::needs_body_rewrite(
+            &rules,
+            rewrite::Half::Request,
+            &ctx.host,
+            &method,
+            &path,
+        ) {
+            maybe_request_body_rewrite(parts, body, deps, id, &rules, &ctx.host, &method, &path)
+                .await?
         } else {
             (parts, body.boxed())
+        };
+        if deps.pauses.any_http_request_enabled() {
+            if let Some(rule) =
+                deps.pauses
+                    .matching_http_request_rule(&ctx.host, &path, &method)
+            {
+                maybe_http_request_pause(parts, body, ctx, deps, id, &rule).await?
+            } else {
+                (parts, body)
+            }
+        } else {
+            (parts, body)
         }
-    } else {
-        (parts, body.boxed())
     };
 
     let (dial_host, dial_port) = match rules.dial_target(&ctx.host, &method, &path) {
@@ -301,8 +336,6 @@ async fn exchange(
     );
 
     let response_headers = headers::to_pairs(&response_parts.headers);
-    let encoding = headers::content_encoding(&response_parts.headers);
-    let mime = headers::content_type(&response_parts.headers);
 
     deps.store.update(id, |flow| {
         flow.rewrites.extend(response_notes.iter().cloned());
@@ -322,16 +355,16 @@ async fn exchange(
         });
     });
 
-    let mut out = Response::builder()
-        .status(status)
-        .version(response_parts.version);
-    if let Some(map) = out.headers_mut() {
-        *map = headers::for_client(&response_parts.headers, status);
-    }
-
     // A 101 means the protocol changes on both sides. From here the connection
-    // is frames, not HTTP, and the websocket module takes it over.
+    // is frames, not HTTP, and the websocket module takes it over. Response
+    // breakpoints never hold a 101: the body is the upgraded stream itself.
     if status == StatusCode::SWITCHING_PROTOCOLS {
+        let mut out = Response::builder()
+            .status(status)
+            .version(response_parts.version);
+        if let Some(map) = out.headers_mut() {
+            *map = headers::for_client(&response_parts.headers, status);
+        }
         if let (Some(client_upgrade), Some(upstream_upgrade)) = (client_upgrade, upstream_upgrade) {
             let store = deps.store.clone();
             let registry = deps.ws_registry.clone();
@@ -412,6 +445,68 @@ async fn exchange(
         return Err(anyhow!(
             "the origin switched protocols on a request that was not an upgrade this proxy can carry"
         ));
+    }
+
+    // Response body text rewrite, then HTTP response breakpoint. Collect only
+    // when a rewrite or pause needs the full payload so SSE and other
+    // long-lived streams stay streaming when neither applies.
+    let (response_parts, response_body) = if upgrading {
+        (response_parts, response_body.boxed())
+    } else {
+        let (response_parts, response_body) = if rewrite::needs_body_rewrite(
+            &rules,
+            rewrite::Half::Response,
+            &ctx.host,
+            &method,
+            &path,
+        ) {
+            maybe_response_body_rewrite(
+                response_parts,
+                response_body,
+                deps,
+                id,
+                &rules,
+                &ctx.host,
+                &method,
+                &path,
+            )
+            .await?
+        } else {
+            (response_parts, response_body.boxed())
+        };
+        if deps.pauses.any_http_response_enabled() {
+            if let Some(rule) =
+                deps.pauses
+                    .matching_http_response_rule(&ctx.host, &path, &method)
+            {
+                maybe_http_response_pause(
+                    response_parts,
+                    response_body,
+                    ctx,
+                    deps,
+                    id,
+                    &method,
+                    &path,
+                    &rule,
+                )
+                .await?
+            } else {
+                (response_parts, response_body)
+            }
+        } else {
+            (response_parts, response_body)
+        }
+    };
+
+    let status = response_parts.status;
+    let encoding = headers::content_encoding(&response_parts.headers);
+    let mime = headers::content_type(&response_parts.headers);
+
+    let mut out = Response::builder()
+        .status(status)
+        .version(response_parts.version);
+    if let Some(map) = out.headers_mut() {
+        *map = headers::for_client(&response_parts.headers, status);
     }
 
     let teed = tee(
@@ -706,11 +801,48 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyOrigin {
 /* HTTP request breakpoint                                             */
 /* ------------------------------------------------------------------ */
 
+/// Collects the request body, applies matching request-body text rewrites, and
+/// rebuilds a body the upstream send path can stream again. Updates
+/// Content-Length when the payload length changes.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_request_body_rewrite(
+    mut parts: http::request::Parts,
+    body: impl Body<Data = Bytes, Error = hyper::Error> + Send + 'static,
+    deps: &Arc<ProxyDeps>,
+    id: &FlowId,
+    rules: &crate::config::RewriteRules,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Result<(http::request::Parts, ProxyBody)> {
+    let collected = body
+        .collect()
+        .await
+        .context("reading the request body for a rewrite")?;
+    let mut bytes = collected.to_bytes().to_vec();
+    let notes = rewrite::apply_body(
+        rules,
+        rewrite::Half::Request,
+        host,
+        method,
+        path,
+        &mut bytes,
+    );
+    set_content_length(&mut parts.headers, bytes.len());
+    if !notes.is_empty() {
+        deps.store.update(id, |flow| {
+            flow.rewrites.extend(notes);
+            flow.request.headers = headers::to_pairs(&parts.headers);
+        });
+    }
+    Ok((parts, full_body(Bytes::from(bytes))))
+}
+
 /// Collects the request, holds it if a rule matched, and rebuilds a body the
 /// upstream send path can stream again.
 async fn maybe_http_request_pause(
     mut parts: http::request::Parts,
-    body: Incoming,
+    body: impl Body<Data = Bytes, Error = hyper::Error> + Send + 'static,
     ctx: &ForwardContext,
     deps: &Arc<ProxyDeps>,
     id: &FlowId,
@@ -771,6 +903,7 @@ async fn maybe_http_request_pause(
         super::breakpoint::PauseDecision::HttpRelease {
             method: new_method,
             url: new_url,
+            status: _,
             headers: new_headers,
             body: new_body,
         } => {
@@ -807,6 +940,156 @@ async fn maybe_http_request_pause(
         }
         super::breakpoint::PauseDecision::Release { payload, .. } => {
             // Mis-routed WS decision: treat payload as body, keep headers.
+            Ok((parts, full_body(Bytes::from(payload))))
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* HTTP response breakpoint                                            */
+/* ------------------------------------------------------------------ */
+
+/// Collects the origin response body, applies matching response-body text
+/// rewrites, and rebuilds a body the client path can stream again.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_response_body_rewrite(
+    mut parts: http::response::Parts,
+    body: impl Body<Data = Bytes, Error = hyper::Error> + Send + 'static,
+    deps: &Arc<ProxyDeps>,
+    id: &FlowId,
+    rules: &crate::config::RewriteRules,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Result<(http::response::Parts, ProxyBody)> {
+    let collected = body
+        .collect()
+        .await
+        .context("reading the response body for a rewrite")?;
+    let mut bytes = collected.to_bytes().to_vec();
+    let notes = rewrite::apply_body(
+        rules,
+        rewrite::Half::Response,
+        host,
+        method,
+        path,
+        &mut bytes,
+    );
+    set_content_length(&mut parts.headers, bytes.len());
+    if !notes.is_empty() {
+        let response_headers = headers::to_pairs(&parts.headers);
+        deps.store.update(id, |flow| {
+            flow.rewrites.extend(notes);
+            if let Some(response) = flow.response.as_mut() {
+                response.headers = response_headers;
+            }
+        });
+    }
+    Ok((parts, full_body(Bytes::from(bytes))))
+}
+
+/// Collects the origin response, holds it if a rule matched, and rebuilds a
+/// body the client path can stream again.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_http_response_pause(
+    mut parts: http::response::Parts,
+    body: impl Body<Data = Bytes, Error = hyper::Error> + Send + 'static,
+    ctx: &ForwardContext,
+    deps: &Arc<ProxyDeps>,
+    id: &FlowId,
+    method: &str,
+    path: &str,
+    rule: &crate::types::BreakpointRule,
+) -> Result<(http::response::Parts, ProxyBody)> {
+    let collected = body
+        .collect()
+        .await
+        .context("reading the response body for an HTTP breakpoint")?;
+    let mut bytes = collected.to_bytes();
+    let max = deps.store.max_body_bytes() as usize;
+    let truncated = bytes.len() > max;
+    if truncated {
+        // Capture ceiling only; the held pause still has the full payload so a
+        // release can forward everything the origin sent.
+    }
+
+    let url = format!("{}://{}{}", ctx.scheme.as_str(), ctx.authority, path);
+    let headers = headers::to_pairs(&parts.headers);
+    let status = parts.status.as_u16();
+
+    let Some((pause_id, rx)) = deps.pauses.hold_http_response(
+        &deps.store,
+        id.clone(),
+        method.to_string(),
+        url,
+        status,
+        headers,
+        &bytes,
+        truncated,
+        rule.timeout_ms,
+    ) else {
+        return Ok((parts, full_body(bytes)));
+    };
+
+    deps.store.update(id, |flow| {
+        flow.rewrites
+            .push("HTTP response paused for breakpoint".into());
+    });
+
+    let decision = super::breakpoint::await_decision(
+        &deps.pauses,
+        &deps.store,
+        &pause_id,
+        rule.timeout_ms,
+        rx,
+    )
+    .await;
+
+    match decision {
+        super::breakpoint::PauseDecision::Drop => {
+            anyhow::bail!("HTTP response dropped at breakpoint");
+        }
+        super::breakpoint::PauseDecision::HttpRelease {
+            method: _method,
+            url: _url,
+            status: new_status,
+            headers: new_headers,
+            body: new_body,
+        } => {
+            if new_status != 0 {
+                if let Ok(s) = StatusCode::from_u16(new_status) {
+                    parts.status = s;
+                }
+            }
+            let mut map = http::HeaderMap::new();
+            for (name, value) in &new_headers {
+                if let (Ok(n), Ok(v)) = (
+                    http::header::HeaderName::from_bytes(name.as_bytes()),
+                    http::header::HeaderValue::from_str(value),
+                ) {
+                    map.append(n, v);
+                }
+            }
+            parts.headers = map;
+            bytes = Bytes::from(new_body);
+            let response_headers = headers::to_pairs(&parts.headers);
+            deps.store.update(id, |flow| {
+                flow.rewrites
+                    .push("HTTP response released from breakpoint".into());
+                if let Some(response) = flow.response.as_mut() {
+                    response.status = parts.status.as_u16();
+                    response.status_text = parts
+                        .status
+                        .canonical_reason()
+                        .unwrap_or_default()
+                        .to_string();
+                    response.headers = response_headers;
+                }
+            });
+            Ok((parts, full_body(bytes)))
+        }
+        super::breakpoint::PauseDecision::Release { payload, .. } => {
+            // Mis-routed WS decision: treat payload as body, keep status/headers.
             Ok((parts, full_body(Bytes::from(payload))))
         }
     }
@@ -944,6 +1227,36 @@ fn full_body(bytes: Bytes) -> ProxyBody {
     Full::new(bytes)
         .map_err(|never| match never {})
         .boxed()
+}
+
+/// Rebuild `parts.uri` path-and-query after a path/query text rewrite, keeping
+/// scheme and authority when the request used absolute-form.
+fn set_request_path_and_query(
+    parts: &mut http::request::Parts,
+    path_and_query: &str,
+) -> Result<()> {
+    let mut builder = Uri::builder();
+    if let Some(scheme) = parts.uri.scheme() {
+        builder = builder.scheme(scheme.clone());
+    }
+    if let Some(authority) = parts.uri.authority() {
+        builder = builder.authority(authority.clone());
+    }
+    let uri = builder
+        .path_and_query(path_and_query)
+        .build()
+        .map_err(|err| anyhow!("illegal path-and-query after rewrite: {err}"))?;
+    parts.uri = uri;
+    Ok(())
+}
+
+/// After a body length change, drop Transfer-Encoding and set Content-Length so
+/// the next hop does not hang waiting for a framed body of the old size.
+fn set_content_length(headers: &mut http::HeaderMap, len: usize) {
+    headers.remove(http::header::TRANSFER_ENCODING);
+    if let Ok(value) = http::HeaderValue::from_str(&len.to_string()) {
+        headers.insert(http::header::CONTENT_LENGTH, value);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1512,5 +1825,462 @@ mod tests {
         // Nothing was polled, so nothing was seen, and the flow must not claim
         // a body it never observed.
         assert!(store.get(&id).expect("flow").request.body.is_none());
+    }
+
+    /* -------------------------------------------------------------- */
+    /* HTTP response breakpoints                                       */
+    /* -------------------------------------------------------------- */
+
+    /// Origin that answers every request with a fixed status, headers and body.
+    async fn origin_http_response(
+        status: u16,
+        headers: &'static [(&'static str, &'static str)],
+        body: &'static [u8],
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+        let addr = listener.local_addr().expect("origin address");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = body;
+                let headers = headers;
+                tokio::spawn(async move {
+                    // Drain the request so the origin can answer.
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let mut msg = format!("HTTP/1.1 {status} OK\r\n");
+                    for (name, value) in headers {
+                        msg.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    msg.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+                    let mut wire = msg.into_bytes();
+                    wire.extend_from_slice(body);
+                    let _ = stream.write_all(&wire).await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn response_rule(timeout_ms: u64) -> crate::types::BreakpointRule {
+        crate::types::BreakpointRule {
+            id: "resp".into(),
+            enabled: true,
+            kind: crate::types::PauseKind::Http,
+            hosts: vec![],
+            path_prefix: None,
+            directions: vec![],
+            opcodes: vec![],
+            timeout_ms,
+            http_half: Some(crate::types::HttpPauseHalf::Response),
+            methods: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn response_breakpoint_timeout_releases_original_body() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        deps.pauses.set_rules(crate::types::BreakpointRulesBody {
+            rules: vec![response_rule(1_000)],
+        });
+        let origin =
+            origin_http_response(200, &[("Content-Type", "text/plain")], b"origin-body").await;
+
+        let response = forward_one(&deps, Scheme::Http, origin).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&body[..], b"origin-body");
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert!(
+            flow.rewrites
+                .iter()
+                .any(|n| n.contains("HTTP response paused")),
+            "expected pause note, got {:?}",
+            flow.rewrites
+        );
+        assert!(
+            flow.rewrites
+                .iter()
+                .any(|n| n.contains("HTTP response released")),
+            "expected release note, got {:?}",
+            flow.rewrites
+        );
+        assert_eq!(
+            flow.response.as_ref().map(|r| r.status),
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_breakpoint_release_can_edit_status_and_body() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        deps.pauses.set_rules(crate::types::BreakpointRulesBody {
+            // Long timeout; the test resolves from the event stream.
+            rules: vec![response_rule(60_000)],
+        });
+        let origin =
+            origin_http_response(200, &[("Content-Type", "text/plain")], b"origin-body").await;
+
+        let pauses = deps.pauses.clone();
+        let store = deps.store.clone();
+        let mut events = store.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(crate::types::ProxyEvent::PauseHit { pause }) => {
+                        let _ = pauses.resolve(
+                            &store,
+                            &pause.pause_id,
+                            crate::proxy::breakpoint::PauseDecision::HttpRelease {
+                                method: "GET".into(),
+                                url: pause
+                                    .http
+                                    .as_ref()
+                                    .map(|h| h.url.clone())
+                                    .unwrap_or_default(),
+                                status: 418,
+                                headers: vec![("content-type".into(), "text/plain".into())],
+                                body: b"edited-body".to_vec(),
+                            },
+                            crate::types::PauseResolveReason::User,
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let response = forward_one(&deps, Scheme::Http, origin).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&body[..], b"edited-body");
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert_eq!(
+            flow.response.as_ref().map(|r| r.status),
+            Some(418)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_breakpoint_drop_fails_the_flow() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        deps.pauses.set_rules(crate::types::BreakpointRulesBody {
+            rules: vec![response_rule(60_000)],
+        });
+        let origin =
+            origin_http_response(200, &[("Content-Type", "text/plain")], b"origin-body").await;
+
+        let pauses = deps.pauses.clone();
+        let store = deps.store.clone();
+        let mut events = store.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(crate::types::ProxyEvent::PauseHit { pause }) => {
+                        let _ = pauses.resolve(
+                            &store,
+                            &pause.pause_id,
+                            crate::proxy::breakpoint::PauseDecision::Drop,
+                            crate::types::PauseResolveReason::User,
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let response = forward_one(&deps, Scheme::Http, origin).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert_eq!(flow.state, FlowState::Error);
+        assert!(
+            flow.error
+                .as_ref()
+                .map(|e| e.message.contains("dropped at breakpoint"))
+                .unwrap_or(false),
+            "expected drop error, got {:?}",
+            flow.error
+        );
+    }
+
+    #[tokio::test]
+    async fn without_response_rule_no_pause_notes_are_written() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        // No response-half rules: streaming path, no pause notes.
+        deps.pauses.set_rules(crate::types::BreakpointRulesBody {
+            rules: vec![],
+        });
+        let origin =
+            origin_http_response(200, &[("Content-Type", "text/plain")], b"plain").await;
+
+        let response = forward_one(&deps, Scheme::Http, origin).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(&body[..], b"plain");
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert!(
+            !flow
+                .rewrites
+                .iter()
+                .any(|n| n.contains("HTTP response paused")),
+            "response half must not pause without a response rule: {:?}",
+            flow.rewrites
+        );
+    }
+
+    /* -------------------------------------------------------------- */
+    /* path / query / body text rewrites                               */
+    /* -------------------------------------------------------------- */
+
+    /// Origin that records the request path and body of the first request,
+    /// then answers 200 with a fixed body so the client can finish.
+    async fn origin_capture_request() -> (SocketAddr, Arc<parking_lot::Mutex<(String, Vec<u8>)>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+        let addr = listener.local_addr().expect("origin address");
+        let captured = Arc::new(parking_lot::Mutex::new((String::new(), Vec::new())));
+        let slot = captured.clone();
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                .await
+                .unwrap_or(0);
+            buf.truncate(n);
+            // Split headers / body on the first blank line.
+            let (head, body) = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = &buf[..pos];
+                let body = buf[pos + 4..].to_vec();
+                (head, body)
+            } else {
+                (buf.as_slice(), Vec::new())
+            };
+            let head_str = String::from_utf8_lossy(head);
+            let path = head_str
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            *slot.lock() = (path, body);
+
+            let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            let _ = stream.write_all(reply).await;
+        });
+        (addr, captured)
+    }
+
+    /// POST a body through `forward` the same way `forward_one` does for GET.
+    async fn forward_post(
+        deps: &Arc<ProxyDeps>,
+        scheme: Scheme,
+        origin: SocketAddr,
+        path: &str,
+        body: &'static [u8],
+    ) -> Response<Incoming> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy = listener.local_addr().expect("proxy address");
+
+        let served = deps.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                let deps = served.clone();
+                async move {
+                    let ctx = ForwardContext {
+                        scheme,
+                        host: origin.ip().to_string(),
+                        port: origin.port(),
+                        authority: format!("{}:{}", origin.ip(), origin.port()),
+                        client: FlowClient {
+                            address: "127.0.0.1".to_string(),
+                            port: 51234,
+                        },
+                        server: FlowServer::default(),
+                        intercepted: true,
+                        connection_id: None,
+                    };
+                    Ok::<_, std::convert::Infallible>(forward(req, ctx, deps).await)
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
+                .await;
+        });
+
+        let stream = TcpStream::connect(proxy).await.expect("connect to the proxy");
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+
+        sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(http::header::HOST, "origin.test")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .header(http::header::CONTENT_LENGTH, body.len())
+                    .body(full_body(Bytes::from_static(body)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    #[tokio::test]
+    async fn a_request_body_text_replace_reaches_the_origin_and_leaves_a_note() {
+        use crate::config::{BodyRewrite, RewriteRule, RewriteRulesBody, TextReplace};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        deps.rewrite.set_rules(RewriteRulesBody {
+            rules: vec![RewriteRule {
+                request_body: Some(BodyRewrite {
+                    replacements: vec![TextReplace {
+                        find: "secret".into(),
+                        replace: "redacted".into(),
+                    }],
+                    max_bytes: 0,
+                }),
+                ..RewriteRule::default()
+            }],
+        });
+
+        let (origin, captured) = origin_capture_request().await;
+        let response = forward_post(
+            &deps,
+            Scheme::Http,
+            origin,
+            "/api/submit",
+            br#"{"token":"secret"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (path, body) = captured.lock().clone();
+        assert_eq!(path, "/api/submit");
+        assert_eq!(
+            body.as_slice(),
+            br#"{"token":"redacted"}"#,
+            "origin must see the rewritten body, not the client original"
+        );
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert!(
+            flow.rewrites
+                .iter()
+                .any(|n| n.contains("request body") && n.contains("secret")),
+            "expected a request body rewrite note, got {:?}",
+            flow.rewrites
+        );
+        // Capture shows wire bytes (post-rewrite), same honesty as headers.
+        let meta = flow.request.body.as_ref().expect("request body meta");
+        assert_eq!(
+            deps.store.bodies().read(&meta.id).as_deref(),
+            Some(&br#"{"token":"redacted"}"#[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_rewrite_is_what_the_origin_sees() {
+        use crate::config::{RewriteRule, RewriteRulesBody, TextReplace};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        deps.rewrite.set_rules(RewriteRulesBody {
+            rules: vec![RewriteRule {
+                path_replacements: vec![TextReplace {
+                    find: "/v1/".into(),
+                    replace: "/v2/".into(),
+                }],
+                ..RewriteRule::default()
+            }],
+        });
+
+        let (origin, captured) = origin_capture_request().await;
+        let response = forward_post(&deps, Scheme::Http, origin, "/v1/users", b"{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (path, _) = captured.lock().clone();
+        assert_eq!(path, "/v2/users", "origin must see the rewritten path");
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert_eq!(flow.request.path, "/v2/users");
+        assert!(
+            flow.rewrites.iter().any(|n| n.contains("path replaced")),
+            "expected a path rewrite note, got {:?}",
+            flow.rewrites
+        );
+    }
+
+    #[tokio::test]
+    async fn without_body_rewrite_rules_the_body_is_not_force_collected() {
+        // Smoke: a POST with no body rewrite still reaches the origin unchanged
+        // and leaves no body-rewrite notes (streaming tee path).
+        let temp = tempfile::tempdir().expect("temp dir");
+        let deps = test_deps(&temp);
+        let (origin, captured) = origin_capture_request().await;
+        let response = forward_post(
+            &deps,
+            Scheme::Http,
+            origin,
+            "/plain",
+            br#"{"keep":"me"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (_, body) = captured.lock().clone();
+        assert_eq!(body.as_slice(), br#"{"keep":"me"}"#);
+
+        let flows = deps.store.all(&FlowQuery::default());
+        let flow = flows.first().expect("recorded flow");
+        assert!(
+            !flow.rewrites.iter().any(|n| n.contains("body")),
+            "no body rewrite rules must leave no body notes: {:?}",
+            flow.rewrites
+        );
     }
 }

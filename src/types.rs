@@ -381,6 +381,10 @@ pub struct FlowSummary {
     /// `None`. Full-flow-only `upstreamStreamId` is not projected here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_id: Option<u64>,
+    /// True when the response was produced by map-local / mock rather than an
+    /// origin. Omitted when false so ordinary list rows stay quiet in JSON.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mocked: bool,
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,7 +402,7 @@ pub enum ProxyEvent {
     FlowDone { flow: Box<FlowSummary> },
     #[serde(rename = "ws:message")]
     WsMessageEvent { id: FlowId, message: Box<WsMessage> },
-    /// A frame (or, later, HTTP message) is held before forward.
+    /// A WS frame or HTTP message is held before forward.
     #[serde(rename = "pause:hit")]
     PauseHit { pause: Box<PauseSnapshot> },
     /// A held pause was released, dropped, timed out, or cancelled.
@@ -418,18 +422,18 @@ pub enum ProxyEvent {
 }
 
 /* ------------------------------------------------------------------ */
-/* Breakpoints / pauses (WS now; HTTP later via kind-tagged body)      */
+/* Breakpoints / pauses (WS and HTTP via kind-tagged body)             */
 /* ------------------------------------------------------------------ */
 
 /// What kind of traffic a pause or breakpoint rule applies to.
 ///
-/// Nested kind bodies (`ws` today, `http` later) keep the event shape shared
-/// without flattening protocol fields into the top level.
+/// Nested kind bodies (`ws` / `http`) keep the event shape shared without
+/// flattening protocol fields into the top level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PauseKind {
     Ws,
-    /// Reserved for request/response breakpoints. Not produced by the WS path.
+    /// Request/response breakpoints. Not produced by the WS path.
     Http,
 }
 
@@ -493,6 +497,9 @@ pub struct PauseHttpBody {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_base64: Option<String>,
+    /// Status code when half is response; omitted/None for request half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
 }
 
 /// WebSocket half of a held pause: direction, opcode and a payload snapshot.
@@ -538,7 +545,7 @@ pub struct BreakpointRule {
     /// original. Zero is treated as a short safety floor by the hub.
     pub timeout_ms: u64,
     /// For [`PauseKind::Http`]: which half to pause. Defaults to request when
-    /// omitted. Response half is reserved for a later pass.
+    /// omitted. Response half pauses after the origin reply is held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_half: Option<HttpPauseHalf>,
     /// For HTTP rules: empty means any method.
@@ -628,7 +635,8 @@ pub struct ServerStatus {
 #[serde(rename_all = "camelCase")]
 pub struct FlowQuery {
     /// Substring match against method, url, status, content type, and
-    /// multiplex `connection_id` (shared H2+H3 session key).
+    /// multiplex `connection_id` (shared H2+H3 session key). Also matches the
+    /// synthetic needles `mock` / `mocked` when [`Flow::mocked`] is true.
     pub search: Option<String>,
     /// Exact hosts or `*.suffix` patterns.
     #[serde(default)]
@@ -641,6 +649,9 @@ pub struct FlowQuery {
     pub kinds: Vec<FlowKind>,
     #[serde(default)]
     pub only_errors: bool,
+    /// When true, keep only map-local / mock flows (`flow.mocked`).
+    #[serde(default)]
+    pub only_mocked: bool,
     pub limit: Option<usize>,
     /// Cursor: return flows recorded before this sequence number.
     pub before: Option<u64>,
@@ -885,6 +896,7 @@ mod tests {
             transport: flow.transport,
             connection_id: flow.connection_id.clone(),
             stream_id: flow.stream_id,
+            mocked: flow.mocked,
         };
         let s = serde_json::to_value(&summary).unwrap();
         assert_eq!(s["httpVersion"], "3.0");
@@ -980,6 +992,7 @@ mod tests {
             transport: flow.transport,
             connection_id: flow.connection_id.clone(),
             stream_id: flow.stream_id,
+            mocked: flow.mocked,
         };
         let s = serde_json::to_value(&summary).unwrap();
         assert_eq!(s["httpVersion"], "2.0");
@@ -1069,6 +1082,7 @@ mod tests {
             transport: None,
             connection_id: flow.connection_id.clone(),
             stream_id: None,
+            mocked: false,
         };
         let s = serde_json::to_value(&summary).unwrap();
         let sobj = s.as_object().unwrap();
@@ -1076,6 +1090,7 @@ mod tests {
         assert!(!sobj.contains_key("streamId"));
         assert!(!sobj.contains_key("upstreamStreamId"));
         assert!(!sobj.contains_key("transport"));
+        assert!(!sobj.contains_key("mocked"));
     }
 
     /// Bare FlowSummary JSON (older list rows) deserialises multiplex as None.
@@ -1105,12 +1120,14 @@ mod tests {
         assert_eq!(summary.transport, None);
         assert_eq!(summary.connection_id, None);
         assert_eq!(summary.stream_id, None);
+        assert!(!summary.mocked);
         // No upstreamStreamId field on the type; JSON must not invent one.
         let out = serde_json::to_value(&summary).unwrap();
         assert!(out.as_object().unwrap().get("upstreamStreamId").is_none());
         assert!(out.as_object().unwrap().get("connectionId").is_none());
         assert!(out.as_object().unwrap().get("streamId").is_none());
         assert!(out.as_object().unwrap().get("transport").is_none());
+        assert!(out.as_object().unwrap().get("mocked").is_none());
     }
 
     /// H2 and H3 share the same multiplex wire keys; only transport differs.

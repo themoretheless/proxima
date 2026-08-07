@@ -1,13 +1,11 @@
-//! Runtime breakpoints: hold a frame (or later an HTTP message) before forward.
+//! Runtime breakpoints: hold a WebSocket frame or HTTP message before forward.
 //!
-//! Rules live only in memory. When any enabled WebSocket rule matches a parsed
-//! frame, the pump registers a pause here, publishes `pause:hit`, and waits for
-//! release, drop, or the per-rule timeout. No enabled rules means the websocket
-//! path stays on its zero-latency byte-copy loop.
-//!
-//! The protocol is kind-tagged from day one (`ws` now, `http` later) so HTTP
-//! request/response pauses can share the same hub, events and resolve API
-//! without flattening protocol fields into the top level.
+//! Rules live only in memory. When any enabled rule matches, the pump or
+//! forwarder registers a pause here, publishes `pause:hit`, and waits for
+//! release, drop, or the per-rule timeout. No enabled WS rules means the
+//! websocket path stays on its zero-latency byte-copy loop; HTTP request and
+//! response pauses use the same hub, events and resolve API, distinguished by
+//! [`HttpPauseHalf`] on the rule and on the held snapshot.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,9 +41,13 @@ pub enum PauseDecision {
     /// Forward this opcode and payload (re-encoded with the half's mask rules).
     Release { opcode: u8, payload: Vec<u8> },
     /// Forward (possibly edited) HTTP request/response bytes.
+    ///
+    /// `status` is `0` for the request half (N/A); a real status code for the
+    /// response half.
     HttpRelease {
         method: String,
         url: String,
+        status: u16,
         headers: Vec<HeaderPair>,
         body: Vec<u8>,
     },
@@ -80,6 +82,8 @@ struct Pending {
 struct HttpOriginal {
     method: String,
     url: String,
+    /// `0` for request-half pauses; real status for response-half.
+    status: u16,
     headers: Vec<HeaderPair>,
 }
 
@@ -142,6 +146,13 @@ impl PauseHub {
         })
     }
 
+    /// True when at least one enabled HTTP response-half rule exists.
+    pub fn any_http_response_enabled(&self) -> bool {
+        self.inner.lock().rules.iter().any(|r| {
+            r.enabled && r.kind == PauseKind::Http && r.http_half == Some(HttpPauseHalf::Response)
+        })
+    }
+
     /// First enabled HTTP request rule that matches host, path and method.
     pub fn matching_http_request_rule(
         &self,
@@ -154,6 +165,21 @@ impl PauseHub {
             .rules
             .iter()
             .find(|r| rule_matches_http_request(r, host, path, method))
+            .cloned()
+    }
+
+    /// First enabled HTTP response rule that matches host, path and method.
+    pub fn matching_http_response_rule(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+    ) -> Option<BreakpointRule> {
+        self.inner
+            .lock()
+            .rules
+            .iter()
+            .find(|r| rule_matches_http_response(r, host, path, method))
             .cloned()
     }
 
@@ -258,6 +284,7 @@ impl PauseHub {
             half: HttpPauseHalf::Request,
             method: method.clone(),
             url: url.clone(),
+            status: None,
             headers: headers.clone(),
             size: body.len() as u64,
             truncated,
@@ -293,6 +320,79 @@ impl PauseHub {
                     original_http: Some(HttpOriginal {
                         method,
                         url,
+                        status: 0,
+                        headers,
+                    }),
+                    tx,
+                },
+            );
+        }
+
+        store.publish(ProxyEvent::PauseHit {
+            pause: Box::new(snapshot),
+        });
+        Some((pause_id, rx))
+    }
+
+    /// Registers a held HTTP response. Same cap behaviour as [`Self::hold_ws`].
+    pub fn hold_http_response(
+        &self,
+        store: &FlowStore,
+        flow_id: FlowId,
+        method: String,
+        url: String,
+        status: u16,
+        headers: Vec<HeaderPair>,
+        body: &[u8],
+        truncated: bool,
+        timeout_ms: u64,
+    ) -> Option<(String, oneshot::Receiver<(PauseDecision, PauseResolveReason)>)> {
+        let timeout_ms = clamp_timeout(timeout_ms);
+        let (tx, rx) = oneshot::channel();
+        let pause_id = new_id();
+        let created_at = now_ms();
+        let expires_at = created_at.saturating_add(timeout_ms);
+        let http = PauseHttpBody {
+            half: HttpPauseHalf::Response,
+            method: method.clone(),
+            url: url.clone(),
+            status: Some(status),
+            headers: headers.clone(),
+            size: body.len() as u64,
+            truncated,
+            text: snapshot_text(1, body),
+            data_base64: snapshot_base64(1, body),
+        };
+        let snapshot = PauseSnapshot {
+            pause_id: pause_id.clone(),
+            flow_id: flow_id.clone(),
+            kind: PauseKind::Http,
+            created_at,
+            expires_at,
+            ws: None,
+            http: Some(http),
+        };
+
+        {
+            let mut inner = self.inner.lock();
+            if inner.pending.len() >= MAX_CONCURRENT_PAUSES {
+                debug!(
+                    %flow_id,
+                    cap = MAX_CONCURRENT_PAUSES,
+                    "pause cap reached; forwarding HTTP response without hold"
+                );
+                return None;
+            }
+            inner.pending.insert(
+                pause_id.clone(),
+                Pending {
+                    snapshot: snapshot.clone(),
+                    original_opcode: 0,
+                    original_payload: body.to_vec(),
+                    original_http: Some(HttpOriginal {
+                        method,
+                        url,
+                        status,
                         headers,
                     }),
                     tx,
@@ -359,6 +459,7 @@ impl PauseHub {
             PauseDecision::HttpRelease {
                 method: http.method,
                 url: http.url,
+                status: http.status,
                 headers: http.headers,
                 body: pending.original_payload,
             }
@@ -487,6 +588,20 @@ fn rule_matches_http_request(rule: &BreakpointRule, host: &str, path: &str, meth
     if rule.http_half.unwrap_or(HttpPauseHalf::Request) != HttpPauseHalf::Request {
         return false;
     }
+    rule_matches_http_filters(rule, host, path, method)
+}
+
+fn rule_matches_http_response(rule: &BreakpointRule, host: &str, path: &str, method: &str) -> bool {
+    if !rule.enabled || rule.kind != PauseKind::Http {
+        return false;
+    }
+    if rule.http_half != Some(HttpPauseHalf::Response) {
+        return false;
+    }
+    rule_matches_http_filters(rule, host, path, method)
+}
+
+fn rule_matches_http_filters(rule: &BreakpointRule, host: &str, path: &str, method: &str) -> bool {
     if !rule.hosts.is_empty() && !rule.hosts.iter().any(|p| host_matches(host, p)) {
         return false;
     }
@@ -1096,5 +1211,202 @@ mod tests {
             ),
             Err(ResolveError::NotFound) | Err(ResolveError::AlreadyResolved)
         ));
+    }
+
+    fn http_request_rule(id: &str, hosts: Vec<String>, path_prefix: Option<String>, methods: Vec<String>) -> BreakpointRule {
+        BreakpointRule {
+            id: id.into(),
+            enabled: true,
+            kind: PauseKind::Http,
+            hosts,
+            path_prefix,
+            directions: vec![],
+            opcodes: vec![],
+            timeout_ms: 5_000,
+            http_half: Some(HttpPauseHalf::Request),
+            methods,
+        }
+    }
+
+    fn http_response_rule(id: &str, hosts: Vec<String>, path_prefix: Option<String>, methods: Vec<String>) -> BreakpointRule {
+        BreakpointRule {
+            id: id.into(),
+            enabled: true,
+            kind: PauseKind::Http,
+            hosts,
+            path_prefix,
+            directions: vec![],
+            opcodes: vec![],
+            timeout_ms: 5_000,
+            http_half: Some(HttpPauseHalf::Response),
+            methods,
+        }
+    }
+
+    #[test]
+    fn any_http_response_enabled_tracks_response_half_only() {
+        let hub = PauseHub::new();
+        assert!(!hub.any_http_response_enabled());
+        assert!(!hub.any_http_request_enabled());
+
+        hub.set_rules(BreakpointRulesBody {
+            rules: vec![http_request_rule("req", vec![], None, vec![])],
+        });
+        assert!(!hub.any_http_response_enabled());
+        assert!(hub.any_http_request_enabled());
+
+        hub.set_rules(BreakpointRulesBody {
+            rules: vec![http_response_rule("resp", vec![], None, vec![])],
+        });
+        assert!(hub.any_http_response_enabled());
+        assert!(!hub.any_http_request_enabled());
+
+        hub.set_rules(BreakpointRulesBody {
+            rules: vec![BreakpointRule {
+                id: "disabled".into(),
+                enabled: false,
+                kind: PauseKind::Http,
+                hosts: vec![],
+                path_prefix: None,
+                directions: vec![],
+                opcodes: vec![],
+                timeout_ms: 5_000,
+                http_half: Some(HttpPauseHalf::Response),
+                methods: vec![],
+            }],
+        });
+        assert!(!hub.any_http_response_enabled());
+    }
+
+    #[test]
+    fn matching_http_response_rule_filters_host_path_method() {
+        let hub = PauseHub::new();
+        hub.set_rules(BreakpointRulesBody {
+            rules: vec![
+                http_request_rule(
+                    "req",
+                    vec!["api.example.com".into()],
+                    Some("/api".into()),
+                    vec!["GET".into()],
+                ),
+                http_response_rule(
+                    "resp",
+                    vec!["*.example.com".into()],
+                    Some("/api".into()),
+                    vec!["GET".into(), "POST".into()],
+                ),
+            ],
+        });
+
+        assert!(hub
+            .matching_http_response_rule("api.example.com", "/api/v1", "GET")
+            .is_some_and(|r| r.id == "resp"));
+        assert!(hub
+            .matching_http_response_rule("api.example.com", "/api/v1", "post")
+            .is_some());
+        assert!(hub
+            .matching_http_response_rule("other.com", "/api/v1", "GET")
+            .is_none());
+        assert!(hub
+            .matching_http_response_rule("api.example.com", "/other", "GET")
+            .is_none());
+        assert!(hub
+            .matching_http_response_rule("api.example.com", "/api/v1", "DELETE")
+            .is_none());
+        // Request-half matcher must not return the response rule.
+        assert!(hub
+            .matching_http_request_rule("api.example.com", "/api/v1", "GET")
+            .is_some_and(|r| r.id == "req"));
+        assert!(hub
+            .matching_http_response_rule("api.example.com", "/api/v1", "GET")
+            .is_some_and(|r| r.id != "req"));
+    }
+
+    #[tokio::test]
+    async fn hold_http_response_timeout_preserves_status() {
+        let hub = Arc::new(PauseHub::new());
+        let store = Arc::new(store());
+        let headers = vec![("content-type".into(), "application/json".into())];
+        let (pause_id, rx) = hub
+            .hold_http_response(
+                &store,
+                "flow-resp".into(),
+                "GET".into(),
+                "https://example.com/x".into(),
+                201,
+                headers.clone(),
+                br#"{"ok":true}"#,
+                false,
+                30_000,
+            )
+            .expect("held");
+
+        let snap = hub.get(&pause_id).expect("snapshot");
+        let http = snap.http.expect("http body");
+        assert_eq!(http.half, HttpPauseHalf::Response);
+        assert_eq!(http.status, Some(201));
+        assert_eq!(http.method, "GET");
+        assert_eq!(http.url, "https://example.com/x");
+
+        let decision = {
+            let hub = hub.clone();
+            let store = store.clone();
+            let pause_id = pause_id.clone();
+            tokio::spawn(async move {
+                await_decision(&hub, &store, &pause_id, 50, rx).await
+            })
+            .await
+            .expect("join")
+        };
+
+        match decision {
+            PauseDecision::HttpRelease {
+                method,
+                url,
+                status,
+                headers: released_headers,
+                body,
+            } => {
+                assert_eq!(method, "GET");
+                assert_eq!(url, "https://example.com/x");
+                assert_eq!(status, 201);
+                assert_eq!(released_headers, headers);
+                assert_eq!(body, br#"{"ok":true}"#);
+            }
+            other => panic!("expected HttpRelease with status, got {other:?}"),
+        }
+        assert_eq!(hub.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn hold_http_request_timeout_status_is_zero() {
+        let hub = Arc::new(PauseHub::new());
+        let store = Arc::new(store());
+        let (pause_id, rx) = hub
+            .hold_http_request(
+                &store,
+                "flow-req".into(),
+                "POST".into(),
+                "https://example.com/y".into(),
+                vec![],
+                b"body",
+                false,
+                30_000,
+            )
+            .expect("held");
+
+        let snap = hub.get(&pause_id).expect("snapshot");
+        let http = snap.http.expect("http body");
+        assert_eq!(http.half, HttpPauseHalf::Request);
+        assert_eq!(http.status, None);
+
+        let decision = await_decision(&hub, &store, &pause_id, 40, rx).await;
+        match decision {
+            PauseDecision::HttpRelease { status, body, .. } => {
+                assert_eq!(status, 0, "request half uses status 0");
+                assert_eq!(body, b"body");
+            }
+            other => panic!("expected HttpRelease, got {other:?}"),
+        }
     }
 }

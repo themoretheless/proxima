@@ -717,6 +717,7 @@ fn summarize(flow: &Flow) -> FlowSummary {
         transport: flow.transport,
         connection_id: flow.connection_id.clone(),
         stream_id: flow.stream_id,
+        mocked: flow.mocked,
     }
 }
 
@@ -826,6 +827,10 @@ fn matches_query(flow: &Flow, q: &FlowQuery) -> bool {
         }
     }
 
+    if q.only_mocked && !flow.mocked {
+        return false;
+    }
+
     if let Some(search) = &q.search {
         let needle = search.trim().to_ascii_lowercase();
         if !needle.is_empty() {
@@ -842,11 +847,15 @@ fn matches_query(flow: &Flow, q: &FlowQuery) -> bool {
                 .as_deref()
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            // Explicit mocked flag (not rewrites text) so map-local rows match
+            // the inspector/GUI "mock"/"mocked" needles without origin hits.
+            let mock_hit = flow.mocked && (needle == "mock" || needle == "mocked");
             let hit = flow.request.method.to_ascii_lowercase().contains(&needle)
                 || flow.request.url.to_ascii_lowercase().contains(&needle)
                 || status.contains(&needle)
                 || content_type.to_ascii_lowercase().contains(&needle)
-                || (!connection.is_empty() && connection.contains(&needle));
+                || (!connection.is_empty() && connection.contains(&needle))
+                || mock_hit;
             if !hit {
                 return false;
             }
@@ -1358,6 +1367,246 @@ mod tests {
             ..FlowQuery::default()
         });
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn query_only_mocked_and_search_mock_needles() {
+        let store = FlowStore::new(100, 1024, 4096);
+
+        let plain = store.create(init("GET", "api.example.com", "/real"));
+        respond(&store, &plain, 200, "application/json");
+
+        let mocked = store.create(init("GET", "api.example.com", "/fixture"));
+        store.update(&mocked, |flow| {
+            flow.mocked = true;
+        });
+        respond(&store, &mocked, 200, "application/json");
+
+        // only_mocked keeps map-local rows and drops origin ones.
+        let (page, total) = store.query(&FlowQuery {
+            only_mocked: true,
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(page[0].id, mocked);
+        assert!(page[0].mocked);
+
+        let (_, total) = store.query(&FlowQuery {
+            only_mocked: false,
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "default leaves mocked and origin rows");
+
+        // Search needles "mock" / "mocked" match the explicit flag, not rewrites.
+        for needle in ["mock", "mocked", "MOCK", "Mocked"] {
+            let (page, total) = store.query(&FlowQuery {
+                search: Some(needle.into()),
+                ..FlowQuery::default()
+            });
+            assert_eq!(total, 1, "search {needle:?} finds the mocked flow");
+            assert_eq!(page[0].id, mocked);
+        }
+
+        // A non-mock needle still uses the normal path fields.
+        let (_, total) = store.query(&FlowQuery {
+            search: Some("fixture".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+
+        // only_mocked combined with search still requires mocked.
+        let (_, total) = store.query(&FlowQuery {
+            only_mocked: true,
+            search: Some("fixture".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+        let (_, total) = store.query(&FlowQuery {
+            only_mocked: true,
+            search: Some("real".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 0, "origin path must not pass only_mocked");
+    }
+
+    /// Gaps the basic filter test leaves open: transport/state errors count as
+    /// only_errors, status_range needs a response, multi-value filters OR,
+    /// combining filters AND, exact hosts, search on method, blank search.
+    #[test]
+    fn query_only_errors_includes_failed_state_without_status() {
+        let store = FlowStore::new(100, 1024, 4096);
+        let ok = store.create(init("GET", "api.example.com", "/ok"));
+        respond(&store, &ok, 200, "application/json");
+        let http_err = store.create(init("GET", "api.example.com", "/boom"));
+        respond(&store, &http_err, 502, "text/plain");
+        let transport = store.create(init("GET", "api.example.com", "/tls"));
+        store.fail(
+            &transport,
+            FlowError {
+                message: "tls handshake failed".into(),
+                code: Some("tls".into()),
+                likely_pinning: Some(false),
+            },
+        );
+        let _pending = store.create(init("GET", "api.example.com", "/pending"));
+
+        let (page, total) = store.query(&FlowQuery {
+            only_errors: true,
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "HTTP 5xx and FlowState::Error both count");
+        let ids: Vec<_> = page.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&http_err.as_str()));
+        assert!(ids.contains(&transport.as_str()));
+        assert!(!ids.contains(&ok.as_str()));
+    }
+
+    #[test]
+    fn query_status_range_excludes_flows_without_a_response() {
+        let store = FlowStore::new(100, 1024, 4096);
+        let ok = store.create(init("GET", "api.example.com", "/ok"));
+        respond(&store, &ok, 204, "text/plain");
+        let failed = store.create(init("GET", "api.example.com", "/tls"));
+        store.fail(
+            &failed,
+            FlowError {
+                message: "reset".into(),
+                code: None,
+                likely_pinning: None,
+            },
+        );
+        let _pending = store.create(init("GET", "api.example.com", "/pending"));
+
+        let (page, total) = store.query(&FlowQuery {
+            status_range: Some((200, 299)),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(page[0].id, ok);
+
+        let (_, total) = store.query(&FlowQuery {
+            status_range: Some((500, 599)),
+            ..FlowQuery::default()
+        });
+        assert_eq!(
+            total, 0,
+            "a transport error has no status and must not match 5xx"
+        );
+    }
+
+    #[test]
+    fn query_methods_and_hosts_or_within_and_across_filters() {
+        let store = FlowStore::new(100, 1024, 4096);
+        let get_api = store.create(init("GET", "api.example.com", "/a"));
+        respond(&store, &get_api, 200, "application/json");
+        let post_api = store.create(init("POST", "api.example.com", "/b"));
+        respond(&store, &post_api, 201, "application/json");
+        let get_cdn = store.create(init("GET", "cdn.example.com", "/c"));
+        respond(&store, &get_cdn, 200, "image/png");
+        let put_other = store.create(init("PUT", "other.net", "/d"));
+        respond(&store, &put_other, 200, "text/plain");
+
+        // Multiple methods are OR.
+        let (page, total) = store.query(&FlowQuery {
+            methods: vec!["GET".into(), "PUT".into()],
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 3);
+        let ids: Vec<_> = page.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&get_api.as_str()));
+        assert!(ids.contains(&get_cdn.as_str()));
+        assert!(ids.contains(&put_other.as_str()));
+        assert!(!ids.contains(&post_api.as_str()));
+
+        // Exact host (no wildcard).
+        let (page, total) = store.query(&FlowQuery {
+            hosts: vec!["api.example.com".into()],
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2);
+        assert!(page.iter().all(|f| f.authority == "api.example.com"));
+
+        // Hosts OR + methods AND across dimensions.
+        let (page, total) = store.query(&FlowQuery {
+            hosts: vec!["api.example.com".into(), "cdn.example.com".into()],
+            methods: vec!["get".into()],
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2);
+        let ids: Vec<_> = page.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&get_api.as_str()));
+        assert!(ids.contains(&get_cdn.as_str()));
+
+        // host + method + status + search all AND together.
+        let (page, total) = store.query(&FlowQuery {
+            hosts: vec!["*.example.com".into()],
+            methods: vec!["POST".into()],
+            status_range: Some((200, 299)),
+            search: Some("/b".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(page[0].id, post_api);
+    }
+
+    #[test]
+    fn query_search_matches_method_and_blank_search_is_a_noop() {
+        let store = FlowStore::new(100, 1024, 4096);
+        let get = store.create(init("GET", "api.example.com", "/a"));
+        respond(&store, &get, 200, "application/json");
+        let delete = store.create(init("DELETE", "api.example.com", "/b"));
+        respond(&store, &delete, 204, "text/plain");
+
+        let (page, total) = store.query(&FlowQuery {
+            search: Some("delete".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1, "search matches the method token");
+        assert_eq!(page[0].id, delete);
+
+        let (_, total) = store.query(&FlowQuery {
+            search: Some("   ".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "whitespace-only search does not filter");
+
+        let (_, total) = store.query(&FlowQuery {
+            search: Some("".into()),
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2, "empty search does not filter");
+    }
+
+    #[test]
+    fn query_kinds_filter_http_vs_websocket() {
+        let store = FlowStore::new(100, 1024, 4096);
+        let http = store.create(init("GET", "api.example.com", "/http"));
+        respond(&store, &http, 200, "application/json");
+
+        let mut ws_init = init("GET", "ws.example.com", "/socket");
+        ws_init.kind = FlowKind::Websocket;
+        let ws = store.create(ws_init);
+
+        let mut tunnel_init = init("CONNECT", "proxy.example.com", ":443");
+        tunnel_init.kind = FlowKind::Tunnel;
+        let tunnel = store.create(tunnel_init);
+
+        let (page, total) = store.query(&FlowQuery {
+            kinds: vec![FlowKind::Websocket],
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(page[0].id, ws);
+
+        let (page, total) = store.query(&FlowQuery {
+            kinds: vec![FlowKind::Http, FlowKind::Tunnel],
+            ..FlowQuery::default()
+        });
+        assert_eq!(total, 2);
+        let ids: Vec<_> = page.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&http.as_str()));
+        assert!(ids.contains(&tunnel.as_str()));
+        assert!(!ids.contains(&ws.as_str()));
     }
 
     #[test]

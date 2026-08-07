@@ -17,7 +17,7 @@ use hyper_util::rt::TokioIo;
 use proxima::ca::CertAuthority;
 use proxima::capture::FlowStore;
 use proxima::config::{
-    Config, DecryptMode, DecryptRules, HeaderEdit, RewriteRule, RewriteRules,
+    Config, DecryptMode, DecryptRules, HeaderEdit, MockResponse, RewriteRule, RewriteRules,
 };
 use proxima::proxy::{ProxyDeps, ProxyServer, SetupHandler};
 use proxima::types::{FlowKind, FlowState};
@@ -79,7 +79,7 @@ async fn start_with(deny: Vec<String>, rewrite: RewriteRules) -> Harness {
             allow: Vec::new(),
             deny,
         },
-        rewrite,
+        rewrite: rewrite.clone(),
         ..Config::default()
     });
 
@@ -88,6 +88,8 @@ async fn start_with(deny: Vec<String>, rewrite: RewriteRules) -> Harness {
         config.max_body_bytes,
         config.max_total_body_bytes,
     ));
+    // Live traffic reads RewriteHub, not Config.rewrite; seed the hub the same
+    // way runtime does so start_with rules actually take effect.
     let deps = Arc::new(ProxyDeps {
         upstream: proxima::proxy::forward::Upstream::new(&config).expect("upstream"),
         config: config.clone(),
@@ -97,7 +99,7 @@ async fn start_with(deny: Vec<String>, rewrite: RewriteRules) -> Harness {
         ws_registry: Arc::new(proxima::proxy::websocket::WsRegistry::new()),
         pauses: Arc::new(proxima::proxy::breakpoint::PauseHub::new()),
         ws_rewrite: proxima::proxy::ws_rewrite::WsRewriteHub::empty(),
-        rewrite: proxima::proxy::rewrite::RewriteHub::empty(),
+        rewrite: proxima::proxy::rewrite::RewriteHub::new(rewrite),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -447,6 +449,195 @@ async fn a_mapped_host_is_answered_by_the_target_while_still_being_addressed_as_
             .any(|note| note.contains(&format!("127.0.0.1:{}", origin_addr.port()))),
         "nothing on the flow says where the request actually went: {:?}",
         flow.rewrites
+    );
+}
+
+/// Map-local answers from the rule without dialling the origin. Status, body,
+/// headers, Flow.mocked, and rewrite notes are the product surface.
+#[tokio::test]
+async fn a_matching_mock_answers_without_dialling_the_origin() {
+    let harness = start_with(
+        Vec::new(),
+        RewriteRules {
+            rules: vec![RewriteRule {
+                path_prefix: Some("/hello".into()),
+                // Dead target: if the proxy dialled instead of mocking, the
+                // request would fail. Mock must win before any dial.
+                to: Some(proxima::config::DialTarget {
+                    host: "127.0.0.1".into(),
+                    port: Some(1),
+                }),
+                mock: Some(MockResponse {
+                    status: 418,
+                    headers: vec![("x-map-local".into(), "yes".into())],
+                    body: Some("from map local".into()),
+                    body_file: None,
+                }),
+                ..RewriteRule::default()
+            }],
+        },
+    )
+    .await;
+
+    let response = client(&harness)
+        .get(harness.origin_url("/hello"))
+        .send()
+        .await
+        .expect("request through the proxy");
+
+    assert_eq!(
+        response.status(),
+        418,
+        "the client must see the configured mock status, not an origin answer"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-map-local")
+            .map(|v| v.to_str().unwrap()),
+        Some("yes"),
+        "configured mock headers must reach the client"
+    );
+    assert_eq!(
+        response.text().await.expect("body"),
+        "from map local",
+        "the client must get the mock body, not the origin's"
+    );
+
+    settle().await;
+    let flows = harness.store.all(&Default::default());
+    let flow = flows
+        .iter()
+        .find(|f| f.request.path == "/hello")
+        .expect("the mocked request was never captured");
+
+    assert!(
+        flow.mocked,
+        "a map-local answer must mark the flow so it is not mistaken for origin traffic"
+    );
+    assert_eq!(flow.state, FlowState::Complete);
+    assert_eq!(flow.kind, FlowKind::Http);
+    let recorded = flow.response.as_ref().expect("no response recorded");
+    assert_eq!(recorded.status, 418);
+    assert!(
+        flow.rewrites
+            .iter()
+            .any(|note| note.to_ascii_lowercase().contains("mock")
+                || note.to_ascii_lowercase().contains("map local")),
+        "rewrite notes must say the response was mocked / map local: {:?}",
+        flow.rewrites
+    );
+    let body = recorded.body.as_ref().expect("no response body captured");
+    assert_eq!(
+        harness.store.bodies().read(&body.id).as_deref(),
+        Some(&b"from map local"[..]),
+        "the capture must store the mock body"
+    );
+}
+
+/// Two matching mocks: last rule wins, same stacking as dial targets.
+#[tokio::test]
+async fn the_last_matching_mock_wins() {
+    let harness = start_with(
+        Vec::new(),
+        RewriteRules {
+            rules: vec![
+                RewriteRule {
+                    path_prefix: Some("/hello".into()),
+                    mock: Some(MockResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: Some("first mock".into()),
+                        body_file: None,
+                    }),
+                    ..RewriteRule::default()
+                },
+                RewriteRule {
+                    path_prefix: Some("/hello".into()),
+                    mock: Some(MockResponse {
+                        status: 201,
+                        headers: Vec::new(),
+                        body: Some("second mock".into()),
+                        body_file: None,
+                    }),
+                    ..RewriteRule::default()
+                },
+            ],
+        },
+    )
+    .await;
+
+    let response = client(&harness)
+        .get(harness.origin_url("/hello"))
+        .send()
+        .await
+        .expect("request through the proxy");
+
+    assert_eq!(response.status(), 201, "later mock rules override earlier ones");
+    assert_eq!(
+        response.text().await.expect("body"),
+        "second mock",
+        "the last matching mock body must be the one served"
+    );
+
+    settle().await;
+    let flow = harness
+        .store
+        .all(&Default::default())
+        .into_iter()
+        .find(|f| f.request.path == "/hello")
+        .expect("flow");
+    assert!(flow.mocked);
+    assert_eq!(
+        flow.response.as_ref().map(|r| r.status),
+        Some(201),
+        "capture must record the winning mock"
+    );
+}
+
+/// A path that no mock covers still reaches the origin.
+#[tokio::test]
+async fn traffic_that_matches_no_mock_still_dials_the_origin() {
+    let harness = start_with(
+        Vec::new(),
+        RewriteRules {
+            rules: vec![RewriteRule {
+                path_prefix: Some("/only-this".into()),
+                mock: Some(MockResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Some("should not appear".into()),
+                    body_file: None,
+                }),
+                ..RewriteRule::default()
+            }],
+        },
+    )
+    .await;
+
+    let response = client(&harness)
+        .get(harness.origin_url("/hello"))
+        .send()
+        .await
+        .expect("request through the proxy");
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.expect("body"),
+        "hello from the origin",
+        "non-matching traffic must still be forwarded"
+    );
+
+    settle().await;
+    let flow = harness
+        .store
+        .all(&Default::default())
+        .into_iter()
+        .find(|f| f.request.path == "/hello")
+        .expect("flow");
+    assert!(
+        !flow.mocked,
+        "a real origin answer must not be marked mocked"
     );
 }
 

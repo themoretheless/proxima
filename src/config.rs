@@ -101,6 +101,50 @@ fn default_mock_status() -> u16 {
     200
 }
 
+/// Default max body size eligible for rewrite when [`BodyRewrite::max_bytes`] is 0.
+pub const DEFAULT_BODY_REWRITE_MAX_BYTES: u64 = 1_048_576;
+
+/// One find/replace on a UTF-8 text surface. Literal match (not regex) for MVP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextReplace {
+    pub find: String,
+    pub replace: String,
+}
+
+/// Body rewrites for one half. Applied only when the collected body length is
+/// at most `max_bytes` (default 1 MiB via [`DEFAULT_BODY_REWRITE_MAX_BYTES`]).
+/// Oversize bodies are left unchanged with a note from the apply site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyRewrite {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replacements: Vec<TextReplace>,
+    /// Max body size eligible for rewrite. Default 1 MiB. Zero means use default.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_bytes: u64,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl BodyRewrite {
+    /// True when there are no find/replace pairs to apply.
+    pub fn is_noop(&self) -> bool {
+        self.replacements.is_empty()
+    }
+
+    /// Effective size gate: zero means [`DEFAULT_BODY_REWRITE_MAX_BYTES`].
+    pub fn effective_max_bytes(&self) -> u64 {
+        if self.max_bytes == 0 {
+            DEFAULT_BODY_REWRITE_MAX_BYTES
+        } else {
+            self.max_bytes
+        }
+    }
+}
+
 /// A match and the edits to make when it matches.
 ///
 /// Every condition left empty matches everything, so a rule with no conditions
@@ -126,6 +170,18 @@ pub struct RewriteRule {
     /// Map local / mock: answer without dialling the origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mock: Option<MockResponse>,
+    /// Literal find/replace on the path+query string (as sent).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_replacements: Vec<TextReplace>,
+    /// Literal find/replace on the query string only, when a query is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_replacements: Vec<TextReplace>,
+    /// Request body find/replace, gated by [`BodyRewrite::max_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<BodyRewrite>,
+    /// Response body find/replace, gated by [`BodyRewrite::max_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<BodyRewrite>,
 }
 
 impl RewriteRule {
@@ -156,6 +212,24 @@ impl RewriteRule {
             && self.response_headers.is_empty()
             && self.to.is_none()
             && self.mock.is_none()
+            && self.path_replacements.is_empty()
+            && self.query_replacements.is_empty()
+            && self.request_body.as_ref().is_none_or(BodyRewrite::is_noop)
+            && self.response_body.as_ref().is_none_or(BodyRewrite::is_noop)
+    }
+
+    /// True when this rule would rewrite the request body.
+    pub fn has_request_body_rewrite(&self) -> bool {
+        self.request_body
+            .as_ref()
+            .is_some_and(|body| !body.is_noop())
+    }
+
+    /// True when this rule would rewrite the response body.
+    pub fn has_response_body_rewrite(&self) -> bool {
+        self.response_body
+            .as_ref()
+            .is_some_and(|body| !body.is_noop())
     }
 }
 
@@ -213,6 +287,20 @@ impl RewriteRules {
         self.matching(host, method, path)
             .filter_map(|rule| rule.mock.as_ref())
             .last()
+    }
+
+    /// True when any matching rule would rewrite the request body, so the
+    /// forward path must collect it instead of streaming.
+    pub fn has_request_body_rewrite(&self, host: &str, method: &str, path: &str) -> bool {
+        self.matching(host, method, path)
+            .any(|rule| rule.request_body.as_ref().is_some_and(|b| !b.is_noop()))
+    }
+
+    /// True when any matching rule would rewrite the response body, so the
+    /// forward path must collect it instead of streaming.
+    pub fn has_response_body_rewrite(&self, host: &str, method: &str, path: &str) -> bool {
+        self.matching(host, method, path)
+            .any(|rule| rule.response_body.as_ref().is_some_and(|b| !b.is_noop()))
     }
 }
 
@@ -2061,6 +2149,296 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.ws_rewrite.is_empty());
         assert!(cfg.ws_rewrite.rules.is_empty());
+    }
+
+    #[test]
+    fn mock_response_last_matching_rule_wins() {
+        let rules = RewriteRules {
+            rules: vec![
+                RewriteRule {
+                    path_prefix: Some("/api".into()),
+                    mock: Some(MockResponse {
+                        status: 200,
+                        headers: Vec::new(),
+                        body: Some("first".into()),
+                        body_file: None,
+                    }),
+                    ..RewriteRule::default()
+                },
+                RewriteRule {
+                    path_prefix: Some("/api".into()),
+                    mock: Some(MockResponse {
+                        status: 503,
+                        headers: vec![("x-mock".into(), "second".into())],
+                        body: Some("second".into()),
+                        body_file: None,
+                    }),
+                    ..RewriteRule::default()
+                },
+                // Matches host but no mock: must not clear the previous mock.
+                RewriteRule {
+                    hosts: vec!["api.example.com".into()],
+                    to: Some(DialTarget {
+                        host: "127.0.0.1".into(),
+                        port: Some(9),
+                    }),
+                    ..RewriteRule::default()
+                },
+            ],
+        };
+
+        let mock = rules
+            .mock_response("api.example.com", "GET", "/api/users")
+            .expect("a mock");
+        assert_eq!(mock.status, 503);
+        assert_eq!(mock.body.as_deref(), Some("second"));
+        assert_eq!(
+            mock.headers,
+            vec![("x-mock".into(), "second".into())],
+            "last matching mock carries its own headers"
+        );
+
+        assert!(
+            rules
+                .mock_response("api.example.com", "GET", "/other")
+                .is_none(),
+            "path that matches no mock rule must not invent one"
+        );
+        assert!(
+            rules
+                .mock_response("other.net", "GET", "/api/users")
+                .is_some(),
+            "rules without host conditions still apply"
+        );
+    }
+
+    #[test]
+    fn mock_response_respects_host_method_and_path() {
+        let rules = RewriteRules {
+            rules: vec![RewriteRule {
+                hosts: vec!["*.example.com".into()],
+                methods: vec!["POST".into()],
+                path_prefix: Some("/v1/".into()),
+                mock: Some(MockResponse {
+                    status: 201,
+                    headers: Vec::new(),
+                    body: Some("created".into()),
+                    body_file: None,
+                }),
+                ..RewriteRule::default()
+            }],
+        };
+
+        assert!(rules
+            .mock_response("api.example.com", "POST", "/v1/items")
+            .is_some());
+        assert!(
+            rules
+                .mock_response("api.other.net", "POST", "/v1/items")
+                .is_none(),
+            "host"
+        );
+        assert!(
+            rules
+                .mock_response("api.example.com", "GET", "/v1/items")
+                .is_none(),
+            "method"
+        );
+        assert!(
+            rules
+                .mock_response("api.example.com", "POST", "/v2/items")
+                .is_none(),
+            "path"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_only_mock_is_not_noop() {
+        assert!(RewriteRule::default().is_noop());
+        assert!(!RewriteRule {
+            mock: Some(MockResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Some("x".into()),
+                body_file: None,
+            }),
+            ..RewriteRule::default()
+        }
+        .is_noop());
+    }
+
+    #[test]
+    fn body_path_query_rewrite_is_noop() {
+        assert!(RewriteRule::default().is_noop());
+        assert!(
+            RewriteRule {
+                request_body: Some(BodyRewrite::default()),
+                response_body: Some(BodyRewrite {
+                    replacements: Vec::new(),
+                    max_bytes: 4096,
+                }),
+                ..RewriteRule::default()
+            }
+            .is_noop(),
+            "empty body replacement lists are still noop"
+        );
+        assert!(!RewriteRule {
+            path_replacements: vec![TextReplace {
+                find: "/a".into(),
+                replace: "/b".into(),
+            }],
+            ..RewriteRule::default()
+        }
+        .is_noop());
+        assert!(!RewriteRule {
+            query_replacements: vec![TextReplace {
+                find: "x=1".into(),
+                replace: "x=2".into(),
+            }],
+            ..RewriteRule::default()
+        }
+        .is_noop());
+        assert!(!RewriteRule {
+            request_body: Some(BodyRewrite {
+                replacements: vec![TextReplace {
+                    find: "old".into(),
+                    replace: "new".into(),
+                }],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        }
+        .is_noop());
+        assert!(!RewriteRule {
+            response_body: Some(BodyRewrite {
+                replacements: vec![TextReplace {
+                    find: "a".into(),
+                    replace: "b".into(),
+                }],
+                max_bytes: 1024,
+            }),
+            ..RewriteRule::default()
+        }
+        .is_noop());
+        assert!(
+            BodyRewrite {
+                replacements: Vec::new(),
+                max_bytes: 0,
+            }
+            .is_noop()
+        );
+        assert_eq!(
+            BodyRewrite::default().effective_max_bytes(),
+            DEFAULT_BODY_REWRITE_MAX_BYTES
+        );
+        assert_eq!(
+            BodyRewrite {
+                replacements: Vec::new(),
+                max_bytes: 99,
+            }
+            .effective_max_bytes(),
+            99
+        );
+    }
+
+    #[test]
+    fn mock_response_serde_uses_camel_case() {
+        let rule = RewriteRule {
+            path_prefix: Some("/local".into()),
+            mock: Some(MockResponse {
+                status: 404,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: Some("missing".into()),
+                body_file: Some("/tmp/fixture.json".into()),
+            }),
+            ..RewriteRule::default()
+        };
+        let json = serde_json::to_value(&rule).expect("serialize");
+        assert_eq!(json["pathPrefix"], "/local");
+        assert_eq!(json["mock"]["status"], 404);
+        assert_eq!(json["mock"]["body"], "missing");
+        assert_eq!(json["mock"]["bodyFile"], "/tmp/fixture.json");
+        assert_eq!(
+            json["mock"]["headers"],
+            serde_json::json!([["content-type", "text/plain"]])
+        );
+
+        let back: RewriteRule = serde_json::from_value(json).expect("parse");
+        assert_eq!(back, rule);
+
+        // Omitted status defaults to 200 so a body-only map-local is valid JSON.
+        let partial: MockResponse = serde_json::from_str(r#"{"body":"hi"}"#).expect("partial");
+        assert_eq!(partial.status, 200);
+        assert_eq!(partial.body.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn body_path_query_rewrite_serde_camel_case() {
+        let rule = RewriteRule {
+            path_replacements: vec![TextReplace {
+                find: "/v1/".into(),
+                replace: "/v2/".into(),
+            }],
+            query_replacements: vec![TextReplace {
+                find: "token=old".into(),
+                replace: "token=new".into(),
+            }],
+            request_body: Some(BodyRewrite {
+                replacements: vec![TextReplace {
+                    find: "\"role\":\"user\"".into(),
+                    replace: "\"role\":\"admin\"".into(),
+                }],
+                max_bytes: 2048,
+            }),
+            response_body: Some(BodyRewrite {
+                replacements: vec![TextReplace {
+                    find: "error".into(),
+                    replace: "ok".into(),
+                }],
+                max_bytes: 0,
+            }),
+            ..RewriteRule::default()
+        };
+
+        let json = serde_json::to_value(&rule).expect("serialize");
+        assert_eq!(json["pathReplacements"][0]["find"], "/v1/");
+        assert_eq!(json["pathReplacements"][0]["replace"], "/v2/");
+        assert_eq!(json["queryReplacements"][0]["find"], "token=old");
+        assert_eq!(json["queryReplacements"][0]["replace"], "token=new");
+        assert_eq!(json["requestBody"]["maxBytes"], 2048);
+        assert_eq!(
+            json["requestBody"]["replacements"][0]["find"],
+            "\"role\":\"user\""
+        );
+        assert_eq!(json["responseBody"]["replacements"][0]["replace"], "ok");
+        assert!(
+            json["responseBody"].get("maxBytes").is_none(),
+            "zero maxBytes is omitted on the wire"
+        );
+
+        let back: RewriteRule = serde_json::from_value(json).expect("parse");
+        assert_eq!(back, rule);
+
+        // Empty rule omits the new fields; defaults stay empty / None.
+        let empty = serde_json::to_value(RewriteRule::default()).expect("empty");
+        assert!(empty.get("pathReplacements").is_none());
+        assert!(empty.get("queryReplacements").is_none());
+        assert!(empty.get("requestBody").is_none());
+        assert!(empty.get("responseBody").is_none());
+
+        let partial: RewriteRule =
+            serde_json::from_str(r#"{"pathReplacements":[{"find":"a","replace":"b"}]}"#)
+                .expect("partial");
+        assert_eq!(partial.path_replacements.len(), 1);
+        assert!(partial.query_replacements.is_empty());
+        assert!(partial.request_body.is_none());
+        assert!(partial.response_body.is_none());
+
+        let body_only: BodyRewrite =
+            serde_json::from_str(r#"{"replacements":[{"find":"x","replace":"y"}]}"#)
+                .expect("body");
+        assert_eq!(body_only.max_bytes, 0);
+        assert_eq!(body_only.effective_max_bytes(), DEFAULT_BODY_REWRITE_MAX_BYTES);
     }
 
     #[test]
