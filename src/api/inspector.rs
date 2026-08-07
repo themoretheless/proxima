@@ -529,7 +529,10 @@ main.rewriting.flat > #rewriter { grid-column: 1; }
 }
 .gline:hover { background: var(--hover); }
 .gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
-.twist { flex: none; width: .9rem; color: var(--dim); text-align: center; }
+.twist {
+  flex: none; width: 1.2rem; color: var(--dim); text-align: center;
+  cursor: pointer; line-height: 1.4;
+}
 .gname {
   flex: 1; min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
@@ -1111,7 +1114,9 @@ const SCRIPT: &str = r#"
     // Two jobs on one row, so the first has to keep the click to itself.
     twist.addEventListener('click', function (event) {
       event.stopPropagation();
-      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+      event.preventDefault();
+      var closed = box.classList.toggle('shut');
+      twist.textContent = closed ? '▸' : '▾';
     });
     line.addEventListener('click', function () { scopeTo(key); });
 
@@ -1246,7 +1251,7 @@ const SCRIPT: &str = r#"
     strip(treeEl);
     groups.clear();
     branches.clear();
-    if (scope) { scopeTo(scope); }
+    if (scope) { scopeTo(scope, false); }
     // One pass: what a row is seated under and whether it shows are decisions
     // about that row alone, so neither waits on the rest of them.
     rows.forEach(function (row, id) {
@@ -1326,7 +1331,7 @@ const SCRIPT: &str = r#"
       if (rec.el.parentNode) { rec.el.parentNode.removeChild(rec.el); }
       groups.delete(rec.key);
       // The list cannot stay narrowed to a branch that is no longer there.
-      if (rec.key === scope) { scopeTo(scope); }
+      if (rec.key === scope) { scopeTo(scope, false); }
       rec = rec.parent;
     }
   }
@@ -1340,9 +1345,28 @@ const SCRIPT: &str = r#"
     return held.key === scope || held.key.indexOf(scope + '/') === 0;
   }
 
-  function scopeTo(key) {
+  // `fromUser` (default true): leave the composer seat so #list is visible.
+  // Internal callers (prune / regroup) pass false; they only fix scope state.
+  function scopeTo(key, fromUser) {
+    if (fromUser !== false) {
+      // Picking a host/path is going back to live traffic. Composer / breaker /
+      // rewrite hide #list; without leaving them the tree looks broken: scope
+      // changes and nothing appears beside it.
+      composing(false);
+      breaking(false);
+      rewriting(false);
+    }
+
     scope = scope === key ? '' : key;
-    groups.forEach(function (rec) { rec.line.classList.toggle('picked', rec.key === scope); });
+    groups.forEach(function (rec) {
+      rec.line.classList.toggle('picked', rec.key === scope);
+      // A branch that is the scope should be open so its children are visible.
+      if (rec.key === scope) {
+        rec.el.classList.remove('shut');
+        var tw = rec.line.querySelector('.twist');
+        if (tw) { tw.textContent = '▾'; }
+      }
+    });
     scopeEl.classList.toggle('idle', scope === '');
     scopeNameEl.textContent = scope;
     rows.forEach(function (row, id) { filterRow(row, id); });
@@ -1417,7 +1441,20 @@ const SCRIPT: &str = r#"
     detailEl.appendChild(el('p', 'hint', text));
   }
 
-  async function select(id) {
+  // `showLive` (default true): leave the composer / breakpoints / rewrite
+  // seats so #list and #detail are visible again. Automatic redraws of the
+  // open flow pass false, so a background update does not yank the composer
+  // closed under someone who just opened a saved request.
+  async function select(id, showLive) {
+    if (showLive !== false) {
+      // Live traffic uses #list/#detail. Those are display:none while composer
+      // (or breaker/rewriter) owns the seat; without this a click on a capture
+      // after opening a saved request looks like it does nothing.
+      composing(false);
+      breaking(false);
+      rewriting(false);
+    }
+
     // Both views carry the selection, so switching between them keeps it.
     if (selectedId) { highlight(selectedId, false); }
     selectedId = id;
@@ -2344,7 +2381,7 @@ const SCRIPT: &str = r#"
       // only appeared if you happened to click away and back.
       if (event.flow && event.flow.id === selectedId &&
           signature(event.flow) !== rendered) {
-        select(selectedId);
+        select(selectedId, false);
       }
       return;
     }
@@ -2427,7 +2464,7 @@ const SCRIPT: &str = r#"
     queue = null;
     for (var j = 0; j < pending.length; j++) { apply(pending[j]); }
     tally();
-    if (reopen && rows.has(reopen)) { select(reopen); }
+    if (reopen && rows.has(reopen)) { select(reopen, false); }
   }
 
   /* ---------------------------------------------------------------- */
@@ -3293,6 +3330,14 @@ const SCRIPT: &str = r#"
     line.appendChild(twist);
     line.appendChild(el('span', 'gname', label));
     line.appendChild(el('span', 'gcount', String(held.length)));
+    // Same split as the live tree: twist folds, the rest of the line does not
+    // also have to; a full-line toggle made the chevron feel broken next to
+    // other click targets on the row.
+    twist.addEventListener('click', function (event) {
+      event.stopPropagation();
+      event.preventDefault();
+      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+    });
     line.addEventListener('click', function () {
       twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
     });
@@ -3327,7 +3372,16 @@ const SCRIPT: &str = r#"
     });
     line.appendChild(kill);
 
-    line.addEventListener('click', function () {
+    twist.addEventListener('click', function (event) {
+      event.stopPropagation();
+      event.preventDefault();
+      twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
+    });
+    line.addEventListener('click', function (event) {
+      // Kill has its own handler; other clicks on the bar fold the collection.
+      if (event.target && event.target.classList && event.target.classList.contains('kill')) {
+        return;
+      }
       twist.textContent = box.classList.toggle('shut') ? '▸' : '▾';
     });
 
@@ -4981,7 +5035,7 @@ mod tests {
         for line in [
             "if (event.flow && event.flow.id === selectedId &&",
             "signature(event.flow) !== rendered) {",
-            "select(selectedId);",
+            "select(selectedId, false);",
             "rendered = signature(summaries.get(id));",
             "summaries.set(flow.id, flow);",
         ] {
@@ -5014,7 +5068,7 @@ mod tests {
     fn resynchronising_the_list_reopens_whatever_was_selected() {
         for line in [
             "var reopen = selectedId;",
-            "if (reopen && rows.has(reopen)) { select(reopen); }",
+            "if (reopen && rows.has(reopen)) { select(reopen, false); }",
         ] {
             assert!(
                 SCRIPT.contains(line),
