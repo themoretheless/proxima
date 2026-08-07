@@ -872,8 +872,9 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 }
 .chip:hover { background: var(--hover); color: var(--ink); }
 .chip.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
+/* Pin sits just left of the fixed count rail (same right edge for every row). */
 .star {
-  position: sticky; right: 0; z-index: 2;
+  position: sticky; right: 2.75rem; z-index: 2;
   flex: none; visibility: hidden; padding: 0 2px; cursor: default;
   background: var(--bg); border: none; color: var(--dim); font: inherit; font-size: 11px;
 }
@@ -969,16 +970,21 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
   color: var(--dim); white-space: nowrap;
 }
 .group.host > .gline > .gname { color: var(--ink); }
+/* Fixed-width sticky rail flush to the tree's right edge. Same width + right:0
+   + text-align:right for every row so 3 and 54 share one vertical line of digits. */
 .gcount {
   position: sticky; right: 0; z-index: 1;
   flex: none; margin-left: auto;
-  padding: 0 6px 0 10px;
+  box-sizing: border-box;
+  width: 2.75rem; min-width: 2.75rem; max-width: 2.75rem;
+  padding: 0 8px 0 6px;
   color: var(--dim); font-size: 11px;
-  white-space: nowrap;
+  white-space: nowrap; text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
   background: var(--bg);
   box-shadow: -10px 0 8px -2px var(--bg);
 }
-.gline:has(> .star) > .gcount { right: 1.25rem; }
 .gline:hover > .gcount {
   background: var(--hover);
   box-shadow: -10px 0 8px -2px var(--hover);
