@@ -20,6 +20,7 @@ pub mod api;
 pub mod ca;
 pub mod capture;
 pub mod config;
+pub mod json_view;
 pub mod proxy;
 pub mod replay;
 pub mod runtime;

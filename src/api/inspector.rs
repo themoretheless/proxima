@@ -178,15 +178,69 @@ const BODY: &str = r#"<header>
         <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option>
         <option>DELETE</option><option>HEAD</option><option>OPTIONS</option>
       </select>
-      <input id="c-url" type="text" spellcheck="false" autocomplete="off"
-             placeholder="https://api.example.com/v1/thing" aria-label="URL">
+      <div class="url-field">
+        <div id="c-url-mirror" class="url-mirror mono" aria-hidden="true"></div>
+        <input id="c-url" type="text" spellcheck="false" autocomplete="off"
+               placeholder="https://api.example.com/v1/thing" aria-label="URL">
+      </div>
       <button id="c-send" class="btn" type="button">Send</button>
     </div>
-    <label class="c-label" for="c-headers">Headers, one per line, as Name: value</label>
-    <textarea id="c-headers" spellcheck="false" placeholder="content-type: application/json"></textarea>
-    <label class="c-label" for="c-body">Body</label>
-    <textarea id="c-body" spellcheck="false"></textarea>
-    <div id="c-out"></div>
+    <section class="c-fold" id="c-params-wrap">
+      <button type="button" class="c-fold-bar" id="c-params-toggle"
+              aria-expanded="true" aria-controls="c-params-panel">
+        <span class="twist">▾</span>
+        <span class="c-fold-name">Query parameters</span>
+        <span class="c-fold-meta" id="c-params-meta"></span>
+      </button>
+      <div class="c-fold-body" id="c-params-panel">
+        <p class="c-params-hint hint" id="c-params-hint">Key/value rows rewrite the query string on the URL above. Uncheck a row to drop it from the URL without deleting it.</p>
+        <table class="c-params" id="c-params" aria-label="Query parameters">
+          <thead>
+            <tr>
+              <th class="c-params-on" title="Include in URL">On</th>
+              <th>Key</th>
+              <th>Value</th>
+              <th class="c-params-drop"></th>
+            </tr>
+          </thead>
+          <tbody id="c-params-body"></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="c-fold" id="c-headers-wrap">
+      <button type="button" class="c-fold-bar" id="c-headers-toggle"
+              aria-expanded="true" aria-controls="c-headers-panel">
+        <span class="twist">▾</span>
+        <span class="c-fold-name">Headers</span>
+        <span class="c-fold-meta" id="c-headers-meta"></span>
+      </button>
+      <div class="c-fold-body" id="c-headers-panel">
+        <label class="c-label" for="c-headers">One per line, as Name: value</label>
+        <textarea id="c-headers" spellcheck="false" placeholder="content-type: application/json"></textarea>
+      </div>
+    </section>
+    <section class="c-fold" id="c-body-wrap">
+      <button type="button" class="c-fold-bar" id="c-body-toggle"
+              aria-expanded="true" aria-controls="c-body-panel">
+        <span class="twist">▾</span>
+        <span class="c-fold-name">Body</span>
+        <span class="c-fold-meta" id="c-body-meta"></span>
+      </button>
+      <div class="c-fold-body" id="c-body-panel">
+        <textarea id="c-body" spellcheck="false" aria-label="Body"></textarea>
+      </div>
+    </section>
+    <section class="c-fold" id="c-out-wrap">
+      <button type="button" class="c-fold-bar" id="c-out-toggle"
+              aria-expanded="true" aria-controls="c-out">
+        <span class="twist">▾</span>
+        <span class="c-fold-name">Response</span>
+        <span class="c-fold-meta" id="c-out-meta"></span>
+      </button>
+      <div class="c-fold-body" id="c-out">
+        <p class="hint">Send a request to see the response here.</p>
+      </div>
+    </section>
   </section>
   <section id="breaker" hidden>
     <p class="hint">Hold matching WebSocket frames or HTTP messages before they are forwarded. Rules are runtime-only and lost on restart. Empty hosts matches any host. For WebSocket, by default only text and binary frames pause; ping, pong and close keep flowing so keepalive and the close handshake do not stall. For HTTP, empty methods matches any method. Injected frames skip breakpoints.</p>
@@ -435,20 +489,182 @@ main.archiving.flat > #archiver { grid-column: 1; }
   overflow: auto; min-height: 0; padding: 12px 14px 40px;
   display: flex; flex-direction: column; gap: 8px;
 }
+/* Composer: method/url keep a little inset; folds go edge-to-edge so headers
+   and body use the full pane width instead of a default-sized textarea island. */
+#composer {
+  padding: 8px 0 20px; gap: 0;
+}
+#composer > .c-line {
+  padding: 4px 10px 6px; gap: 8px;
+}
 .c-line { display: flex; gap: 8px; flex-wrap: wrap; }
-#c-url { flex: 1; min-width: 0; }
+/* Coloured URL: a mirror of spans sits under a transparent input so the caret
+   and edits stay on a real field while scheme/host/path/query paint in colour. */
+.url-field {
+  flex: 1; min-width: 0; display: grid; position: relative;
+  background: var(--field); border: 1px solid var(--line); border-radius: 7px;
+}
+.url-field:focus-within {
+  outline: 1px solid var(--accent); border-color: var(--accent);
+}
+.url-field > .url-mirror,
+.url-field > #c-url {
+  grid-area: 1 / 1; min-width: 0; width: 100%; box-sizing: border-box;
+  margin: 0; padding: 5px 9px; border: none; border-radius: 7px;
+  font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.45; white-space: pre; overflow: hidden;
+}
+.url-field > .url-mirror {
+  pointer-events: none; color: var(--ink); background: transparent;
+  /* Keep one line; scrollLeft is synced from the input. */
+  overflow-x: hidden; overflow-y: hidden;
+}
+.url-field > #c-url {
+  position: relative; z-index: 1;
+  color: transparent; -webkit-text-fill-color: transparent;
+  caret-color: var(--ink); background: transparent; outline: none;
+}
+.url-field > #c-url::placeholder {
+  color: var(--dim); -webkit-text-fill-color: var(--dim); opacity: 1;
+}
+/* Token colours for the URL mirror. Separators stay dim so keys and host read first. */
+.url-mirror .u-scheme { color: var(--dim); }
+.url-mirror .u-sep { color: var(--dim); }
+.url-mirror .u-user { color: var(--warn); }
+.url-mirror .u-host { color: var(--accent); }
+.url-mirror .u-port { color: var(--dim); }
+.url-mirror .u-path { color: var(--ink); }
+.url-mirror .u-key { color: var(--info); }
+.url-mirror .u-val { color: var(--good); }
+.url-mirror .u-frag { color: var(--warn); }
+.url-mirror .u-var { color: var(--warn); }
+/* Composer folds: full-bleed under the URL row. Bar on --card with accent
+   titles; editor body on --field so header and inputs are two clear layers. */
+.c-fold {
+  display: flex; flex-direction: column; gap: 0;
+  margin: 0; background: var(--field);
+  border: none; border-top: 1px solid var(--line); border-radius: 0;
+  overflow: hidden;
+}
+.c-fold-bar {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  margin: 0; padding: 7px 12px; cursor: default; text-align: left;
+  background: var(--card); border: none; border-bottom: 1px solid var(--line);
+  color: var(--ink); font: inherit;
+}
+.c-fold-bar:hover { background: var(--hover); }
+/* Same language as .shelf-name / .shelf > .twist in the tree column. */
+.c-fold-bar .twist { flex: none; font-size: 10px; color: var(--dim); width: 0.9rem; }
+.c-fold-name {
+  flex: none; color: var(--dim); font-size: 11px; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.c-fold-meta {
+  flex: 1; min-width: 0; color: var(--dim); font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+}
+.c-fold-body {
+  display: flex; flex-direction: column; gap: 0; padding: 0; min-width: 0;
+  background: var(--field);
+}
+.c-fold.shut > .c-fold-body { display: none; }
+.c-fold.shut > .c-fold-bar { border-bottom: none; }
+/* Query params table: Postman-style key/value rows that rewrite the URL query. */
+.c-params-hint { margin: 0; padding: 6px 12px; font-size: 12px; color: var(--dim); background: var(--field); }
+.c-params {
+  width: 100%; border-collapse: collapse; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--field); border: none; border-top: 1px solid var(--line);
+  border-radius: 0; table-layout: fixed;
+}
+.c-params th, .c-params td {
+  text-align: left; padding: 0; border-bottom: 1px solid var(--rule);
+  vertical-align: middle;
+}
+.c-params tr:last-child td { border-bottom: none; }
+.c-params th {
+  color: var(--info); font-size: 11px; font-weight: 700;
+  letter-spacing: .04em; text-transform: uppercase; white-space: nowrap;
+  padding: 6px 10px; background: var(--bg);
+}
+.c-params th.c-params-on, .c-params td.c-params-on { width: 2.6rem; text-align: center; padding: 0 4px; }
+.c-params th.c-params-drop, .c-params td.c-params-drop { width: 2.2rem; text-align: center; padding: 0 4px; }
+.c-params td input[type="text"] {
+  width: 100%; box-sizing: border-box; margin: 0; min-height: 32px;
+  background: var(--field); color: var(--ink); border: none; border-radius: 0;
+  padding: 7px 10px; font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.c-params td input[type="text"]:focus {
+  outline: none; background: var(--bg); box-shadow: inset 0 0 0 1px var(--accent);
+}
+.c-params td input[type="text"]::placeholder { color: var(--dim); opacity: 1; }
+.c-params td input[type="checkbox"] { margin: 0; width: 14px; height: 14px; cursor: default; accent-color: var(--accent); }
+.c-params .c-params-x {
+  height: 26px; width: 26px; padding: 0; border: none; border-radius: 6px;
+  background: none; color: var(--dim); font: inherit; font-size: 16px; line-height: 1; cursor: default;
+}
+.c-params .c-params-x:hover { color: var(--bad); background: var(--hover); }
+.c-params tr.off td input[type="text"] { color: var(--dim); background: var(--bg); }
+/* Read-only query breakdown on a captured request (Request tab). */
+.qparams { margin: 0 0 12px; }
+.qparams .headers { margin-top: 4px; }
+.qparams .hname { color: var(--info); }
+.qparams .hval { color: var(--good); }
 #composer select, #composer input, #composer textarea,
 #breaker select, #breaker input, #breaker textarea,
 #rewriter select, #rewriter input, #rewriter textarea,
 #httprewriter select, #httprewriter input, #httprewriter textarea {
-  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  background: var(--field); color: var(--ink); border: 1px solid var(--line);
   border-radius: 7px; padding: 5px 9px; font: inherit;
+}
+/* Method / name / book row: sit on the page bg so the field chips read clearly. */
+#composer > .c-line select, #composer > .c-line input {
+  background: var(--field); color: var(--ink); border-color: var(--line);
+}
+/* Fold editors span the pane: no default textarea island, no double chrome. */
+#composer .c-fold textarea {
+  display: block; width: 100%; min-width: 0; box-sizing: border-box;
+  margin: 0; border: none; border-top: 1px solid var(--line); border-radius: 0;
+  min-height: 7.5rem; resize: vertical;
+  background: var(--field); color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+#composer .c-fold textarea::placeholder { color: var(--dim); opacity: 1; }
+#composer .c-fold .c-label {
+  padding: 6px 12px 2px; margin: 0; color: var(--info);
+  background: var(--field);
+}
+#composer .c-fold #c-out {
+  padding: 10px 12px 14px; min-width: 0;
+  background: var(--field); color: var(--ink);
+}
+/* The URL field owns its own chrome (see .url-field); skip the shared input chrome. */
+#composer .url-field > #c-url {
+  background: transparent; color: transparent; border: none; border-radius: 7px;
+  padding: 5px 9px;
 }
 #composer select:focus, #composer input:focus, #composer textarea:focus,
 #breaker select:focus, #breaker input:focus, #breaker textarea:focus,
 #rewriter select:focus, #rewriter input:focus, #rewriter textarea:focus,
 #httprewriter select:focus, #httprewriter input:focus, #httprewriter textarea:focus {
   outline: 1px solid var(--accent); border-color: var(--accent);
+}
+#composer .c-fold textarea:focus {
+  outline: none; background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+#composer .url-field > #c-url:focus {
+  outline: none; border: none;
+}
+/* Param cells skip the shared composer input chrome (border/padding). */
+#composer .c-params td input[type="text"] {
+  background: var(--field); border: none; border-radius: 0; padding: 7px 10px;
+}
+#composer .c-params td input[type="text"]:focus {
+  outline: none; border: none; background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 /* Archive stats: canned report tables from GET /api/archive/stats. */
 .a-section { margin-bottom: 14px; }
@@ -656,8 +872,8 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 }
 .pad { margin: 0; padding: 10px 12px; font-size: 12px; }
 .sitem {
-  display: flex; gap: 6px; align-items: baseline; padding: 3px 8px 3px 12px;
-  cursor: default; font-size: 12px;
+  position: relative; display: flex; gap: 6px; align-items: baseline;
+  padding: 3px 8px 3px 12px; cursor: default; font-size: 12px;
 }
 .sitem:hover { background: var(--hover); }
 .smethod {
@@ -665,14 +881,23 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
 }
 .sname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* A control that destroys something should not be sitting under the pointer
-   before the pointer is anywhere near it. */
+/* Delete sits on top of the trailing text so rows do not reserve a kill column.
+   Hidden with opacity (not visibility) so the layout never pays for the control. */
 .kill {
-  flex: none; visibility: hidden; padding: 0 3px; cursor: default;
-  background: none; border: none; color: var(--dim); font: inherit; font-size: 13px;
+  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  z-index: 1; width: 1.35rem; height: 1.35rem; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: 0; pointer-events: none; cursor: default;
+  background: var(--hover); border: none; border-radius: 5px;
+  color: var(--dim); font: inherit; font-size: 13px; line-height: 1;
+  /* Soft edge so text under the mark still reads until hover. */
+  box-shadow: -8px 0 8px var(--hover);
 }
-.kill:hover { color: var(--bad); }
-.sitem:hover .kill, .gline:hover .kill { visibility: visible; }
+.kill:hover { color: var(--bad); background: var(--card); }
+.sitem:hover .kill, .gline:hover .kill {
+  opacity: 1; pointer-events: auto;
+}
+/* Collection rows also use .kill; gline is position:relative below. */
 /* Live rows drag into a collection via pointer drag (not HTML5 DnD: that
    forces a system grab hand we cannot style away). Arrow cursor throughout. */
 .row.dragging, .durl.dragging { opacity: .55; pointer-events: none; }
@@ -686,8 +911,8 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .gline {
-  display: flex; gap: 6px; align-items: baseline; padding: 3px 10px 3px 4px;
-  cursor: default; border-radius: 0 6px 6px 0;
+  position: relative; display: flex; gap: 6px; align-items: baseline;
+  padding: 3px 10px 3px 4px; cursor: default; border-radius: 0 6px 6px 0;
 }
 .gline:hover { background: var(--hover); }
 .gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
@@ -870,6 +1095,19 @@ pre.body, pre.copy {
 .inject.replay input[type="number"] { width: 6.5rem; }
 .frame.gap .dir { color: var(--dim); font-style: italic; }
 .frame.gap .meta { color: var(--dim); }
+/* JSON syntax paint from /api/json/view (themoretheless-tokenizer). Spans only. */
+.json .j-property { color: var(--info); }
+.json .j-string { color: var(--good); }
+.json .j-number { color: var(--accent); }
+.json .j-boolean { color: var(--warn); }
+.json .j-null { color: var(--dim); }
+.json .j-punctuation { color: var(--dim); }
+.json .j-comment { color: var(--dim); font-style: italic; }
+.json .j-whitespace { }
+.json .j-invalid { color: var(--bad); }
+pre.json, .text.json {
+  white-space: pre-wrap; word-break: break-word;
+}
 @media (max-width: 1000px) {
   /* The tree is the pane you can do without: the filter box narrows the same
      list without taking a column to do it. */
@@ -1927,10 +2165,36 @@ const SCRIPT: &str = r#"
       return box;
     }
     var half = which === 'response' ? response : request;
+    if (which === 'request') {
+      // Postman-style key/value breakdown of the request URL query string.
+      box.appendChild(queryParamsBlock(request.url));
+    }
     box.appendChild(headerBlock(
       which === 'response' ? 'Response headers' : 'Request headers', half.headers));
     box.appendChild(bodyBlock(flow.id, which, half.body));
     return box;
+  }
+
+  // Read-only table of query parameters for a captured request URL. Same
+  // header-grid language as Request headers so the two stacks match.
+  function queryParamsBlock(url) {
+    var block = el('section', 'block qparams');
+    block.appendChild(el('h2', null, 'Query parameters'));
+    var parts = splitUrlParts(str(url));
+    var rows = parseQueryString(parts.query);
+    if (!rows.length) {
+      block.appendChild(el('p', 'none', 'none'));
+      return block;
+    }
+    var grid = el('div', 'headers mono');
+    for (var i = 0; i < rows.length; i++) {
+      var line = el('div', 'hrow');
+      line.appendChild(el('span', 'hname', str(rows[i].key)));
+      line.appendChild(el('span', 'hval', str(rows[i].value)));
+      grid.appendChild(line);
+    }
+    block.appendChild(grid);
+    return block;
   }
 
   function facts(flow, request, response) {
@@ -2093,18 +2357,83 @@ const SCRIPT: &str = r#"
     }
     var cut = text.length > MAX_BODY_CHARS;
     if (cut) { text = text.slice(0, MAX_BODY_CHARS); }
-    into.textContent = indent(text, contentType) +
-      (cut ? '\n\n[stopped after ' + MAX_BODY_CHARS + ' characters]' : '');
+    var suffix = cut ? '\n\n[stopped after ' + MAX_BODY_CHARS + ' characters]' : '';
+    // JSON goes through the tokenizer (pretty + colour); other types stay plain.
+    if (wantsJsonView(text, contentType)) {
+      var view = await fetchJsonView(text);
+      if (view) {
+        paintJson(into, view);
+        if (suffix) { into.appendChild(document.createTextNode(suffix)); }
+        return;
+      }
+    }
+    into.textContent = text + suffix;
   }
 
-  // Reformatting JSON is worth it: most captured JSON arrives on one line.
-  function indent(text, contentType) {
-    if (!contentType || String(contentType).toLowerCase().indexOf('json') < 0) { return text; }
-    try {
-      return JSON.stringify(JSON.parse(text), null, 2);
-    } catch (error) {
-      return text;
+  // True when the body is worth sending to /api/json/view.
+  function wantsJsonView(text, contentType) {
+    if (contentType && String(contentType).toLowerCase().indexOf('json') >= 0) {
+      return true;
     }
+    var t = String(text || '').replace(/^\uFEFF/, '').replace(/^\s+/, '');
+    return t.charAt(0) === '{' || t.charAt(0) === '[';
+  }
+
+  // Cache short payloads so a list of similar frames does not hammer the API.
+  var jsonViewCache = new Map();
+  var JSON_VIEW_CACHE_MAX = 64;
+
+  async function fetchJsonView(text) {
+    var key = text.length <= 4096 ? text : null;
+    if (key && jsonViewCache.has(key)) { return jsonViewCache.get(key); }
+    try {
+      var response = await fetch('/api/json/view', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: text }),
+        cache: 'no-store'
+      });
+      if (!response.ok) { return null; }
+      var view = await response.json();
+      if (key) {
+        if (jsonViewCache.size >= JSON_VIEW_CACHE_MAX) {
+          jsonViewCache.delete(jsonViewCache.keys().next().value);
+        }
+        jsonViewCache.set(key, view);
+      }
+      return view;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  // Paint tokenizer tokens as spans. Never HTML: each run is textContent.
+  function paintJson(into, view) {
+    strip(into);
+    into.classList.add('json');
+    var tokens = view && Array.isArray(view.tokens) ? view.tokens : null;
+    if (!tokens || !tokens.length) {
+      into.textContent = view && view.text != null ? String(view.text) : '';
+      return;
+    }
+    for (var i = 0; i < tokens.length; i++) {
+      var tok = tokens[i];
+      var kind = str(tok && tok.kind).toLowerCase() || 'invalid';
+      into.appendChild(el('span', 'j-' + kind, tok && tok.text != null ? String(tok.text) : ''));
+    }
+  }
+
+  // Soft-view JSON from ?pretty=1 (tokens optional) or plain text fallback.
+  function paintSoftOrText(into, view, fallback) {
+    if (view && view.kind === 'json' && view.tokens) {
+      paintJson(into, view);
+      return;
+    }
+    if (view && view.text != null) {
+      into.textContent = String(view.text);
+      return;
+    }
+    into.textContent = fallback || '';
   }
 
   function frameBlock(id, messages, flow) {
@@ -2142,18 +2471,37 @@ const SCRIPT: &str = r#"
     return true;
   }
 
+  // Synchronous fallback when /api/json/view is not yet back. Search still
+  // uses raw message.text; only display goes through this.
   function displayText(message) {
     var raw = typeof message.text === 'string' ? message.text : null;
     if (raw === null) { return null; }
-    // Text frames only: pretty-print when the payload is JSON, else leave raw.
-    if (message.opcode === 1) {
-      try {
-        return JSON.stringify(JSON.parse(raw), null, 2);
-      } catch (error) {
-        return raw;
+    if (message.opcode === 1 && wantsJsonView(raw, null)) {
+      // Prefer a cached server pretty; else leave raw until paintJson fills in.
+      if (jsonViewCache.has(raw)) {
+        var held = jsonViewCache.get(raw);
+        return held && held.text != null ? String(held.text) : raw;
       }
+      return raw;
     }
     return raw;
+  }
+
+  function paintFramePayload(textEl, message) {
+    var raw = typeof message.text === 'string' ? message.text : null;
+    if (raw === null) { return; }
+    if (message.opcode === 1 && wantsJsonView(raw, null)) {
+      if (jsonViewCache.has(raw)) {
+        paintJson(textEl, jsonViewCache.get(raw));
+        return;
+      }
+      textEl.textContent = raw;
+      fetchJsonView(raw).then(function (view) {
+        if (view) { paintJson(textEl, view); }
+      });
+      return;
+    }
+    textEl.textContent = raw;
   }
 
   function renderFrames() {
@@ -2476,10 +2824,11 @@ const SCRIPT: &str = r#"
     if (message.compressed) { meta += ' wire'; }
     if (message.truncated && !gap) { meta += ', cut short'; }
     line.appendChild(el('span', 'meta', meta));
-    // Search raw text via matchesFrame; paint pretty JSON when it applies.
-    var shown = displayText(message);
-    if (typeof shown === 'string') {
-      line.appendChild(el('span', 'text', shown));
+    // Search raw text via matchesFrame; paint pretty/coloured JSON when it applies.
+    if (typeof message.text === 'string') {
+      var textEl = el('span', 'text');
+      line.appendChild(textEl);
+      paintFramePayload(textEl, message);
     } else if (message.bodyId && !gap) {
       // Large/binary frames store payload under bodyId; load on demand.
       var bodyEl = el('span', 'text body-pending', 'loading body…');
@@ -2491,7 +2840,7 @@ const SCRIPT: &str = r#"
         })
         .then(function (view) {
           bodyEl.className = 'text';
-          bodyEl.textContent = (view && view.text) ? String(view.text) : '(empty)';
+          paintSoftOrText(bodyEl, view, '(empty)');
           if (view && view.kind) {
             bodyEl.title = 'soft view: ' + view.kind + (view.note ? ' — ' + view.note : '');
           }
@@ -3907,13 +4256,574 @@ const SCRIPT: &str = r#"
   var composerEl = document.getElementById('composer');
   var composeBtn = document.getElementById('compose');
   var outEl = document.getElementById('c-out');
+  var urlIn = document.getElementById('c-url');
+  var urlMirror = document.getElementById('c-url-mirror');
+
+  /* Paint scheme, host, path and query parameters under the transparent URL
+     input. Spans only: captured or typed text never reaches the HTML parser. */
+  function paintUrlMirror() {
+    if (!urlMirror || !urlIn) { return; }
+    strip(urlMirror);
+    var text = urlIn.value;
+    if (!text) { return; }
+    var parts = tokenizeUrl(text);
+    for (var i = 0; i < parts.length; i++) {
+      urlMirror.appendChild(el('span', parts[i].cls, parts[i].text));
+    }
+    urlMirror.scrollLeft = urlIn.scrollLeft;
+  }
+
+  // Break a typed URL into coloured runs without requiring a complete URL.
+  // `{{var}}` wins over every other class so environment placeholders stay
+  // obvious while the rest of the string still tokenises around them.
+  function tokenizeUrl(raw) {
+    var text = String(raw || '');
+    var n = text.length;
+    var out = [];
+
+    function push(cls, from, to) {
+      if (to <= from) { return; }
+      var j = from;
+      while (j < to) {
+        if (j + 1 < to && text.charAt(j) === '{' && text.charAt(j + 1) === '{') {
+          var close = text.indexOf('}}', j + 2);
+          if (close < 0 || close + 2 > to) {
+            // Unclosed {{... : still mark the rest of this range as a var so
+            // half-typed placeholders do not look like path text mid-edit.
+            if (j > from) { out.push({ cls: cls, text: text.slice(from, j) }); }
+            out.push({ cls: 'u-var', text: text.slice(j, to) });
+            return;
+          }
+          if (j > from) { out.push({ cls: cls, text: text.slice(from, j) }); }
+          out.push({ cls: 'u-var', text: text.slice(j, close + 2) });
+          from = close + 2;
+          j = from;
+          continue;
+        }
+        j += 1;
+      }
+      if (to > from) { out.push({ cls: cls, text: text.slice(from, to) }); }
+    }
+
+    function isSchemeChar(ch) {
+      return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch === '+' || ch === '.' || ch === '-';
+    }
+
+    var i = 0;
+    // scheme://  when present; otherwise the first segment is the host.
+    var schemeAt = -1;
+    if (n > 0 && ((text.charAt(0) >= 'a' && text.charAt(0) <= 'z') ||
+        (text.charAt(0) >= 'A' && text.charAt(0) <= 'Z'))) {
+      var s = 1;
+      while (s < n && isSchemeChar(text.charAt(s))) { s += 1; }
+      if (s < n && text.charAt(s) === ':') { schemeAt = s; }
+    }
+    if (schemeAt >= 0) {
+      push('u-scheme', 0, schemeAt + 1);
+      i = schemeAt + 1;
+      if (i + 1 < n && text.charAt(i) === '/' && text.charAt(i + 1) === '/') {
+        push('u-sep', i, i + 2);
+        i += 2;
+      }
+    }
+
+    // Authority: [userinfo@]host[:port] until / ? # or end.
+    if (schemeAt >= 0 || i === 0) {
+      var authEnd = i;
+      while (authEnd < n) {
+        var ac = text.charAt(authEnd);
+        if (ac === '/' || ac === '?' || ac === '#') { break; }
+        authEnd += 1;
+      }
+      if (authEnd > i) {
+        var at = text.lastIndexOf('@', authEnd - 1);
+        var hostStart = i;
+        if (at >= i) {
+          push('u-user', i, at);
+          push('u-sep', at, at + 1);
+          hostStart = at + 1;
+        }
+        // Host vs port: last bare colon (ignore IPv6 brackets by only taking
+        // a trailing :digits port after the last ']').
+        var colon = text.lastIndexOf(':', authEnd - 1);
+        if (colon >= hostStart) {
+          // Port is a trailing :digits only; IPv6 brackets put other colons
+          // before ']', so a colon after ']' (or none) is the port marker.
+          var bracket = text.lastIndexOf(']', authEnd - 1);
+          var digits = colon + 1 < authEnd;
+          var d = colon + 1;
+          while (digits && d < authEnd) {
+            var dc = text.charAt(d);
+            if (dc < '0' || dc > '9') { digits = false; break; }
+            d += 1;
+          }
+          // Empty ":port" (just a trailing colon) still counts as a port slot.
+          if (bracket < colon && (colon + 1 === authEnd || digits)) {
+            push('u-host', hostStart, colon);
+            push('u-sep', colon, colon + 1);
+            push('u-port', colon + 1, authEnd);
+          } else {
+            push('u-host', hostStart, authEnd);
+          }
+        } else {
+          push('u-host', hostStart, authEnd);
+        }
+        i = authEnd;
+      }
+    }
+
+    // Path segments until ? or #.
+    if (i < n && text.charAt(i) !== '?' && text.charAt(i) !== '#') {
+      var pathEnd = i;
+      while (pathEnd < n) {
+        var pc = text.charAt(pathEnd);
+        if (pc === '?' || pc === '#') { break; }
+        pathEnd += 1;
+      }
+      var p = i;
+      while (p < pathEnd) {
+        if (text.charAt(p) === '/') {
+          push('u-sep', p, p + 1);
+          p += 1;
+          continue;
+        }
+        var seg = p;
+        while (seg < pathEnd && text.charAt(seg) !== '/') { seg += 1; }
+        push('u-path', p, seg);
+        p = seg;
+      }
+      i = pathEnd;
+    }
+
+    // Query: ?key=value&key=value
+    if (i < n && text.charAt(i) === '?') {
+      push('u-sep', i, i + 1);
+      i += 1;
+      while (i < n && text.charAt(i) !== '#') {
+        if (text.charAt(i) === '&') {
+          push('u-sep', i, i + 1);
+          i += 1;
+          continue;
+        }
+        var keyEnd = i;
+        while (keyEnd < n) {
+          var kc = text.charAt(keyEnd);
+          if (kc === '=' || kc === '&' || kc === '#') { break; }
+          keyEnd += 1;
+        }
+        push('u-key', i, keyEnd);
+        i = keyEnd;
+        if (i < n && text.charAt(i) === '=') {
+          push('u-sep', i, i + 1);
+          i += 1;
+          var valEnd = i;
+          while (valEnd < n) {
+            var vc = text.charAt(valEnd);
+            if (vc === '&' || vc === '#') { break; }
+            valEnd += 1;
+          }
+          push('u-val', i, valEnd);
+          i = valEnd;
+        }
+      }
+    }
+
+    // Fragment.
+    if (i < n && text.charAt(i) === '#') {
+      push('u-sep', i, i + 1);
+      i += 1;
+      push('u-frag', i, n);
+      i = n;
+    }
+
+    // Anything left (malformed remainder) as plain path colour.
+    if (i < n) { push('u-path', i, n); }
+    return out;
+  }
+
+  /* Query-parameter table (Postman-style). Rows drive the URL query when the
+     table is edited; typing in the URL bar re-parses into rows. Disabled rows
+     stay in the table but drop out of the URL until re-checked. */
+  var paramsBody = document.getElementById('c-params-body');
+  // true while the table is rewriting the URL, so the URL→table pass is skipped.
+  var paramsFromTable = false;
+  // Disabled (unchecked) rows live only in the table. URL edits would drop
+  // them; keep a copy keyed by position until the next full table rebuild that
+  // still has room for them — simpler: hold extra off-rows and re-append after
+  // a URL-driven rebuild when the query text itself did not change from us.
+  var paramsOff = [];
+
+  function decodeParam(raw) {
+    try { return decodeURIComponent(String(raw || '').replace(/\+/g, ' ')); }
+    catch (error) { return String(raw || ''); }
+  }
+
+  // encodeURIComponent turns {{var}} into %7B%7Bvar%7D%7D; restore braces so
+  // environment placeholders survive a round-trip through the table.
+  function encodeParam(raw) {
+    return encodeURIComponent(String(raw || ''))
+      .replace(/%7B/gi, '{')
+      .replace(/%7D/gi, '}');
+  }
+
+  // Split into base (before ?), query (between ? and #), hash (from #).
+  function splitUrlParts(url) {
+    var text = String(url || '');
+    var hash = '';
+    var hashAt = text.indexOf('#');
+    if (hashAt >= 0) {
+      hash = text.slice(hashAt);
+      text = text.slice(0, hashAt);
+    }
+    var query = '';
+    var qAt = text.indexOf('?');
+    var base = text;
+    if (qAt >= 0) {
+      base = text.slice(0, qAt);
+      query = text.slice(qAt + 1);
+    }
+    return { base: base, query: query, hash: hash };
+  }
+
+  function parseQueryString(query) {
+    var rows = [];
+    if (!query) { return rows; }
+    var parts = String(query).split('&');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i];
+      // A trailing & leaves an empty segment; skip so the blank add-row is alone.
+      if (part === '' && i === parts.length - 1) { continue; }
+      var eq = part.indexOf('=');
+      var key = eq < 0 ? part : part.slice(0, eq);
+      var val = eq < 0 ? '' : part.slice(eq + 1);
+      rows.push({ on: true, key: decodeParam(key), value: decodeParam(val) });
+    }
+    return rows;
+  }
+
+  function buildQueryString(rows) {
+    var bits = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row.on) { continue; }
+      var key = str(row.key);
+      var val = str(row.value);
+      // Empty trailing add-row must not become "?=" on the wire.
+      if (!key && !val) { continue; }
+      if (!key) { continue; }
+      bits.push(encodeParam(key) + '=' + encodeParam(val));
+    }
+    return bits.join('&');
+  }
+
+  function readParamRows() {
+    var rows = [];
+    if (!paramsBody) { return rows; }
+    var trs = paramsBody.querySelectorAll('tr');
+    for (var i = 0; i < trs.length; i++) {
+      var tr = trs[i];
+      var onEl = tr.querySelector('input[type="checkbox"]');
+      var keyEl = tr.querySelector('input.c-params-key');
+      var valEl = tr.querySelector('input.c-params-val');
+      if (!keyEl || !valEl) { continue; }
+      rows.push({
+        on: onEl ? !!onEl.checked : true,
+        key: keyEl.value,
+        value: valEl.value
+      });
+    }
+    return rows;
+  }
+
+  function writeUrlFromParams() {
+    if (!urlIn) { return; }
+    var rows = readParamRows();
+    var parts = splitUrlParts(urlIn.value);
+    var query = buildQueryString(rows);
+    var next = parts.base;
+    if (query) { next += '?' + query; }
+    next += parts.hash;
+    if (next !== urlIn.value) {
+      paramsFromTable = true;
+      urlIn.value = next;
+      paintUrlMirror();
+      paramsFromTable = false;
+    }
+    // Meta counts on/off rows even when the query string did not change.
+    dressParamsMeta();
+  }
+
+  function paramRow(data, isBlank) {
+    var row = data || { on: true, key: '', value: '' };
+    var tr = document.createElement('tr');
+    if (!row.on) { tr.className = 'off'; }
+
+    var tdOn = document.createElement('td');
+    tdOn.className = 'c-params-on';
+    var check = document.createElement('input');
+    check.type = 'checkbox';
+    check.checked = row.on !== false;
+    check.title = 'Include in URL';
+    check.setAttribute('aria-label', 'Include parameter in URL');
+    tdOn.appendChild(check);
+    tr.appendChild(tdOn);
+
+    var tdKey = document.createElement('td');
+    var keyIn = document.createElement('input');
+    keyIn.type = 'text';
+    keyIn.className = 'c-params-key';
+    keyIn.spellcheck = false;
+    keyIn.autocomplete = 'off';
+    keyIn.placeholder = isBlank ? 'Key' : '';
+    keyIn.setAttribute('aria-label', 'Parameter key');
+    keyIn.value = str(row.key);
+    tdKey.appendChild(keyIn);
+    tr.appendChild(tdKey);
+
+    var tdVal = document.createElement('td');
+    var valIn = document.createElement('input');
+    valIn.type = 'text';
+    valIn.className = 'c-params-val';
+    valIn.spellcheck = false;
+    valIn.autocomplete = 'off';
+    valIn.placeholder = isBlank ? 'Value' : '';
+    valIn.setAttribute('aria-label', 'Parameter value');
+    valIn.value = str(row.value);
+    tdVal.appendChild(valIn);
+    tr.appendChild(tdVal);
+
+    var tdDrop = document.createElement('td');
+    tdDrop.className = 'c-params-drop';
+    if (!isBlank) {
+      var drop = document.createElement('button');
+      drop.type = 'button';
+      drop.className = 'c-params-x';
+      drop.title = 'Remove parameter';
+      drop.setAttribute('aria-label', 'Remove parameter');
+      drop.textContent = '×';
+      drop.addEventListener('click', function () {
+        tr.parentNode.removeChild(tr);
+        ensureBlankParamRow();
+        writeUrlFromParams();
+      });
+      tdDrop.appendChild(drop);
+    }
+    tr.appendChild(tdDrop);
+
+    function onEdit() {
+      tr.classList.toggle('off', !check.checked);
+      // Typing into the blank row turns it into a real one and seeds a new blank.
+      if (isBlank && (keyIn.value || valIn.value)) {
+        isBlank = false;
+        dropBtnFor(tr);
+        ensureBlankParamRow();
+      }
+      writeUrlFromParams();
+    }
+
+    function dropBtnFor(node) {
+      if (node.querySelector('.c-params-x')) { return; }
+      var cell = node.querySelector('td.c-params-drop');
+      if (!cell) { return; }
+      var drop = document.createElement('button');
+      drop.type = 'button';
+      drop.className = 'c-params-x';
+      drop.title = 'Remove parameter';
+      drop.setAttribute('aria-label', 'Remove parameter');
+      drop.textContent = '×';
+      drop.addEventListener('click', function () {
+        node.parentNode.removeChild(node);
+        ensureBlankParamRow();
+        writeUrlFromParams();
+      });
+      cell.appendChild(drop);
+      keyIn.placeholder = '';
+      valIn.placeholder = '';
+    }
+
+    check.addEventListener('change', onEdit);
+    keyIn.addEventListener('input', onEdit);
+    valIn.addEventListener('input', onEdit);
+    return tr;
+  }
+
+  function ensureBlankParamRow() {
+    if (!paramsBody) { return; }
+    var trs = paramsBody.querySelectorAll('tr');
+    var last = trs.length ? trs[trs.length - 1] : null;
+    if (last) {
+      var keyEl = last.querySelector('input.c-params-key');
+      var valEl = last.querySelector('input.c-params-val');
+      if (keyEl && valEl && !keyEl.value && !valEl.value) { return; }
+    }
+    paramsBody.appendChild(paramRow({ on: true, key: '', value: '' }, true));
+  }
+
+  function fillParamsTable(rows) {
+    if (!paramsBody) { return; }
+    strip(paramsBody);
+    var list = Array.isArray(rows) ? rows : [];
+    for (var i = 0; i < list.length; i++) {
+      paramsBody.appendChild(paramRow(list[i], false));
+    }
+    // Re-attach disabled rows that were only in the table (not on the URL).
+    for (var j = 0; j < paramsOff.length; j++) {
+      paramsBody.appendChild(paramRow(paramsOff[j], false));
+    }
+    paramsOff = [];
+    ensureBlankParamRow();
+    dressParamsMeta();
+  }
+
+  function syncParamsFromUrl() {
+    if (paramsFromTable || !urlIn) { return; }
+    // Preserve unchecked rows across a URL-driven rebuild when the operator is
+    // only editing the path/host, not the query — actually any URL edit that
+    // re-parses query replaces on-rows; stash current off-rows first.
+    var current = readParamRows();
+    paramsOff = [];
+    for (var i = 0; i < current.length; i++) {
+      if (!current[i].on && (current[i].key || current[i].value)) {
+        paramsOff.push(current[i]);
+      }
+    }
+    var parts = splitUrlParts(urlIn.value);
+    fillParamsTable(parseQueryString(parts.query));
+  }
+
+  function wireUrlField() {
+    // Params table must fill even if the colour mirror is missing; the two
+    // are independent surfaces that share the same input value.
+    if (urlIn) {
+      urlIn.addEventListener('input', function () {
+        paintUrlMirror();
+        syncParamsFromUrl();
+      });
+      if (urlMirror) {
+        urlIn.addEventListener('scroll', function () {
+          urlMirror.scrollLeft = urlIn.scrollLeft;
+        });
+      }
+      // Programmatic .value writes do not fire input; openSaved calls paint+sync.
+      paintUrlMirror();
+      syncParamsFromUrl();
+    } else if (paramsBody) {
+      ensureBlankParamRow();
+    }
+  }
+  wireUrlField();
+
+  /* Fold bars for params and response. Same twist language as the tree shelves;
+     preference survives the tab via localStorage. */
+  var paramsMetaEl = document.getElementById('c-params-meta');
+  var headersMetaEl = document.getElementById('c-headers-meta');
+  var bodyMetaEl = document.getElementById('c-body-meta');
+  var outMetaEl = document.getElementById('c-out-meta');
+  var headersIn = document.getElementById('c-headers');
+  var bodyIn = document.getElementById('c-body');
+  var paramsFold = null;
+  var headersFold = null;
+  var bodyFold = null;
+  var outFold = null;
+
+  function wireFold(wrapId, storageKey) {
+    var wrap = document.getElementById(wrapId);
+    if (!wrap) { return null; }
+    var bar = wrap.querySelector('.c-fold-bar');
+    var twist = bar ? bar.querySelector('.twist') : null;
+    if (!bar || !twist) { return null; }
+
+    function apply(shut) {
+      wrap.classList.toggle('shut', shut);
+      twist.textContent = shut ? '▸' : '▾';
+      bar.setAttribute('aria-expanded', shut ? 'false' : 'true');
+      try { localStorage.setItem(storageKey, shut ? '1' : '0'); } catch (error) { /* not fatal */ }
+    }
+
+    bar.addEventListener('click', function () {
+      apply(!wrap.classList.contains('shut'));
+    });
+    try {
+      if (localStorage.getItem(storageKey) === '1') { apply(true); }
+    } catch (error) { /* not fatal */ }
+
+    return {
+      open: function () { apply(false); },
+      close: function () { apply(true); },
+      isShut: function () { return wrap.classList.contains('shut'); }
+    };
+  }
+
+  function dressParamsMeta() {
+    if (!paramsMetaEl) { return; }
+    var rows = readParamRows();
+    var on = 0;
+    var total = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (!rows[i].key && !rows[i].value) { continue; }
+      total += 1;
+      if (rows[i].on) { on += 1; }
+    }
+    if (!total) {
+      paramsMetaEl.textContent = '';
+      return;
+    }
+    paramsMetaEl.textContent = on === total
+      ? (total + (total === 1 ? ' param' : ' params'))
+      : (on + ' of ' + total);
+  }
+
+  function dressHeadersMeta() {
+    if (!headersMetaEl || !headersIn) { return; }
+    var list = readHeaders(headersIn.value);
+    headersMetaEl.textContent = list.length
+      ? (list.length + (list.length === 1 ? ' header' : ' headers'))
+      : '';
+  }
+
+  function dressBodyMeta() {
+    if (!bodyMetaEl || !bodyIn) { return; }
+    var text = bodyIn.value;
+    if (!text) {
+      bodyMetaEl.textContent = '';
+      return;
+    }
+    // Character count is what the operator typed; bytes may differ after encode.
+    var n = text.length;
+    bodyMetaEl.textContent = n < 1024
+      ? (n + (n === 1 ? ' char' : ' chars'))
+      : ((n / 1024).toFixed(1) + ' KB');
+  }
+
+  function dressOutMeta(text) {
+    if (outMetaEl) { outMetaEl.textContent = text ? str(text) : ''; }
+  }
+
+  paramsFold = wireFold('c-params-wrap', 'proxima.compose.params-shut');
+  headersFold = wireFold('c-headers-wrap', 'proxima.compose.headers-shut');
+  bodyFold = wireFold('c-body-wrap', 'proxima.compose.body-shut');
+  outFold = wireFold('c-out-wrap', 'proxima.compose.out-shut');
+  dressParamsMeta();
+  dressHeadersMeta();
+  dressBodyMeta();
+  if (headersIn) {
+    headersIn.addEventListener('input', dressHeadersMeta);
+  }
+  if (bodyIn) {
+    bodyIn.addEventListener('input', dressBodyMeta);
+  }
 
   function composing(on) {
     if (on) { breaking(false); rewriting(false); httpRewriting(false); archiveView(false); }
     mainEl.classList.toggle('composing', on);
     composerEl.hidden = !on;
     composeBtn.classList.toggle('on', on);
-    if (on) { document.getElementById('c-url').focus(); }
+    if (on) {
+      urlIn.focus();
+      paintUrlMirror();
+      syncParamsFromUrl();
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -4160,7 +5070,10 @@ const SCRIPT: &str = r#"
     var button = document.getElementById('c-send');
     var url = document.getElementById('c-url').value.trim();
     strip(outEl);
+    // A folded response would hide the answer the operator just asked for.
+    if (outFold) { outFold.open(); }
     if (!url) {
+      dressOutMeta('');
       outEl.appendChild(el('p', 'hint', 'Give it a URL first.'));
       return;
     }
@@ -4176,6 +5089,7 @@ const SCRIPT: &str = r#"
     };
 
     button.disabled = true;
+    dressOutMeta('Sending...');
     outEl.appendChild(el('p', 'hint', 'Sending...'));
     try {
       var response = await fetch('/api/send', {
@@ -4187,6 +5101,7 @@ const SCRIPT: &str = r#"
       var text = await response.text();
       strip(outEl);
       if (!response.ok) {
+        dressOutMeta('failed');
         outEl.appendChild(el('p', 'hint', 'The request failed.'));
         outEl.appendChild(el('pre', 'mono', text));
         return;
@@ -4196,11 +5111,12 @@ const SCRIPT: &str = r#"
       var took = result.timings && result.timings.end
         ? result.timings.end - result.timings.start
         : null;
+      var statusLine = str(result.status) + ' ' + str(result.statusText) + '   ' +
+        str(result.httpVersion) + (took === null ? '' : '   ' + millis(took));
+      // Status also sits on the fold bar so a collapsed response still names it.
+      dressOutMeta(str(result.status) + (took === null ? '' : ' · ' + millis(took)));
       var summary = el('section', 'block');
-      summary.appendChild(el('h2', null, 'Response'));
-      summary.appendChild(el('p', 'mono',
-        str(result.status) + ' ' + str(result.statusText) + '   ' + str(result.httpVersion) +
-        (took === null ? '' : '   ' + millis(took))));
+      summary.appendChild(el('p', 'mono', statusLine));
       outEl.appendChild(summary);
       outEl.appendChild(headerBlock('Response headers', result.headers));
 
@@ -4209,10 +5125,21 @@ const SCRIPT: &str = r#"
       catch (error) { shown = '[the body is not text]'; }
       var body = el('section', 'block');
       body.appendChild(el('h2', null, 'Response body'));
-      body.appendChild(el('pre', 'mono', indent(shown, contentTypeOf(result.headers))));
+      var pre = el('pre', 'mono');
+      body.appendChild(pre);
       outEl.appendChild(body);
+      var ct = contentTypeOf(result.headers);
+      if (wantsJsonView(shown, ct)) {
+        fetchJsonView(shown).then(function (view) {
+          if (view) { paintJson(pre, view); }
+          else { pre.textContent = shown; }
+        });
+      } else {
+        pre.textContent = shown;
+      }
     } catch (error) {
       strip(outEl);
+      dressOutMeta('error');
       outEl.appendChild(el('p', 'hint', 'Could not send: ' + error.message));
     } finally {
       button.disabled = false;
@@ -4504,18 +5431,27 @@ const SCRIPT: &str = r#"
   function openSaved(saved) {
     var spec = saved.spec || {};
     document.getElementById('c-method').value = str(spec.method) || 'GET';
-    document.getElementById('c-url').value = str(spec.url);
-    document.getElementById('c-headers').value = headerLines(spec.headers);
+    // urlIn is #c-url; paint + params table after so both match the value.
+    urlIn.value = str(spec.url);
+    paintUrlMirror();
+    syncParamsFromUrl();
+    if (headersIn) { headersIn.value = headerLines(spec.headers); }
+    else { document.getElementById('c-headers').value = headerLines(spec.headers); }
     var body = '';
     if (spec.bodyBase64) {
       try { body = fromBase64(spec.bodyBase64); } catch (error) { body = ''; }
     }
-    document.getElementById('c-body').value = body;
+    if (bodyIn) { bodyIn.value = body; }
+    else { document.getElementById('c-body').value = body; }
     document.getElementById('c-name').value = str(saved.name);
+    dressHeadersMeta();
+    dressBodyMeta();
     // The answer on screen belongs to the request that was open a moment ago.
     // Left up, it reads as the answer to this one, and it is convincing: same
     // shape, same pane, only the URL above it has changed.
     strip(outEl);
+    dressOutMeta('');
+    outEl.appendChild(el('p', 'hint', 'Send a request to see the response here.'));
     composing(true);
   }
 
@@ -5327,8 +6263,14 @@ mod tests {
         // tree, so its bytes are never handed to the HTML parser. There is no
         // second path: the sink check above covers the rest of the file.
         assert!(
-            SCRIPT.contains("into.textContent = indent(text, contentType) +"),
-            "a captured body must still be written as text, not built into markup"
+            SCRIPT.contains("function paintJson(into, view)")
+                && SCRIPT.contains("into.appendChild(el('span', 'j-' + kind"),
+            "JSON bodies paint as textContent spans, never markup strings"
+        );
+        assert!(
+            SCRIPT.contains("into.textContent = text + suffix")
+                || SCRIPT.contains("into.textContent = 'Could not read the body:"),
+            "non-JSON bodies still land as plain textContent"
         );
         assert!(
             SCRIPT.contains("pre.textContent = 'Binary. Download it"),
@@ -5404,11 +6346,12 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 22] = [
+    const KNOWN_PATHS: [&str; 23] = [
         "/api/flows",
         "/api/flows?",
         "/api/flows/",
         "/api/bodies/",
+        "/api/json/view",
         "/api/stream",
         "/api/send",
         "/api/collections",
@@ -6176,6 +7119,89 @@ mod tests {
         );
     }
 
+    /// Composer URL box paints scheme, host, path and query under a transparent
+    /// input so the caret stays real while tokens take colour. Mirror spans only.
+    #[test]
+    fn composer_url_field_paints_tokens_under_a_transparent_input() {
+        assert!(
+            BODY.contains("id=\"c-url-mirror\"") && BODY.contains("class=\"url-field\""),
+            "composer URL sits in a field with a coloured mirror under the input"
+        );
+        assert!(
+            CSS.contains(".url-mirror .u-host")
+                && CSS.contains(".url-mirror .u-key")
+                && CSS.contains(".url-mirror .u-val")
+                && CSS.contains("-webkit-text-fill-color: transparent"),
+            "URL mirror token colours and transparent input text must stay wired"
+        );
+        assert!(
+            SCRIPT.contains("function tokenizeUrl(raw)")
+                && SCRIPT.contains("function paintUrlMirror()")
+                && SCRIPT.contains("paintUrlMirror();"),
+            "typing and openSaved must repaint the URL mirror from tokenizeUrl"
+        );
+        // {{var}} and query keys/values are the reason this is more than host colour.
+        assert!(
+            SCRIPT.contains("'u-var'") && SCRIPT.contains("'u-key'") && SCRIPT.contains("'u-val'"),
+            "tokenizer must colour query params and environment placeholders"
+        );
+    }
+
+    /// Query params table under the URL bar, Postman-style: key/value rows
+    /// rewrite the query string; the URL bar re-parses into rows. Spans/inputs
+    /// only — no HTML from the URL. Captured requests get a read-only copy on
+    /// the Request tab. Params and response folds collapse like tree shelves.
+    #[test]
+    fn composer_query_params_table_syncs_with_the_url_bar() {
+        assert!(
+            BODY.contains("id=\"c-params-body\"") && BODY.contains("Query parameters"),
+            "composer must expose a query-parameter table under the URL"
+        );
+        assert!(
+            CSS.contains(".c-params") && CSS.contains(".c-fold"),
+            "param table and fold styling must be present"
+        );
+        assert!(
+            BODY.contains("id=\"c-out-wrap\"")
+                && BODY.contains("id=\"c-headers-wrap\"")
+                && BODY.contains("id=\"c-body-wrap\"")
+                && SCRIPT.contains("wireFold('c-params-wrap'")
+                && SCRIPT.contains("wireFold('c-headers-wrap'")
+                && SCRIPT.contains("wireFold('c-body-wrap'")
+                && SCRIPT.contains("wireFold('c-out-wrap'")
+                && SCRIPT.contains("outFold.open()"),
+            "params, headers, body and response must fold; send re-opens the response"
+        );
+        assert!(
+            SCRIPT.contains("function syncParamsFromUrl()")
+                && SCRIPT.contains("function writeUrlFromParams()")
+                && SCRIPT.contains("function parseQueryString(query)")
+                && SCRIPT.contains("function buildQueryString(rows)"),
+            "URL and table must round-trip through parse/build helpers"
+        );
+        // openSaved loads a URL that may already carry a query; the table has to
+        // fill without waiting for a keystroke.
+        let open = SCRIPT
+            .split_once("function openSaved(saved) {")
+            .expect("the script still opens a saved request")
+            .1;
+        assert!(
+            open.contains("syncParamsFromUrl();"),
+            "opening a saved request must fill the params table from its URL"
+        );
+        // {{var}} must survive encode for environment send.
+        assert!(
+            SCRIPT.contains(".replace(/%7B/gi, '{')"),
+            "encodeParam must keep {{var}} braces usable after a table edit"
+        );
+        // Captured traffic: Request tab lists the same breakdown without editing.
+        assert!(
+            SCRIPT.contains("function queryParamsBlock(url)")
+                && SCRIPT.contains("box.appendChild(queryParamsBlock(request.url));"),
+            "Request tab must show a read-only query parameter breakdown"
+        );
+    }
+
     #[test]
     fn saved_requests_go_out_and_come_back_the_way_the_composer_sends_them() {
         // A saved request is a SendSpec under a name. Saving one shape and
@@ -6702,25 +7728,26 @@ mod tests {
         );
     }
 
-    /// Pretty-print is display-only: opcode 1 JSON is indented; search still
-    /// runs on the raw captured text.
+    /// Pretty-print is display-only: opcode 1 JSON goes through the tokenizer
+    /// via /api/json/view; search still runs on the raw captured text.
     #[test]
     fn text_frames_pretty_print_json_without_changing_search() {
         assert!(
-            SCRIPT.contains("function displayText(message)"),
-            "frame display text must go through one pretty-print helper"
+            SCRIPT.contains("function paintFramePayload(textEl, message)"),
+            "frame display must paint through paintFramePayload"
         );
         assert!(
-            SCRIPT.contains("JSON.stringify(JSON.parse(raw), null, 2)"),
-            "valid JSON text frames must render indented by two spaces"
+            SCRIPT.contains("fetchJsonView(raw)")
+                && SCRIPT.contains("paintJson(textEl, view)"),
+            "JSON text frames must use /api/json/view then paintJson"
         );
         assert!(
-            SCRIPT.contains("if (message.opcode === 1)"),
-            "pretty-print is for text frames only"
+            SCRIPT.contains("message.opcode === 1 && wantsJsonView"),
+            "pretty/colour is for text frames that look like JSON"
         );
         assert!(
-            SCRIPT.contains("var shown = displayText(message);"),
-            "frameLine must paint the pretty form, not the raw string alone"
+            SCRIPT.contains("paintFramePayload(textEl, message)"),
+            "frameLine must paint via paintFramePayload, not raw text alone"
         );
         // matchesFrame still reads message.text, not displayText(...).
         let matcher = SCRIPT
@@ -6734,6 +7761,10 @@ mod tests {
         assert!(
             body.contains("message.text") && !body.contains("displayText"),
             "search must use raw message.text, not the pretty-printed display"
+        );
+        assert!(
+            SCRIPT.contains("'/api/json/view'"),
+            "inspector must call the tokenizer-backed JSON view endpoint"
         );
     }
 
@@ -6930,40 +7961,37 @@ mod tests {
         );
     }
 
-    /// displayText pretty-prints opcode-1 JSON only; binary/close/etc. stay raw
+    /// paintFramePayload colours opcode-1 JSON only; binary/close/etc. stay raw
     /// (or absent). Non-JSON text frames must fall back without throwing away text.
     #[test]
     fn display_text_pretty_prints_json_text_frames_only() {
         let display = SCRIPT
-            .split_once("function displayText(message) {")
-            .expect("displayText still exists")
+            .split_once("function paintFramePayload(textEl, message) {")
+            .expect("paintFramePayload still exists")
             .1;
         let body = display
             .split_once("function renderFrames() {")
-            .expect("renderFrames follows displayText")
+            .expect("renderFrames follows paintFramePayload")
             .0;
         assert!(
-            body.contains("if (message.opcode === 1)"),
-            "pretty-print is gated on text frames"
+            body.contains("message.opcode === 1 && wantsJsonView"),
+            "pretty/colour is gated on text frames that look like JSON"
         );
         assert!(
-            body.contains("JSON.stringify(JSON.parse(raw), null, 2)"),
-            "valid JSON must indent with two spaces"
+            body.contains("paintJson(textEl, view)") && body.contains("fetchJsonView(raw)"),
+            "valid JSON frames must go through the tokenizer view endpoint"
         );
         assert!(
-            body.contains("catch (error)") && body.contains("return raw;"),
-            "invalid JSON text frames must fall back to the raw payload"
+            body.contains("textEl.textContent = raw"),
+            "non-JSON or pending paint must keep the raw payload as text"
         );
         assert!(
-            body.contains("if (raw === null) { return null; }"),
+            body.contains("if (raw === null) { return; }"),
             "a frame without text must not invent a display string"
         );
-        // Pretty helper is not used for HTTP body indent under another name here;
-        // the same indent-2 pattern is the contract for both.
         assert!(
-            SCRIPT.contains("JSON.stringify(JSON.parse(text), null, 2)")
-                || SCRIPT.matches("null, 2)").count() >= 1,
-            "JSON pretty-print indent-2 must remain available in the page script"
+            SCRIPT.contains("'/api/json/view'") && CSS.contains(".json .j-property"),
+            "tokenizer paint classes and endpoint must stay wired"
         );
     }
 

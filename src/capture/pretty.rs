@@ -19,6 +19,7 @@ pub enum SoftViewKind {
     Protobuf,
     Grpc,
     Jwt,
+    Json,
     Hex,
 }
 
@@ -32,11 +33,14 @@ pub struct SoftView {
     /// Optional note (compression flag, truncation, parse warning).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// When `kind` is Json: coloured runs covering `text` losslessly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<crate::json_view::JsonToken>>,
 }
 
 /// Best-effort soft view for body bytes, guided by `content_type` when present.
 ///
-/// Detection order: gRPC content-type, protobuf content-type, protobuf wire
+/// Detection order: JSON (mime or `{`/`[`), gRPC, protobuf, protobuf wire
 /// heuristic, then hex dump.
 pub fn soft_view(bytes: &[u8], content_type: Option<&str>) -> SoftView {
     let mime = content_type
@@ -44,6 +48,9 @@ pub fn soft_view(bytes: &[u8], content_type: Option<&str>) -> SoftView {
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_default();
 
+    if let Some(view) = soft_json(bytes, content_type) {
+        return view;
+    }
     if mime.starts_with("application/grpc") {
         return soft_grpc(bytes);
     }
@@ -55,6 +62,28 @@ pub fn soft_view(bytes: &[u8], content_type: Option<&str>) -> SoftView {
         return soft_protobuf(bytes, Some("detected without content-type".into()));
     }
     soft_hex(bytes, None)
+}
+
+/// JSON soft view via themoretheless-tokenizer (pretty + semantic tokens).
+fn soft_json(bytes: &[u8], content_type: Option<&str>) -> Option<SoftView> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let wants_json = crate::json_view::content_type_is_json(content_type)
+        || crate::json_view::looks_like_json(text);
+    if !wants_json {
+        return None;
+    }
+    let view = crate::json_view::view(text)?;
+    let note = if view.valid {
+        None
+    } else {
+        Some("JSON highlight without full parse (incomplete or invalid)".into())
+    };
+    Some(SoftView {
+        kind: SoftViewKind::Json,
+        text: truncate_text(view.text),
+        note,
+        tokens: Some(view.tokens),
+    })
 }
 
 /// Soft-decode a JWT string (three base64url parts). Does not verify signatures.
@@ -85,6 +114,7 @@ pub fn soft_jwt(token: &str) -> Option<SoftView> {
         kind: SoftViewKind::Jwt,
         text: truncate_text(text),
         note: Some("JWT soft view; signature not verified".into()),
+        tokens: None,
     })
 }
 
@@ -115,6 +145,7 @@ fn soft_grpc(bytes: &[u8]) -> SoftView {
             kind: SoftViewKind::Grpc,
             text: "(empty gRPC body)".into(),
             note: None,
+            tokens: None,
         };
     }
     let mut out = String::new();
@@ -175,6 +206,7 @@ fn soft_grpc(bytes: &[u8]) -> SoftView {
         } else {
             Some(notes.join("; "))
         },
+        tokens: None,
     }
 }
 
@@ -184,6 +216,7 @@ fn soft_protobuf(bytes: &[u8], note: Option<String>) -> SoftView {
             kind: SoftViewKind::Protobuf,
             text: truncate_text(tree),
             note,
+            tokens: None,
         },
         Ok(_) => soft_hex(bytes, note.or(Some("empty protobuf walk".into()))),
         Err(err) => soft_hex(bytes, Some(err)),
@@ -195,6 +228,7 @@ fn soft_hex(bytes: &[u8], note: Option<String>) -> SoftView {
         kind: SoftViewKind::Hex,
         text: hex_preview(bytes, 512),
         note,
+        tokens: None,
     }
 }
 
@@ -348,10 +382,8 @@ fn decode_b64url_json(part: &str) -> Option<Vec<u8>> {
 }
 
 fn pretty_json_or_raw(bytes: &[u8]) -> String {
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| String::from_utf8_lossy(bytes).into()),
-        Err(_) => String::from_utf8_lossy(bytes).into(),
-    }
+    let text = String::from_utf8_lossy(bytes);
+    crate::json_view::pretty(&text).unwrap_or_else(|| text.into_owned())
 }
 
 fn truncate_text(mut text: String) -> String {

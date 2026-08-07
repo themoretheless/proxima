@@ -62,6 +62,11 @@ pub(super) fn build(state: ApiState) -> Router {
         .route("/api/flows/{id}", get(get_flow))
         .route("/api/flows/{id}/body/{which}", get(get_body))
         .route("/api/bodies/{id}", get(get_body_by_id))
+        // Pretty-print + semantic highlight via themoretheless-tokenizer.
+        .route(
+            "/api/json/view",
+            post(json_view).layer(DefaultBodyLimit::max(body_limit)),
+        )
         .route("/api/flows/{id}/curl", get(get_curl))
         .route(
             "/api/flows/{id}/replay",
@@ -278,6 +283,22 @@ fn archive(state: &ApiState) -> Result<&crate::capture::Archive, ApiError> {
 enum Side {
     Request,
     Response,
+}
+
+/// Request body for `POST /api/json/view`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonViewRequest {
+    text: String,
+}
+
+/// Pretty-print and highlight JSON for the inspector. Display only: does not
+/// touch capture storage. Empty or non-text input is a 400.
+async fn json_view(Json(body): Json<JsonViewRequest>) -> Result<Response, ApiError> {
+    let view = crate::json_view::view(&body.text).ok_or_else(|| {
+        bad_request("give the endpoint a non-empty JSON (or JSON-looking) string")
+    })?;
+    Ok(Json(view).into_response())
 }
 
 async fn get_body(
