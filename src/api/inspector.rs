@@ -824,9 +824,8 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
    keeps only its bar, and the space it was using goes to the other. */
 .part { display: flex; flex-direction: column; min-height: 0; }
 .part.shut > *:not(.shelf) { display: none; }
-/* Vertical scroll on the half. Horizontal scroll is on .tree-scroll; #hosts /
-   #books inside are as wide as the longest name so every row shares one right
-   edge for sticky counts (not a scrollport per row). */
+/* Vertical scroll on the half. The tree is always the panel width: long names
+   ellipsis rather than a sticky count rail that painted over the shelf buttons. */
 #live {
   flex: 0 1 auto; max-height: 66%; min-height: 0;
   overflow-x: hidden; overflow-y: auto;
@@ -836,25 +835,31 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
   overflow-x: hidden; overflow-y: auto;
   border-top: 1px solid var(--line);
 }
+/* Folded live is only its shelf (border-bottom). Drop #saved's top edge or the
+   two rules stack into a double line under REQUESTS. */
+#live.shut + #saved {
+  border-top: none;
+}
 .tree-scroll {
   flex: none;
   width: 100%; max-width: 100%;
-  overflow-x: auto; overflow-y: hidden;
+  overflow-x: hidden; overflow-y: hidden;
   box-sizing: border-box;
 }
 /* Written against the ids on purpose: the shares above are set that way too,
    and a class alone loses to them, which leaves a folded half still holding
    the room it was given. Folded halves stack at the top instead. */
 #live.shut, #saved.shut { flex: none; max-height: none; overflow: hidden; }
-/* When the other half is folded, the open one may use the whole column. */
-#tree:has(> #saved.shut) > #live:not(.shut) {
-  flex: 1 1 0%; max-height: none;
-}
+/* When live is folded, saved may use the rest of the column. Do not expand live
+   when saved is folded: that pushed the SAVED REQUESTS bar to the bottom with
+   a void under a short host list. */
 #tree:has(> #live.shut) > #saved:not(.shut) { flex: 1 1 0%; }
-/* Wide content box: min-width fills the scrollport; width grows with names. */
+/* Panel-wide content. --d tracks nest depth so indented rows still span the
+   full right edge (count column stays put while the name indents). */
 #hosts {
+  --d: 0px;
   padding: 4px 0 12px;
-  width: max-content; min-width: 100%;
+  width: 100%;
   box-sizing: border-box;
 }
 /* Devices sit above the hosts because they are the coarser cut: which machine,
@@ -872,34 +877,60 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 }
 .chip:hover { background: var(--hover); color: var(--ink); }
 .chip.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
-/* Pin sits just left of the fixed count rail (same right edge for every row). */
-.star {
-  position: sticky; right: 2.75rem; z-index: 2;
-  flex: none; visibility: hidden; padding: 0 2px; cursor: default;
-  background: var(--bg); border: none; color: var(--dim); font: inherit; font-size: 11px;
+/* Keep-pin in the count rail. Star only on digit hover (or kept); replaces the
+   number. Colours as before: dim until kept, then accent — not yellow. */
+.gpin {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  z-index: 1;
+  box-sizing: border-box;
+  min-width: 2.25rem; min-height: 1.2em;
+  display: flex; align-items: center; justify-content: flex-end;
 }
+.gpin > .gcount {
+  position: static; right: auto; top: auto; transform: none;
+}
+.star {
+  position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+  box-sizing: border-box;
+  min-width: 2.25rem;
+  visibility: hidden; padding: 0; margin: 0; cursor: default;
+  background: none; border: none; color: var(--dim); font: inherit; font-size: 12px;
+  line-height: 1.2; text-align: right;
+}
+.gpin:hover > .star { visibility: visible; color: var(--dim); }
 .star.on { visibility: visible; color: var(--accent); }
-.gline:hover .star { visibility: visible; }
-.gline:hover > .star { background: var(--hover); }
-.gline.picked > .star { background: var(--pick); }
+.gpin:hover > .gcount,
+.gpin:has(> .star.on) > .gcount { visibility: hidden; }
 #books {
+  --d: 0px;
   padding: 2px 0 12px;
-  width: max-content; min-width: 100%;
+  width: 100%;
   box-sizing: border-box;
 }
+/* Above row chrome: a scrolled host must not cover hunt/sift.
+   Fixed height so REQUESTS and SAVED REQUESTS bars match (2 vs 3 icons used to
+   look uneven when line-box metrics differed). */
 .shelf {
-  position: sticky; top: 0; left: 0; z-index: 1;
+  position: sticky; top: 0; left: 0; z-index: 5;
   flex: none; display: flex; align-items: center; gap: 6px; cursor: default;
-  padding: 4px 6px 4px 8px; border-bottom: 1px solid var(--rule);
+  box-sizing: border-box;
+  height: 32px; min-height: 32px; max-height: 32px;
+  padding: 0 6px 0 8px;
+  border-bottom: 1px solid var(--rule);
   background: var(--bg);
-  /* Stay at least as wide as the half while rows grow past it. */
   width: 100%;
   min-width: 100%;
-  box-sizing: border-box;
 }
 .shelf:hover { background: var(--hover); }
-.shelf > .twist { font-size: 10px; }
-.shelf .icon { width: 22px; height: 22px; font-size: 13px; }
+.shelf > .twist {
+  flex: none; width: 1.15rem; font-size: 10px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.shelf .icon {
+  flex: none; box-sizing: border-box;
+  width: 22px; height: 22px; min-width: 22px; min-height: 22px;
+  font-size: 13px; line-height: 1; padding: 0;
+}
 .hunt {
   flex: none; margin: 5px 8px 3px; height: 24px; padding: 0 8px;
   background: var(--field); color: var(--ink);
@@ -907,26 +938,30 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 }
 .hunt:focus { outline: none; border-color: var(--accent); }
 .shelf-name {
-  flex: 1; color: var(--dim); font-size: 11px;
+  flex: 1; min-width: 0; color: var(--dim); font-size: 11px; line-height: 1;
   letter-spacing: .06em; text-transform: uppercase;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pad { margin: 0; padding: 10px 12px; font-size: 12px; }
 .sitem {
   position: relative; display: flex; gap: 6px; align-items: baseline;
   padding: 3px 8px 3px 12px; cursor: default; font-size: 12px;
-  width: max-content; min-width: 100%; box-sizing: border-box;
+  width: 100%; box-sizing: border-box; min-width: 0;
 }
 .sitem:hover { background: var(--hover); }
 .smethod {
   flex: none; width: 3.2rem; color: var(--dim);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
 }
-.sname { flex: none; white-space: nowrap; }
+.sname {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 /* Delete sits on top of the trailing text so rows do not reserve a kill column.
    Hidden with opacity (not visibility) so the layout never pays for the control. */
 .kill {
   position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
-  z-index: 1; width: 1.35rem; height: 1.35rem; padding: 0;
+  z-index: 2; width: 1.35rem; height: 1.35rem; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
   opacity: 0; pointer-events: none; cursor: default;
   background: var(--hover); border: none; border-radius: 5px;
@@ -951,50 +986,50 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
   background: var(--pick);
   box-shadow: inset 2px 0 0 var(--accent);
 }
-/* As wide as the name (grows #hosts) and at least the full content width so
-   short rows still park their count on the shared right edge. */
+/* Full panel width at every depth (--d undoes gbody indent). Count is absolute
+   against that shared right edge so 1, 26 and 380 end on one vertical line. */
 .gline {
-  position: relative; display: flex; gap: 6px; align-items: baseline;
-  padding: 3px 8px 3px 4px; cursor: default; border-radius: 0 6px 6px 0;
-  width: max-content; min-width: 100%; box-sizing: border-box;
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  box-sizing: border-box;
+  width: calc(100% + var(--d));
+  margin-left: calc(0px - var(--d));
+  padding: 3px 2.5rem 3px calc(4px + var(--d));
+  cursor: default; border-radius: 0 6px 6px 0;
 }
 .gline:hover { background: var(--hover); }
 .gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
 .twist {
-  flex: none; width: 1.2rem; color: var(--dim); text-align: center;
+  flex: none; width: 1.15rem; color: var(--dim); text-align: center;
   cursor: default; line-height: 1.4;
 }
 .gname {
-  flex: none;
+  flex: 1 1 auto; min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
-  color: var(--dim); white-space: nowrap;
+  color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .group.host > .gline > .gname { color: var(--ink); }
-/* Fixed-width sticky rail flush to the tree's right edge. Same width + right:0
-   + text-align:right for every row so 3 and 54 share one vertical line of digits. */
+/* Absolute rail on the row's right edge. Monospace + tabular-nums. */
 .gcount {
-  position: sticky; right: 0; z-index: 1;
-  flex: none; margin-left: auto;
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
   box-sizing: border-box;
-  width: 2.75rem; min-width: 2.75rem; max-width: 2.75rem;
-  padding: 0 8px 0 6px;
-  color: var(--dim); font-size: 11px;
+  min-width: 2.25rem;
+  padding: 0;
+  color: var(--dim); font-size: 11px; line-height: 1.2;
   white-space: nowrap; text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
-  background: var(--bg);
-  box-shadow: -10px 0 8px -2px var(--bg);
-}
-.gline:hover > .gcount {
-  background: var(--hover);
-  box-shadow: -10px 0 8px -2px var(--hover);
-}
-.gline.picked > .gcount {
-  background: var(--pick);
-  box-shadow: -10px 0 8px -2px var(--pick);
 }
 .gline.picked > .gname, .gline.picked > .gcount { color: var(--accent); }
-.gbody { margin-left: 11px; border-left: 1px solid var(--rule); }
+/* Indent the branch; --d grows so child .gline can span back to the full edge. */
+.gbody {
+  --d: calc(var(--d) + 11px);
+  margin-left: 11px; border-left: 1px solid var(--rule);
+}
 .group.shut > .gbody { display: none; }
 #scope {
   display: flex; gap: 6px; align-items: baseline; padding: 5px 10px;
@@ -1052,7 +1087,10 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
 /* The same menu, hung off a button that sits at the right edge of a narrow
    column: measured from that edge instead, or most of it would be off the
    side of the tree it belongs to. */
-.sift { position: relative; display: inline-flex; }
+.sift {
+  position: relative; display: inline-flex; align-items: center;
+  flex: none; line-height: 0;
+}
 .sift > .menu { left: auto; right: 0; }
 .mhead {
   padding: 5px 9px 2px; color: var(--dim); font-size: 11px;
@@ -1654,12 +1692,17 @@ const SCRIPT: &str = r#"
     var twist = el('span', 'twist', '▾');
     line.appendChild(twist);
     line.appendChild(el('span', 'gname', label));
+    // Host rows wrap star + count in .gpin so the star only appears when the
+    // digit rail is hovered and replaces the number there (same slot).
     var count = el('span', 'gcount', '0');
-    line.appendChild(count);
-    // The star keeps a host at the top, so it belongs to a line that is one:
-    // grouped by device the top line is an address, and keeping it would mean
-    // something else again.
-    if (!parent && liveGroup === 'host') { line.appendChild(starFor(box, label)); }
+    if (!parent && liveGroup === 'host') {
+      var pin = el('span', 'gpin');
+      pin.appendChild(starFor(box, label));
+      pin.appendChild(count);
+      line.appendChild(pin);
+    } else {
+      line.appendChild(count);
+    }
     var body = el('div', 'gbody');
     box.appendChild(line);
     box.appendChild(body);
@@ -6857,29 +6900,57 @@ mod tests {
             CSS.contains("#live.shut, #saved.shut { flex: none;"),
             "a folded half must give its share of the column back"
         );
-        // Shared horizontal scroll on .tree-scroll; wide #hosts so every row
-        // shares one right edge for sticky counts.
+        // Panel-wide rows; absolute count rail; star replaces digit on pin hover.
         assert!(
-            CSS.contains(".tree-scroll {\n  flex: none;\n  width: 100%; max-width: 100%;\n  overflow-x: auto; overflow-y: hidden;"),
-            "hosts and books share one horizontal scroll each, not one per row"
+            CSS.contains(".tree-scroll {\n  flex: none;\n  width: 100%; max-width: 100%;\n  overflow-x: hidden; overflow-y: hidden;"),
+            "the tree stays the panel width; long names ellipsis instead of a sticky rail"
         );
         assert!(
             BODY.contains("class=\"tree-scroll\"")
                 && BODY.contains("id=\"hosts\"")
                 && BODY.contains("id=\"books\""),
-            "the wide tree content sits inside a scroll shell"
+            "hosts and books sit inside the tree shell"
         );
         assert!(
-            CSS.contains(".gcount {\n  position: sticky; right: 0; z-index: 1;"),
-            "counts stick to the right of the shared scrollport"
+            CSS.contains(".gcount {\n  position: absolute; right: 6px;")
+                && CSS.contains("text-align: right;")
+                && CSS.contains("font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;"),
+            "counts sit absolute on the row's right edge, monospace right-aligned"
+        );
+        assert!(
+            !CSS.contains("position: sticky; right:")
+                && !CSS.contains(".gcount {\n  position: sticky"),
+            "counts must not be sticky: they painted over the shelf buttons"
+        );
+        assert!(
+            CSS.contains("width: calc(100% + var(--d));")
+                && CSS.contains("margin-left: calc(0px - var(--d));")
+                && CSS.contains("--d: calc(var(--d) + 11px);")
+                && CSS.contains("padding: 3px 2.5rem 3px calc(4px + var(--d));"),
+            "nested rows span the full panel and reserve a fixed count rail"
+        );
+        assert!(
+            CSS.contains(".shelf {\n  position: sticky; top: 0; left: 0; z-index: 5;"),
+            "the shelf stays above scrolled rows so hunt/sift stay clickable"
+        );
+        assert!(
+            CSS.contains(".gpin {\n  position: absolute; right: 6px;")
+                && CSS.contains(".gpin:hover > .star { visibility: visible; color: var(--dim); }")
+                && CSS.contains(".star.on { visibility: visible; color: var(--accent); }")
+                && CSS.contains(".gpin:hover > .gcount,\n.gpin:has(> .star.on) > .gcount { visibility: hidden; }")
+                && !CSS.contains(".gline:hover > .star")
+                && !CSS.contains(".star {\n  position: absolute; right: 0; top: 50%; transform: translateY(-50%);\n  box-sizing: border-box;\n  min-width: 2.25rem;\n  visibility: hidden; padding: 0; margin: 0; cursor: default;\n  background: none; border: none; color: var(--warn);"),
+            "star replaces the count on digit hover; dim/accent colours, not yellow"
+        );
+        assert!(
+            SCRIPT.contains("var pin = el('span', 'gpin');")
+                && SCRIPT.contains("pin.appendChild(starFor(box, label));")
+                && SCRIPT.contains("pin.appendChild(count);"),
+            "host rows wrap star and count so hover is limited to the digit"
         );
         assert!(
             !SCRIPT.contains("el('span', 'gmain')") && !CSS.contains(".gmain {"),
             "per-row gmain scroll panes must stay gone"
-        );
-        assert!(
-            CSS.contains("position: sticky; top: 0; left: 0;"),
-            "shelf bars stay put while their half scrolls"
         );
         assert!(
             SCRIPT.contains("localStorage.setItem('proxima.shut', JSON.stringify(shutParts));"),
