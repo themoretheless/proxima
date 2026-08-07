@@ -203,8 +203,9 @@ mod p11_docs_honesty_tests {
             "README must state inject skips rewrite and breakpoints"
         );
         assert!(
-            README.contains("compose") && README.contains("not implemented"),
-            "README must keep compose mode as not implemented"
+            README.contains("compose")
+                && (README.contains("\"compose\"") || README.contains("mode: \"compose\"")),
+            "README must document compose mode"
         );
         assert!(
             README.contains("drop marker") || README.contains("drop markers"),
@@ -214,13 +215,17 @@ mod p11_docs_honesty_tests {
             README.contains("uncompressed"),
             "README must document deflate uncompressed replay"
         );
-        // Status codes from the API sketch (200 / 400 / 404 / 409).
+        // Status codes from the API sketch (200 / 400 / 404 / 409 / 502 for compose dial).
         for code in ["**200**", "**400**", "**404**", "**409**"] {
             assert!(
                 README.contains(code),
                 "README ws API must document status {code}"
             );
         }
+        assert!(
+            README.contains("**502**") || README.contains("502"),
+            "README must document compose dial failure as 502"
+        );
     }
 
     #[test]
@@ -244,9 +249,8 @@ mod p11_docs_honesty_tests {
             "PLANS must reference shipped inject/replay API docs"
         );
         assert!(
-            PLANS.contains("compose not implemented")
-                || PLANS.contains("Compose mode") && PLANS.contains("still open"),
-            "PLANS must not claim compose mode is shipped"
+            PLANS.contains("compose") || PLANS.contains("Compose mode"),
+            "PLANS must reference WebSocket compose replay"
         );
     }
 }

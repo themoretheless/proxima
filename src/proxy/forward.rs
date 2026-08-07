@@ -55,6 +55,7 @@ pub struct ForwardContext {
 }
 
 /// Reusable TLS settings for talking to origins.
+#[derive(Clone)]
 pub struct Upstream {
     /// Offers h2 and http/1.1, so the origin picks.
     negotiating: Arc<rustls::ClientConfig>,

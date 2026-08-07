@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long, value_name = "n", default_value_t = 5000)]
     max_flows: usize,
 
+    /// WebSocket frames retained per flow (most recent; older become a gap marker)
+    #[arg(long, value_name = "n", default_value_t = 4096)]
+    max_ws_messages: usize,
+
     /// record finished flows to <data-dir>/capture.duckdb for later querying
     #[arg(long)]
     archive: bool,
@@ -673,6 +677,7 @@ fn config_from(cli: &Cli) -> std::result::Result<Config, String> {
         ui_port: cli.ui_port,
         data_dir,
         max_flows: cli.max_flows,
+        max_ws_messages: cli.max_ws_messages.max(1),
         archive_path,
         decrypt: DecryptRules { mode, allow, deny },
         rewrite: rewrite_from(cli)?,

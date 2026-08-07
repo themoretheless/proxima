@@ -1,10 +1,19 @@
-//! Replay captured WebSocket frames onto a live upgraded flow.
+//! Replay captured WebSocket frames onto a live upgraded flow, or compose a
+//! new dial with `replay_of`.
 //!
 //! Selects frames from a source flow's `ws_messages`, resolves payloads from
 //! inline text or the body store, and injects them in order through
 //! [`crate::proxy::websocket::WsRegistry::inject`]. Injected frames are written
 //! immediately (no rewrite, no breakpoint pause) and recorded with
 //! `injected: true`, same path as `POST .../ws/send`.
+//!
+//! ## Modes
+//!
+//! - **`live`**: inject onto an already-upgraded flow (default target = source).
+//! - **`compose`**: dial a fresh HTTP/1.1 WebSocket to the source request's
+//!   origin, create a new flow with `replay_of`, spawn the same pump as the
+//!   proxy, then inject. `targetFlowId` is refused (target is always the new
+//!   flow).
 //!
 //! ## Limits (honest capture, imperfect wire replay)
 //!
@@ -21,17 +30,36 @@
 //! - **Compressed** (`permessage-deflate`): capture stores inflated display
 //!   bytes in `text` / `body_id`. Replay injects those bytes uncompressed
 //!   (legal, not wire-identical RSV1 frames).
-//! - **Compose mode** (new dial + `replay_of`) is not implemented here yet;
-//!   only `mode: "live"` is supported.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{anyhow, Context as _, Result as AnyResult};
+use base64::Engine as _;
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use http_body_util::Empty;
+use hyper_util::rt::TokioIo;
+use rand::RngCore;
+use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::net::TcpStream;
+use tracing::debug;
 
-use crate::capture::{is_ws_drop_marker, BodyStore};
+use crate::capture::{is_ws_drop_marker, BodyStore, FlowInit, FlowStore};
+use crate::config::strip_port;
+use crate::proxy::breakpoint::PauseHub;
+use crate::proxy::forward::Upstream;
+use crate::proxy::headers;
 use crate::proxy::websocket::{InjectError, WsRegistry};
-use crate::types::{FlowId, WsDirection, WsMessage};
+use crate::proxy::ws_deflate::{self, PermessageDeflateParams};
+use crate::proxy::ws_rewrite::WsRewriteHub;
+use crate::proxy::websocket;
+use crate::types::{
+    now_ms, Flow, FlowClient, FlowError, FlowId, FlowKind, FlowRequest, FlowResponse, FlowServer,
+    FlowState, HeaderPair, HttpVersion, Scheme, WsDirection, WsMessage,
+};
 
 /// Default cap on how many frames one replay may plan. Matches the per-flow
 /// capture window so a full history can be selected without a hostile body.
@@ -41,9 +69,10 @@ pub const DEFAULT_MAX_FRAMES: usize = 4096;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WsReplayRequest {
-    /// Live flow to inject into. Defaults to the source id.
+    /// Live flow to inject into (`mode: live`). Defaults to the source id.
+    /// Refused when `mode` is `"compose"` (target is always the new dial).
     pub target_flow_id: Option<String>,
-    /// `"live"` only for now. `"compose"` is refused until dial support lands.
+    /// `"live"` (default) or `"compose"` (dial a new socket with `replay_of`).
     pub mode: Option<String>,
     /// Explicit indices into `source.ws_messages`. When omitted, every eligible
     /// frame after direction filter is planned (up to `max_frames`).
@@ -56,6 +85,37 @@ pub struct WsReplayRequest {
     pub stop_on_error: Option<bool>,
     /// Cap on planned frames. Defaults to [`DEFAULT_MAX_FRAMES`].
     pub max_frames: Option<usize>,
+}
+
+/// Dependencies for compose mode (dial + pump).
+pub struct ComposeDeps {
+    pub store: Arc<FlowStore>,
+    pub registry: Arc<WsRegistry>,
+    pub pauses: Arc<PauseHub>,
+    pub ws_rewrite: Arc<WsRewriteHub>,
+    pub upstream: Upstream,
+}
+
+/// Plan failures (400/409) or dial/handshake failures (502).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeError {
+    Plan(PlanError),
+    Dial(String),
+}
+
+impl ComposeError {
+    pub fn message(&self) -> &str {
+        match self {
+            ComposeError::Plan(p) => p.message(),
+            ComposeError::Dial(m) => m,
+        }
+    }
+}
+
+impl From<PlanError> for ComposeError {
+    fn from(value: PlanError) -> Self {
+        ComposeError::Plan(value)
+    }
 }
 
 /// Successful or partial reply body for the replay route.
@@ -366,7 +426,7 @@ pub async fn replay_live(
     let mode = request.mode.as_deref().unwrap_or("live");
     if mode != "live" {
         return Err(PlanError::BadRequest(format!(
-            "mode \"{mode}\" is not supported; only \"live\" is implemented"
+            "mode \"{mode}\" is not supported here; use replay_compose for \"compose\""
         )));
     }
 
@@ -404,6 +464,427 @@ pub async fn replay_live(
         messages: recorded,
         error,
     })
+}
+
+/// Dials a new WebSocket from the source request, pumps it under a new flow
+/// with `replay_of`, then injects the planned frames.
+pub async fn replay_compose(
+    deps: &ComposeDeps,
+    source: &Flow,
+    messages: &[WsMessage],
+    request: &WsReplayRequest,
+) -> Result<WsReplayResult, ComposeError> {
+    let mode = request.mode.as_deref().unwrap_or("compose");
+    if mode != "compose" {
+        return Err(ComposeError::Plan(PlanError::BadRequest(format!(
+            "mode \"{mode}\" is not compose"
+        ))));
+    }
+    if request
+        .target_flow_id
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        return Err(ComposeError::Plan(PlanError::BadRequest(
+            "targetFlowId is not used in compose mode; the new dial is always the target".into(),
+        )));
+    }
+
+    let max_frames = request.max_frames.unwrap_or(DEFAULT_MAX_FRAMES);
+    let directions = parse_directions(request.directions.as_deref())?;
+    let (planned, skipped) = plan_frames(
+        messages,
+        deps.store.bodies(),
+        request.indices.as_deref(),
+        directions.as_deref(),
+        max_frames,
+    )?;
+
+    let new_id = match dial_and_start_compose(deps, source).await {
+        Ok(id) => id,
+        Err(err) => return Err(ComposeError::Dial(err)),
+    };
+
+    let delay_ms = request.delay_ms.unwrap_or(0);
+    let stop_on_error = request.stop_on_error.unwrap_or(true);
+    let (sent, recorded, error) = execute_live(
+        deps.registry.as_ref(),
+        &new_id,
+        &planned,
+        delay_ms,
+        stop_on_error,
+    )
+    .await;
+
+    if sent == 0 {
+        if let Some(err) = error {
+            return Err(ComposeError::Plan(PlanError::Conflict(err)));
+        }
+    }
+
+    Ok(WsReplayResult {
+        source_flow_id: source.id.clone(),
+        target_flow_id: new_id,
+        mode: "compose".into(),
+        planned: planned.len(),
+        sent,
+        skipped,
+        messages: recorded,
+        error,
+    })
+}
+
+/// Create flow, dial upgrade, spawn pump, wait until registry is live.
+async fn dial_and_start_compose(deps: &ComposeDeps, source: &Flow) -> Result<FlowId, String> {
+    let req = &source.request;
+    let host = strip_port(&req.host).to_string();
+    let port = req.port;
+    let path = if req.path.is_empty() {
+        "/".to_string()
+    } else {
+        req.path.clone()
+    };
+
+    let id = deps.store.create(FlowInit {
+        kind: FlowKind::Websocket,
+        intercepted: true,
+        request: FlowRequest {
+            method: req.method.clone(),
+            url: req.url.clone(),
+            scheme: req.scheme,
+            authority: req.authority.clone(),
+            host: req.host.clone(),
+            port: req.port,
+            path: path.clone(),
+            http_version: HttpVersion::Http11,
+            headers: req.headers.clone(),
+            body: None,
+        },
+        client: FlowClient {
+            address: "127.0.0.1".into(),
+            port: 0,
+        },
+        server: FlowServer {
+            address: Some(host.clone()),
+            port: Some(port),
+            ..FlowServer::default()
+        },
+        replay_of: Some(source.id.clone()),
+        transport: None,
+        connection_id: None,
+        stream_id: None,
+        upstream_stream_id: None,
+    });
+    deps.store.update(&id, |flow| {
+        flow.ws_messages = Some(Vec::new());
+    });
+
+    let dial_result = dial_websocket_upgrade(&deps.upstream, req, &host, port, &path).await;
+    let dialed = match dial_result {
+        Ok(d) => d,
+        Err(err) => {
+            let msg = format!("{err:#}");
+            deps.store.fail(
+                &id,
+                FlowError {
+                    message: msg.clone(),
+                    code: Some("compose".into()),
+                    likely_pinning: None,
+                },
+            );
+            return Err(msg);
+        }
+    };
+
+    let connect_end = dialed.connect_end;
+    let request_sent = dialed.request_sent;
+    let response_start = dialed.response_start;
+    let deflate = dialed.deflate;
+    let response_headers = dialed.response_headers.clone();
+    let facts = dialed.tls_facts;
+
+    deps.store.update(&id, |flow| {
+        flow.state = FlowState::Streaming;
+        flow.timings.connect_end = Some(connect_end);
+        flow.timings.request_sent = Some(request_sent);
+        flow.timings.response_start = Some(response_start);
+        if let Some(facts) = &facts {
+            flow.timings.tls_end = facts.tls_end;
+            flow.server.sni = facts.sni.clone();
+            flow.server.alpn = facts.alpn.clone();
+            flow.server.tls_version = facts.tls_version.clone();
+            flow.server.cipher = facts.cipher.clone();
+            flow.server.cert_fingerprint = facts.cert_fingerprint.clone();
+        }
+        flow.response = Some(FlowResponse {
+            status: 101,
+            status_text: "Switching Protocols".into(),
+            http_version: HttpVersion::Http11,
+            headers: response_headers,
+            body: None,
+        });
+    });
+
+    // Duplex stands in for the missing browser half. hold_end is drained so
+    // origin→client frames do not fill the buffer and stall the pump.
+    let (client_end, mut hold_end) = tokio::io::duplex(64 * 1024);
+    let store = deps.store.clone();
+    let registry = deps.registry.clone();
+    let pauses = deps.pauses.clone();
+    let ws_rewrite = deps.ws_rewrite.clone();
+    let flow_id = id.clone();
+    let ws_host = host.clone();
+    let ws_path = path.clone();
+    let upgraded = dialed.upstream_io;
+
+    tokio::spawn(async move {
+        // Discard anything written toward the synthetic client so Recv from
+        // origin cannot block the pump forever.
+        let drain = async {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match hold_end.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        tokio::select! {
+            _ = drain => {}
+            _ = websocket::pump(
+                client_end,
+                upgraded,
+                store,
+                flow_id,
+                registry,
+                pauses,
+                ws_rewrite,
+                ws_host,
+                ws_path,
+                deflate,
+            ) => {}
+        }
+    });
+
+    // Wait until the pump has registered inject senders.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if deps.registry.is_live(&id) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let msg = "compose WebSocket pump did not become live in time".to_string();
+            deps.store.fail(
+                &id,
+                FlowError {
+                    message: msg.clone(),
+                    code: Some("compose".into()),
+                    likely_pinning: None,
+                },
+            );
+            return Err(msg);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    Ok(id)
+}
+
+struct DialedWs {
+    upstream_io: TokioIo<hyper::upgrade::Upgraded>,
+    connect_end: u64,
+    request_sent: u64,
+    response_start: u64,
+    response_headers: Vec<HeaderPair>,
+    tls_facts: Option<crate::proxy::forward::TlsFacts>,
+    deflate: PermessageDeflateParams,
+}
+
+async fn dial_websocket_upgrade(
+    upstream: &Upstream,
+    source_req: &FlowRequest,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> AnyResult<DialedWs> {
+    let stream = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("connecting to {host}:{port}"))?;
+    let _ = stream.set_nodelay(true);
+    let connect_end = now_ms();
+
+    match source_req.scheme {
+        Scheme::Http => {
+            let request_sent = now_ms();
+            let (io, headers, deflate) =
+                http1_upgrade(stream, source_req, host, port, path).await?;
+            Ok(DialedWs {
+                upstream_io: io,
+                connect_end,
+                request_sent,
+                response_start: now_ms(),
+                response_headers: headers,
+                tls_facts: None,
+                deflate,
+            })
+        }
+        Scheme::Https => {
+            let name = ServerName::try_from(host.to_string())
+                .map_err(|_| anyhow!("{host} is not a usable TLS server name"))?;
+            // Upgrades require HTTP/1.1; never offer h2.
+            let tls = tokio_rustls::TlsConnector::from(upstream.client_config(false))
+                .connect(name, stream)
+                .await
+                .with_context(|| format!("TLS handshake with {host}"))?;
+            let facts = crate::proxy::forward::tls_facts(&tls, host);
+            let request_sent = now_ms();
+            let (io, headers, deflate) = http1_upgrade(tls, source_req, host, port, path).await?;
+            Ok(DialedWs {
+                upstream_io: io,
+                connect_end,
+                request_sent,
+                response_start: now_ms(),
+                response_headers: headers,
+                tls_facts: Some(facts),
+                deflate,
+            })
+        }
+    }
+}
+
+async fn http1_upgrade<I>(
+    io: I,
+    source_req: &FlowRequest,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> AnyResult<(
+    TokioIo<hyper::upgrade::Upgraded>,
+    Vec<HeaderPair>,
+    PermessageDeflateParams,
+)>
+where
+    I: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .context("HTTP/1.1 handshake for WebSocket compose")?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.with_upgrades().await {
+            debug!(error = %err, "compose upgrade connection ended");
+        }
+    });
+
+    let mut map = HeaderMap::new();
+    for (name, value) in &source_req.headers {
+        if name.starts_with(':') {
+            continue;
+        }
+        // Fresh key every dial; drop captured length/transfer framing.
+        if name.eq_ignore_ascii_case("sec-websocket-key")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(v) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.append(n, v);
+    }
+    // Ensure upgrade framing is present even if capture stripped hop headers.
+    map.insert(
+        http::header::UPGRADE,
+        HeaderValue::from_static("websocket"),
+    );
+    map.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    map.insert(
+        http::header::SEC_WEBSOCKET_VERSION,
+        HeaderValue::from_static("13"),
+    );
+    let mut key = [0u8; 16];
+    rand::rng().fill_bytes(&mut key);
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+    map.insert(
+        http::header::SEC_WEBSOCKET_KEY,
+        HeaderValue::from_str(&key_b64).expect("base64 is valid header value"),
+    );
+
+    let authority = if port == 80 || port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    headers::set_host(&mut map, &authority);
+    // Keep upgrade hop headers that for_upstream would otherwise strip.
+    let sent = headers::for_upstream(&map, headers::Wire::Http1);
+    // for_upstream with websocket upgrade keeps Connection/Upgrade; merge key.
+    let mut sent = sent;
+    for name in [
+        http::header::SEC_WEBSOCKET_KEY,
+        http::header::SEC_WEBSOCKET_VERSION,
+        http::header::SEC_WEBSOCKET_EXTENSIONS,
+        http::header::SEC_WEBSOCKET_PROTOCOL,
+    ] {
+        if let Some(v) = map.get(&name) {
+            sent.insert(name, v.clone());
+        }
+    }
+    // Always re-apply our generated key last.
+    sent.insert(
+        http::header::SEC_WEBSOCKET_KEY,
+        HeaderValue::from_str(&key_b64).expect("base64"),
+    );
+
+    let uri: Uri = path
+        .parse()
+        .with_context(|| format!("{path} is not a usable request path"))?;
+    let method = Method::from_bytes(source_req.method.as_bytes()).unwrap_or(Method::GET);
+    let mut request = Request::new(Empty::<Bytes>::new());
+    *request.method_mut() = method;
+    *request.uri_mut() = uri;
+    *request.headers_mut() = sent;
+
+    let mut response = sender
+        .send_request(request)
+        .await
+        .context("sending WebSocket upgrade request")?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(anyhow!(
+            "origin answered {} instead of 101 Switching Protocols",
+            response.status()
+        ));
+    }
+
+    let response_headers = headers::to_pairs(response.headers());
+    let ext_joined = {
+        let mut parts = Vec::new();
+        for val in response
+            .headers()
+            .get_all(http::header::SEC_WEBSOCKET_EXTENSIONS)
+        {
+            if let Ok(s) = val.to_str() {
+                parts.push(s);
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    };
+    let deflate = ws_deflate::parse_sec_websocket_extensions(ext_joined.as_deref());
+
+    let upgraded = hyper::upgrade::on(&mut response)
+        .await
+        .context("taking the upgraded WebSocket stream")?;
+    Ok((TokioIo::new(upgraded), response_headers, deflate))
 }
 
 /// Convenience for tests and call sites that hold an `Arc` registry.
@@ -1129,7 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compose_mode_is_refused() {
+    async fn compose_mode_is_refused_on_live_path() {
         let registry = WsRegistry::new();
         let bodies = BodyStore::new(1024);
         let messages = vec![msg(WsDirection::Send, 1, Some("hi"), 2, None)];
@@ -1141,6 +1622,74 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PlanError::BadRequest(_)));
-        assert!(err.message().contains("live"));
+        assert!(
+            err.message().contains("compose") || err.message().contains("replay_compose"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_rejects_target_flow_id() {
+        use crate::config::Config;
+        use crate::proxy::breakpoint::PauseHub;
+        use crate::proxy::ws_rewrite::WsRewriteHub;
+        use crate::types::{FlowClient, FlowRequest, FlowServer, FlowState, Scheme};
+
+        let store = Arc::new(FlowStore::new(8, 1024, 4096));
+        let config = Config::default();
+        let upstream = crate::proxy::forward::Upstream::new(&config).expect("upstream");
+        let deps = ComposeDeps {
+            store: store.clone(),
+            registry: Arc::new(WsRegistry::new()),
+            pauses: Arc::new(PauseHub::new()),
+            ws_rewrite: WsRewriteHub::empty(),
+            upstream,
+        };
+        let source = Flow {
+            id: "src".into(),
+            kind: crate::types::FlowKind::Websocket,
+            state: FlowState::Complete,
+            intercepted: true,
+            request: FlowRequest {
+                method: "GET".into(),
+                url: "http://127.0.0.1/ws".into(),
+                scheme: Scheme::Http,
+                authority: "127.0.0.1".into(),
+                host: "127.0.0.1".into(),
+                port: 80,
+                path: "/ws".into(),
+                http_version: crate::types::HttpVersion::Http11,
+                headers: vec![],
+                body: None,
+            },
+            response: None,
+            error: None,
+            timings: Default::default(),
+            client: FlowClient {
+                address: "127.0.0.1".into(),
+                port: 1,
+            },
+            server: FlowServer::default(),
+            replay_of: None,
+            comment: None,
+            ws_messages: Some(vec![]),
+            tunnel: None,
+            rewrites: vec![],
+            mocked: false,
+            transport: None,
+            connection_id: None,
+            stream_id: None,
+            upstream_stream_id: None,
+        };
+        let req = WsReplayRequest {
+            mode: Some("compose".into()),
+            target_flow_id: Some("other".into()),
+            ..Default::default()
+        };
+        let err = replay_compose(&deps, &source, &[], &req)
+            .await
+            .expect_err("targetFlowId must be refused in compose");
+        assert!(matches!(err, ComposeError::Plan(PlanError::BadRequest(_))));
     }
 }

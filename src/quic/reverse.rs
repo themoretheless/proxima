@@ -41,16 +41,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::{Buf, Bytes};
 use http::header::HeaderMap;
-use http::Uri;
+use http::{Request as HttpRequest, Uri};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::ca::CertAuthority;
 use crate::capture::{new_id, FlowStore};
+use crate::config::Config;
+use crate::proxy::forward::Upstream;
 use crate::proxy::headers::{self, Wire};
+use crate::types::{FlowResponse, HttpVersion};
 
 use super::endpoint::QuicEndpoint;
 use super::forward_upstream::{dial_upstream_h3, split_host_port, UpstreamH3};
@@ -59,6 +68,19 @@ use super::stream::{
     classify_bridge_error_code, codes, record_handshake_failure, H3StreamFlow,
 };
 use super::tls::client_crypto;
+
+/// How reverse reaches the origin for one client QUIC connection.
+enum OriginLeg {
+    /// Multiplexed H3 session (preferred).
+    H3(UpstreamH3),
+    /// TCP HTTP/1.1 or HTTP/2 when origin has no usable H3.
+    Tcp {
+        host: String,
+        port: u16,
+        authority: String,
+        tls: Upstream,
+    },
+}
 
 /// Cap hung DNS/handshake so reverse connection tasks cannot pin drain forever.
 const REVERSE_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -120,11 +142,17 @@ pub async fn run_reverse_h3(
     endpoint.set_default_client_config(client_config);
 
     let origin = ReverseOrigin::from_spec(&cfg.upstream);
+    // TCP fallback TLS settings (h2 + http/1.1). Built once; ClientConfig is Arc.
+    let mut tcp_cfg = Config::default();
+    tcp_cfg.insecure_upstream = cfg.insecure_upstream;
+    let tcp_upstream =
+        Upstream::new(&tcp_cfg).context("building TCP upstream TLS for reverse H3 fallback")?;
+
     info!(
         local = %endpoint.local_addr(),
         upstream = %cfg.upstream,
         authority = %origin.authority,
-        "QUIC reverse H3 mode"
+        "QUIC reverse H3 mode (TCP HTTP/2 fallback when origin has no h3)"
     );
 
     loop {
@@ -142,10 +170,11 @@ pub async fn run_reverse_h3(
                         let raw = endpoint.raw().clone();
                         let origin = origin.clone();
                         let drain = drain_tx.clone();
+                        let tcp_upstream = tcp_upstream.clone();
                         tokio::spawn(async move {
                             let _drain = drain.clone();
                             if let Err(err) =
-                                reverse_one(connecting, raw, store, origin, drain).await
+                                reverse_one(connecting, raw, store, origin, tcp_upstream, drain).await
                             {
                                 // Handshake/dial failures already warn + may record flows.
                                 debug!(error = %err, "reverse h3 connection failed");
@@ -164,6 +193,7 @@ async fn reverse_one(
     endpoint: quinn::Endpoint,
     store: Arc<FlowStore>,
     origin: ReverseOrigin,
+    tcp_upstream: Upstream,
     drain_tx: mpsc::Sender<()>,
 ) -> Result<()> {
     let remote = incoming.remote_address();
@@ -205,46 +235,50 @@ async fn reverse_one(
         "reverse H3 client connected"
     );
 
-    // Upstream dial (1-RTT, ALPN h3) with a hard timeout so hung DNS cannot pin drain.
-    let upstream: UpstreamH3 = match tokio::time::timeout(
+    // Prefer H3 origin. On failure, fall back to TCP HTTP/1.1 or HTTP/2 so
+    // reverse stays usable when the origin has no h3 (common for many APIs).
+    let origin_leg = match tokio::time::timeout(
         REVERSE_DIAL_TIMEOUT,
         dial_upstream_h3(&endpoint, &origin.dial_spec),
     )
     .await
     {
-        Ok(Ok(up)) => up,
-        Ok(Err(err)) => {
-            let err = err.context(format!(
-                "dial upstream H3 {} ({})",
-                origin.authority, codes::QUIC_UPSTREAM
-            ));
-            warn!(
-                %remote,
+        Ok(Ok(up)) => {
+            info!(
                 connection_id = %connection_id,
                 upstream = %origin.authority,
-                error = %err,
-                "reverse upstream dial failed after client connect"
+                "reverse origin dialed over H3"
             );
-            return Err(err);
+            OriginLeg::H3(up)
+        }
+        Ok(Err(h3_err)) => {
+            warn!(
+                connection_id = %connection_id,
+                upstream = %origin.authority,
+                error = %h3_err,
+                "reverse H3 origin dial failed; falling back to TCP HTTP/1.1 or HTTP/2"
+            );
+            OriginLeg::Tcp {
+                host: origin.host.clone(),
+                port: origin.port,
+                authority: origin.authority.clone(),
+                tls: tcp_upstream,
+            }
         }
         Err(_) => {
-            let err = anyhow::anyhow!(
-                "dial upstream H3 {}: timed out after {}s ({})",
-                origin.authority,
-                REVERSE_DIAL_TIMEOUT.as_secs(),
-                codes::QUIC_UPSTREAM
-            );
             warn!(
-                %remote,
                 connection_id = %connection_id,
                 upstream = %origin.authority,
-                error = %err,
-                "reverse upstream dial timed out"
+                "reverse H3 origin dial timed out; falling back to TCP HTTP/1.1 or HTTP/2"
             );
-            return Err(err);
+            OriginLeg::Tcp {
+                host: origin.host.clone(),
+                port: origin.port,
+                authority: origin.authority.clone(),
+                tls: tcp_upstream,
+            }
         }
     };
-    let send_request = upstream.send_request;
 
     let mut h3_client_side = h3::server::Connection::new(h3_quinn::Connection::new(client_conn))
         .await
@@ -255,6 +289,21 @@ async fn reverse_one(
         connection_id: connection_id.clone(),
         sni: client_sni,
         alpn: client_alpn,
+    };
+
+    // H3 path keeps a shared SendRequest; TCP path clones tls settings per stream.
+    let h3_sender = match &origin_leg {
+        OriginLeg::H3(up) => Some(up.send_request.clone()),
+        OriginLeg::Tcp { .. } => None,
+    };
+    let tcp_leg = match &origin_leg {
+        OriginLeg::Tcp {
+            host,
+            port,
+            authority,
+            tls,
+        } => Some((host.clone(), *port, authority.clone(), tls.clone())),
+        OriginLeg::H3(_) => None,
     };
 
     loop {
@@ -272,14 +321,23 @@ async fn reverse_one(
                     }
                 };
                 let store = store.clone();
-                let mut out = send_request.clone();
                 let origin = origin.clone();
                 let client = client.clone();
                 let drain = drain_tx.clone();
+                let h3_sender = h3_sender.clone();
+                let tcp_leg = tcp_leg.clone();
                 tokio::spawn(async move {
                     let _drain = drain;
-                    if let Err(err) =
-                        proxy_request(req, &mut in_stream, &mut out, store, &origin, client).await
+                    if let Err(err) = proxy_request(
+                        req,
+                        &mut in_stream,
+                        h3_sender,
+                        tcp_leg,
+                        store,
+                        &origin,
+                        client,
+                    )
+                    .await
                     {
                         debug!(error = %err, "reverse h3 stream failed");
                     }
@@ -303,7 +361,8 @@ async fn reverse_one(
 async fn proxy_request(
     req: http::Request<()>,
     in_stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
-    out: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    h3_out: Option<h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>>,
+    tcp_leg: Option<(String, u16, String, Upstream)>,
     store: Arc<FlowStore>,
     origin: &ReverseOrigin,
     client: ClientLeg,
@@ -352,11 +411,39 @@ async fn proxy_request(
         "reverse h3 stream bridging"
     );
 
-    match bridge_stream(method, meta.path.clone(), client_headers, in_stream, out, &flow, origin)
+    let bridge = if let Some(mut out) = h3_out {
+        bridge_stream(
+            method,
+            meta.path.clone(),
+            client_headers,
+            in_stream,
+            &mut out,
+            &flow,
+            origin,
+        )
         .await
-    {
+    } else if let Some((host, port, authority, tls)) = tcp_leg {
+        flow.note_rewrite(
+            "reverse origin fell back to TCP HTTP/1.1 or HTTP/2 (no h3)".to_string(),
+        );
+        bridge_stream_tcp(
+            method,
+            meta.path.clone(),
+            client_headers,
+            in_stream,
+            &flow,
+            &host,
+            port,
+            &authority,
+            &tls,
+        )
+        .await
+    } else {
+        Err(anyhow!("reverse stream has neither H3 nor TCP origin leg"))
+    };
+
+    match bridge {
         Ok(()) => {
-            // Close event: Complete (bridge already recorded response body).
             flow.finish();
             Ok(())
         }
@@ -472,6 +559,177 @@ async fn bridge_stream(
     flow.set_response_body(response_body);
 
     Ok(())
+}
+
+/// Bridge one H3 client stream to a TCP HTTP/1.1 or HTTP/2 origin.
+///
+/// Client still speaks H3 to Proxima. Origin response version is recorded
+/// honestly (`Http2` / `Http11`); `upstream_stream_id` stays `None`.
+async fn bridge_stream_tcp(
+    method: http::Method,
+    path: String,
+    client_headers: HeaderMap,
+    in_stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flow: &H3StreamFlow,
+    host: &str,
+    port: u16,
+    authority: &str,
+    tls: &Upstream,
+) -> Result<()> {
+    let req_encoding = headers::content_encoding(&client_headers);
+    let req_mime = headers::content_type(&client_headers);
+
+    // Collect client body fully so we can hand hyper a Full body (one TCP
+    // connection per request, same as the classic proxy).
+    let mut req_writer = flow.body_writer();
+    let mut body_buf = Vec::new();
+    while let Some(mut chunk) = in_stream.recv_data().await.context("recv client body")? {
+        let bytes = chunk.copy_to_bytes(chunk.remaining());
+        req_writer.write(&bytes);
+        body_buf.extend_from_slice(&bytes);
+    }
+    let request_body = if req_writer.seen() > 0 {
+        Some(req_writer.finish(req_encoding, req_mime))
+    } else {
+        None
+    };
+    flow.set_request_body(request_body);
+
+    let stream = TcpStream::connect((host, port))
+        .await
+        .with_context(|| format!("connecting TCP origin {host}:{port}"))?;
+    let _ = stream.set_nodelay(true);
+
+    let name = ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow!("{host} is not a usable TLS server name"))?;
+    let tls_stream = tokio_rustls::TlsConnector::from(tls.client_config(true))
+        .connect(name, stream)
+        .await
+        .with_context(|| format!("TLS handshake with TCP origin {host}"))?;
+
+    let alpn = {
+        let (_, conn) = tls_stream.get_ref();
+        conn.alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+    };
+    let use_h2 = alpn.as_deref() == Some("h2");
+    let wire = if use_h2 { Wire::Http2 } else { Wire::Http1 };
+
+    let mut upstream_headers = headers::for_upstream(&client_headers, wire);
+    if !use_h2 {
+        headers::set_host(&mut upstream_headers, authority);
+    }
+    let upstream_uri = rewrite_upstream_uri(&path, authority)?;
+    let body = Full::new(Bytes::from(body_buf));
+    let mut builder = HttpRequest::builder().method(method).uri(upstream_uri);
+    for (name, value) in upstream_headers.iter() {
+        builder = builder.header(name, value);
+    }
+    let out_req = builder.body(body).context("building TCP upstream request")?;
+
+    flow.mark_request_sent();
+
+    let response = if use_h2 {
+        send_origin_http2(tls_stream, out_req).await?
+    } else {
+        send_origin_http1(tls_stream, out_req).await?
+    };
+
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let version = HttpVersion::from_http(parts.version);
+    let client_resp_headers = headers::for_client(&parts.headers, status);
+    let resp_header_pairs = headers::to_pairs(&client_resp_headers);
+    let resp_encoding = headers::content_encoding(&client_resp_headers);
+    let resp_mime = headers::content_type(&client_resp_headers);
+
+    // Honest origin version; do not claim HTTP/3 on the response.
+    flow.set_response(FlowResponse {
+        status: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or("").to_string(),
+        http_version: version,
+        headers: resp_header_pairs,
+        body: None,
+    });
+
+    let mut client_resp = http::Response::builder().status(status);
+    for (name, value) in client_resp_headers.iter() {
+        client_resp = client_resp.header(name, value);
+    }
+    in_stream
+        .send_response(client_resp.body(()).context("client response")?)
+        .await
+        .context("send client response headers")?;
+
+    let mut resp_writer = flow.body_writer();
+    let mut body = body;
+    while let Some(frame) = body
+        .frame()
+        .await
+        .transpose()
+        .context("recv TCP origin body")?
+    {
+        if let Ok(data) = frame.into_data() {
+            resp_writer.write(&data);
+            in_stream
+                .send_data(data)
+                .await
+                .context("send client body")?;
+        }
+    }
+    in_stream.finish().await.context("finish client stream")?;
+
+    let response_body = if resp_writer.seen() > 0 {
+        Some(resp_writer.finish(resp_encoding, resp_mime))
+    } else {
+        None
+    };
+    flow.set_response_body(response_body);
+    // upstream_stream_id intentionally left None for TCP origin.
+
+    Ok(())
+}
+
+async fn send_origin_http1<I>(
+    io: I,
+    request: HttpRequest<Full<Bytes>>,
+) -> Result<http::Response<Incoming>>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .context("HTTP/1.1 handshake with reverse TCP origin")?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            debug!(error = %err, "reverse TCP origin HTTP/1.1 connection ended");
+        }
+    });
+    sender
+        .send_request(request)
+        .await
+        .context("sending request to reverse TCP origin")
+}
+
+async fn send_origin_http2<I>(
+    io: I,
+    request: HttpRequest<Full<Bytes>>,
+) -> Result<http::Response<Incoming>>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+        .await
+        .context("HTTP/2 handshake with reverse TCP origin")?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            debug!(error = %err, "reverse TCP origin HTTP/2 connection ended");
+        }
+    });
+    sender
+        .send_request(request)
+        .await
+        .context("sending request to reverse TCP origin")
 }
 
 /* ------------------------------------------------------------------ */

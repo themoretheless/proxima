@@ -384,7 +384,7 @@ defaults: `mode: "live"`, target = source id, auto-select injectable frames.
 | Field | Type | Default |
 | --- | --- | --- |
 | `targetFlowId` | string | source id |
-| `mode` | `"live"` only | `"live"` (`"compose"` is refused) |
+| `mode` | `"live"` \| `"compose"` | `"live"` |
 | `indices` | number[] | auto-select all eligible frames |
 | `directions` | `("send"\|"recv")[]` | both |
 | `delayMs` | u64 | `0` |
@@ -405,16 +405,17 @@ Responses:
 - **200** `{ sourceFlowId, targetFlowId, mode, planned, sent, skipped, messages, error? }`
   - `messages` are the injected `WsMessage` records (with `injected: true`)
   - partial progress is possible when `stopOnError` is false; `error` names the first failure
-- **400** bad plan: unsupported `mode` (including compose), bad directions, out-of-range indices, explicit drop-marker or continuation index, non-injectable opcode, control payload over 125 bytes, `maxFrames` less than 1, or unknown JSON fields
-- **404** unknown source or `targetFlowId`
+- **400** bad plan: unsupported `mode`, compose with `targetFlowId` set, bad directions, out-of-range indices, explicit drop-marker or continuation index, non-injectable opcode, control payload over 125 bytes, `maxFrames` less than 1, or unknown JSON fields
+- **404** unknown source or `targetFlowId` (live mode)
 - **409** not live / inject queue full / closed before write; also missing body-store bytes or truncated capture when nothing has been sent yet
+- **502** compose dial/handshake failure (origin refused upgrade or network error)
 
 **Fail-closed limits (inject and replay share these):**
 
 - Opcodes **1, 2, 8, 9, 10** only. Opcode **0** (continuation) and **15** (retention drop marker) are never injected. Auto-selection skips them; an explicit index fails with 400.
 - Truncated captures and missing non-empty body-store bytes fail closed (409 when nothing was sent).
 - Under permessage-deflate, capture stores inflated display bytes; replay injects those bytes **uncompressed** (legal frames, not wire-identical RSV1).
-- Compose mode (dial a new socket with `replay_of`) is **not implemented**.
+- **Compose mode** (`mode: "compose"`): dials a new HTTP/1.1 WebSocket to the source request's origin, creates a flow with `replay_of`, injects planned frames. `targetFlowId` is refused (target is always the new dial).
 
 **WebSocket frame breakpoints:** matching frames can be held before forward,
 edited, released, or dropped. Rules live only in memory (lost on restart) and

@@ -483,7 +483,7 @@ h2 { font-size: 19px; margin: 0 0 10px; }
   flex: 1; min-height: 48px; padding: 0 10px;
   background: var(--card); color: var(--dim);
   border: 1px solid var(--line); border-radius: 11px;
-  font: inherit; font-size: 15px; cursor: pointer;
+  font: inherit; font-size: 15px; cursor: default;
 }
 .tab.on { color: var(--ink); border-color: var(--accent); background: var(--pick); }
 .panel[hidden] { display: none; }
@@ -525,7 +525,7 @@ pre {
 .btn {
   width: 100%; min-height: 56px; font: inherit; font-size: 17px; font-weight: 600;
   background: var(--btn); color: var(--ink); border: 1px solid var(--btn-line);
-  border-radius: 12px; cursor: pointer;
+  border-radius: 12px; cursor: default;
 }
 .btn:active { background: var(--btn-down); }
 .btn[disabled] { opacity: .6; }

@@ -202,7 +202,8 @@ impl Servers {
             config.max_flows,
             config.max_body_bytes,
             config.max_total_body_bytes,
-        );
+        )
+        .with_max_ws_messages(config.max_ws_messages);
         if let Some(path) = &config.archive_path {
             // A failure here stops the start. Someone who passed --archive and
             // silently got no archive would only find out later, when the

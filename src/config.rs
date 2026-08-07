@@ -101,6 +101,10 @@ fn default_mock_status() -> u16 {
     200
 }
 
+fn default_max_ws_messages() -> usize {
+    crate::capture::DEFAULT_MAX_WS_MESSAGES
+}
+
 /// Default max body size eligible for rewrite when [`BodyRewrite::max_bytes`] is 0.
 pub const DEFAULT_BODY_REWRITE_MAX_BYTES: u64 = 1_048_576;
 
@@ -961,6 +965,10 @@ pub struct Config {
     pub max_body_bytes: u64,
     /// Total memory ceiling across all retained bodies.
     pub max_total_body_bytes: u64,
+    /// Per-flow WebSocket frame retention window (most recent frames).
+    /// Defaults to [`crate::capture::DEFAULT_MAX_WS_MESSAGES`].
+    #[serde(default = "default_max_ws_messages")]
+    pub max_ws_messages: usize,
     /// Where finished flows are recorded for later querying. `None` keeps
     /// everything in memory, which is what a build without the `archive`
     /// feature can do at all.
@@ -1013,6 +1021,7 @@ impl Default for Config {
             max_flows: 5000,
             max_body_bytes: 10 * 1024 * 1024,
             max_total_body_bytes: 512 * 1024 * 1024,
+            max_ws_messages: default_max_ws_messages(),
             archive_path: None,
             decrypt: DecryptRules::default(),
             rewrite: RewriteRules::default(),

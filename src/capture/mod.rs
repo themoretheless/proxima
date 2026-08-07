@@ -18,6 +18,7 @@ pub mod archive;
 pub mod bodies;
 pub mod decode;
 pub mod har;
+pub mod pretty;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -38,6 +39,7 @@ pub use archive::{Archive, ArchiveRow, QueryError, QueryResult};
 pub use bodies::{BodyStore, BodyWriter};
 pub use decode::{decode_body, is_textual};
 pub use har::flows_to_har;
+pub use pretty::{soft_view, SoftView, SoftViewKind};
 
 /// Deep enough that a websocket client doing a full page render does not lag,
 /// small enough that a subscriber that stopped reading cannot cost much.
@@ -45,10 +47,13 @@ const EVENT_CAPACITY: usize = 1024;
 const DEFAULT_QUERY_LIMIT: usize = 200;
 const MAX_QUERY_LIMIT: usize = 1000;
 
-/// WebSocket frames retained per flow. Frames are the one part of a flow whose
-/// count the proxy does not control: a socket that stays open for a day keeps
-/// appending, so the list is a window on the most recent traffic.
+/// Default WebSocket frames retained per flow. Frames are the one part of a
+/// flow whose count the proxy does not control: a socket that stays open for a
+/// day keeps appending, so the list is a window on the most recent traffic.
+/// Override via [`FlowStore::with_max_ws_messages`] / `Config.max_ws_messages`.
 pub const MAX_WS_MESSAGES: usize = 4096;
+/// Alias for docs and CLI defaults.
+pub const DEFAULT_MAX_WS_MESSAGES: usize = MAX_WS_MESSAGES;
 
 /// How many frames go at once when the cap is reached. Discarding a single
 /// frame per arrival would shift the whole retained window on every frame, so
@@ -91,6 +96,8 @@ pub struct FlowStore {
     bodies: BodyStore,
     max_flows: usize,
     max_body_bytes: u64,
+    /// Per-flow WebSocket frame window (most recent). See [`MAX_WS_MESSAGES`].
+    max_ws_messages: usize,
     /// Where finished flows go to outlive the ring buffer. `None` unless an
     /// archive was configured, in which case the store behaves exactly as it
     /// did before this existed.
@@ -129,8 +136,18 @@ impl FlowStore {
             // created, which no configuration can plausibly want.
             max_flows: max_flows.max(1),
             max_body_bytes,
+            max_ws_messages: DEFAULT_MAX_WS_MESSAGES.max(1),
             archive: None,
         }
+    }
+
+    /// Overrides the per-flow WebSocket frame retention window.
+    ///
+    /// A value of zero is treated as one so the store cannot discard every
+    /// frame on insert. Larger values raise memory use on long-lived sockets.
+    pub fn with_max_ws_messages(mut self, max_ws_messages: usize) -> Self {
+        self.max_ws_messages = max_ws_messages.max(1);
+        self
     }
 
     /// Records finished flows to `archive` as well as holding them in memory.
@@ -139,6 +156,11 @@ impl FlowStore {
     pub fn with_archive(mut self, archive: Archive) -> Self {
         self.archive = Some(archive);
         self
+    }
+
+    /// Per-flow WebSocket frame retention cap.
+    pub fn max_ws_messages(&self) -> usize {
+        self.max_ws_messages
     }
 
     pub fn archive(&self) -> Option<&Archive> {
@@ -356,19 +378,20 @@ impl FlowStore {
         }
     }
 
-    /// Records one frame, keeping at most [`MAX_WS_MESSAGES`] of them. Frames
-    /// past the cap are discarded oldest first, their bodies are released, and
-    /// a marker frame is left at the head of the list so a reader can tell that
-    /// the history is not complete.
+    /// Records one frame, keeping at most [`Self::max_ws_messages`] of them.
+    /// Frames past the cap are discarded oldest first, their bodies are
+    /// released, and a marker frame is left at the head of the list so a
+    /// reader can tell that the history is not complete.
     pub fn add_ws_message(&self, id: &str, message: WsMessage) {
         let mut orphaned = Vec::new();
+        let cap = self.max_ws_messages;
         let (stored_ok, marker) = {
             let mut inner = self.inner.lock();
             match inner.flows.get_mut(id) {
                 Some(stored) => {
                     let messages = stored.flow.ws_messages.get_or_insert_with(Vec::new);
                     messages.push(message.clone());
-                    let marker = trim_ws_messages(messages, &mut orphaned);
+                    let marker = trim_ws_messages(messages, &mut orphaned, cap);
                     (true, marker)
                 }
                 None => {
@@ -561,7 +584,7 @@ pub fn is_ws_drop_marker(message: &WsMessage) -> bool {
     message.opcode == WS_DROPPED_OPCODE
 }
 
-fn ws_drop_marker(dropped: u64, at: u64, direction: WsDirection) -> WsMessage {
+fn ws_drop_marker(dropped: u64, at: u64, direction: WsDirection, cap: usize) -> WsMessage {
     WsMessage {
         at,
         direction,
@@ -569,7 +592,7 @@ fn ws_drop_marker(dropped: u64, at: u64, direction: WsDirection) -> WsMessage {
         size: dropped,
         truncated: true,
         text: Some(format!(
-            "{dropped} earlier messages discarded, keeping the most recent {MAX_WS_MESSAGES}"
+            "{dropped} earlier messages discarded, keeping the most recent {cap}"
         )),
         body_id: None,
         injected: false,
@@ -577,21 +600,28 @@ fn ws_drop_marker(dropped: u64, at: u64, direction: WsDirection) -> WsMessage {
     }
 }
 
-/// Trims the retained frames back under [`MAX_WS_MESSAGES`], collecting the
-/// body ids the discarded frames owned. Returns the marker frame when anything
-/// was discarded, so the caller can announce it.
-fn trim_ws_messages(messages: &mut Vec<WsMessage>, orphaned: &mut Vec<String>) -> Option<WsMessage> {
+/// Trims the retained frames back under `cap`, collecting the body ids the
+/// discarded frames owned. Returns the marker frame when anything was
+/// discarded, so the caller can announce it.
+fn trim_ws_messages(
+    messages: &mut Vec<WsMessage>,
+    orphaned: &mut Vec<String>,
+    cap: usize,
+) -> Option<WsMessage> {
+    let cap = cap.max(1);
     let had_marker = messages.first().is_some_and(is_ws_drop_marker);
     // The marker sits at index 0 and is not itself a captured frame.
     let head = usize::from(had_marker);
     let retained = messages.len() - head;
-    if retained <= MAX_WS_MESSAGES {
+    if retained <= cap {
         return None;
     }
 
     // Take a batch rather than the single frame that pushed us over, so a busy
-    // socket does not shift the whole window on every arrival.
-    let discard = (retained - MAX_WS_MESSAGES + WS_TRIM_BATCH).min(retained);
+    // socket does not shift the whole window on every arrival. Shrink the batch
+    // when the cap itself is small so tiny windows still work.
+    let batch = WS_TRIM_BATCH.min(cap.max(1));
+    let discard = (retained - cap + batch).min(retained);
     let mut dropped = if had_marker { messages[0].size } else { 0 };
     let mut at = 0;
     let mut direction = WsDirection::Recv;
@@ -606,7 +636,7 @@ fn trim_ws_messages(messages: &mut Vec<WsMessage>, orphaned: &mut Vec<String>) -
         dropped = dropped.saturating_add(1);
     }
 
-    let marker = ws_drop_marker(dropped, at, direction);
+    let marker = ws_drop_marker(dropped, at, direction, cap);
     match had_marker {
         true => messages[0] = marker.clone(),
         false => messages.insert(0, marker.clone()),

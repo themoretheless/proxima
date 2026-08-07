@@ -61,6 +61,7 @@ pub(super) fn build(state: ApiState) -> Router {
         .route("/api/flows", get(list_flows).delete(clear_flows))
         .route("/api/flows/{id}", get(get_flow))
         .route("/api/flows/{id}/body/{which}", get(get_body))
+        .route("/api/bodies/{id}", get(get_body_by_id))
         .route("/api/flows/{id}/curl", get(get_curl))
         .route(
             "/api/flows/{id}/replay",
@@ -295,6 +296,7 @@ async fn get_body(
     let params = parse_query(raw.as_deref());
     let decode = flag(&params, "decode")?;
     let download = flag(&params, "download")?;
+    let pretty = flag(&params, "pretty")?;
 
     let flow = state
         .store
@@ -326,6 +328,12 @@ async fn get_body(
     } else {
         (stored, meta.content_encoding.clone())
     };
+
+    // Soft schema-free view (protobuf/gRPC/hex). Display only; store unchanged.
+    if pretty {
+        let view = crate::capture::soft_view(&bytes, meta.content_type.as_deref());
+        return Ok(Json(view).into_response());
+    }
 
     let mut response = Response::new(Body::from(bytes));
     let headers = response.headers_mut();
@@ -368,6 +376,54 @@ async fn get_body(
     Ok(response)
 }
 
+/// Load a body by its store id (WebSocket frame `bodyId`, or any other capture
+/// body). Used for on-demand frame payload display without inlining large
+/// binaries into the flow JSON.
+async fn get_body_by_id(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let id = validate_id(&id)?;
+    let params = parse_query(raw.as_deref());
+    let download = flag(&params, "download")?;
+    let pretty = flag(&params, "pretty")?;
+
+    let stored = state
+        .store
+        .bodies()
+        .read(&id)
+        .ok_or_else(|| not_found("no body with that id (evicted or never stored)"))?;
+
+    if pretty {
+        let view = crate::capture::soft_view(&stored, None);
+        return Ok(Json(view).into_response());
+    }
+
+    let mut response = Response::new(Body::from(stored));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if download {
+        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"body-{id}.bin\""))
+        {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+    Ok(response)
+}
+
 async fn get_curl(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -407,18 +463,18 @@ async fn replay_flow(
     Ok(Json(result).into_response())
 }
 
-/// Replays captured WebSocket frames onto a live upgraded flow.
+/// Replays captured WebSocket frames onto a live upgraded flow, or dials a new
+/// compose socket with `replay_of`.
 ///
 /// Selects frames from the source flow's history (optional indices and
 /// direction filter), skips retention drop markers, resolves payloads from
 /// inline text or the body store, and injects them in order through the same
-/// path as [`ws_send`]. Injected frames are unmarked by rewrite and breakpoint
-/// rules; they are recorded with `injected: true`.
+/// path as [`ws_send`]. Injected frames skip rewrite and breakpoint rules and
+/// are recorded with `injected: true`.
 ///
-/// Limits: truncated captures and missing body bytes fail closed; opcode 0
-/// continuations and opcode 15 markers are never injected (explicit index is
-/// 400); compressed frames replay inflated display bytes uncompressed (not
-/// wire-identical RSV1). Only `mode: "live"` is implemented.
+/// `mode: "live"` (default) injects onto an existing upgrade. `mode: "compose"`
+/// dials a fresh HTTP/1.1 WebSocket from the source request, creates a new
+/// flow, and injects there. Dial failures are 502.
 async fn ws_replay(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -436,6 +492,35 @@ async fn ws_replay(
         parse_json_body(&body)?
     };
 
+    let mode = request.mode.as_deref().unwrap_or("live");
+    let messages = source.ws_messages.clone().unwrap_or_default();
+
+    if mode == "compose" {
+        let deps = crate::replay::ComposeDeps {
+            store: state.store.clone(),
+            registry: state.ws_registry.clone(),
+            pauses: state.pauses.clone(),
+            ws_rewrite: state.ws_rewrite.clone(),
+            upstream: state.replay.upstream().clone(),
+        };
+        return match crate::replay::replay_compose(&deps, &source, &messages, &request).await {
+            Ok(result) => Ok(Json(result).into_response()),
+            Err(crate::replay::ComposeError::Plan(crate::replay::PlanError::BadRequest(msg))) => {
+                Err(bad_request(msg))
+            }
+            Err(crate::replay::ComposeError::Plan(crate::replay::PlanError::Conflict(msg))) => {
+                Err(ApiError::new(StatusCode::CONFLICT, msg))
+            }
+            Err(crate::replay::ComposeError::Dial(msg)) => Err(upstream(anyhow::anyhow!(msg))),
+        };
+    }
+
+    if mode != "live" {
+        return Err(bad_request(format!(
+            "mode \"{mode}\" is not supported; use \"live\" or \"compose\""
+        )));
+    }
+
     let target_id = match &request.target_flow_id {
         Some(raw) if !raw.is_empty() => {
             let tid = validate_id(raw)?;
@@ -446,8 +531,6 @@ async fn ws_replay(
         }
         _ => source_id.clone(),
     };
-
-    let messages = source.ws_messages.unwrap_or_default();
 
     match crate::replay::replay_live(
         state.ws_registry.as_ref(),
@@ -1953,7 +2036,24 @@ mod tests {
             &path,
             &[("content-type", "application/json")],
             Bytes::from(
-                serde_json::to_vec(&serde_json::json!({ "mode": "compose" })).expect("json"),
+                serde_json::to_vec(&serde_json::json!({ "mode": "nope" })).expect("json"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Compose refuses targetFlowId (target is always the new dial).
+        let (status, _) = request(
+            address,
+            "POST",
+            &path,
+            &[("content-type", "application/json")],
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "mode": "compose",
+                    "targetFlowId": "someone-else"
+                }))
+                .expect("json"),
             ),
         )
         .await;

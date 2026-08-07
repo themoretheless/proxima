@@ -384,7 +384,7 @@ header {
 .btn {
   height: 28px; padding: 0 11px; display: inline-flex; align-items: center;
   background: var(--btn); color: var(--ink); border: 1px solid var(--btn-line);
-  border-radius: 7px; font: inherit; text-decoration: none; cursor: pointer;
+  border-radius: 7px; font: inherit; text-decoration: none; cursor: default;
   white-space: nowrap;
 }
 .btn:hover { background: var(--btn-hover); }
@@ -508,7 +508,7 @@ main.archiving.flat > #archiver { grid-column: 1; }
 .pause .p-meta { color: var(--dim); font-size: 12px; }
 .pause .p-flow {
   background: none; border: none; padding: 0; color: var(--accent);
-  font: inherit; cursor: pointer; text-decoration: underline;
+  font: inherit; cursor: default; text-decoration: underline;
 }
 .pause .p-flow:hover { color: var(--ink); }
 .pause .p-payload, .pause .p-headers {
@@ -594,12 +594,12 @@ main.archiving.flat > #archiver { grid-column: 1; }
    column grows or shrinks, and the list takes whatever is left. */
 #tree-grip {
   position: absolute; top: 0; right: -3px; width: 6px; height: 100%;
-  cursor: col-resize; z-index: 3; touch-action: none;
+  cursor: default; z-index: 3; touch-action: none;
 }
 #tree-grip:hover, body.tree-sizing #tree-grip {
   background: var(--accent); opacity: 0.35;
 }
-body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none; }
 /* Both halves carry the same bar and fold away the same way. A folded one
    keeps only its bar, and the space it was using goes to the other. */
 .part { display: flex; flex-direction: column; min-height: 0; }
@@ -624,14 +624,14 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 }
 #devices:empty { display: none; }
 .chip {
-  padding: 2px 8px; cursor: pointer; white-space: nowrap;
+  padding: 2px 8px; cursor: default; white-space: nowrap;
   background: none; border: 1px solid var(--btn-line); border-radius: 20px;
   color: var(--dim); font: inherit; font-size: 11px;
 }
 .chip:hover { background: var(--hover); color: var(--ink); }
 .chip.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
 .star {
-  flex: none; visibility: hidden; padding: 0 2px; cursor: pointer;
+  flex: none; visibility: hidden; padding: 0 2px; cursor: default;
   background: none; border: none; color: var(--dim); font: inherit; font-size: 11px;
 }
 .star.on { visibility: visible; color: var(--accent); }
@@ -668,16 +668,20 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 /* A control that destroys something should not be sitting under the pointer
    before the pointer is anywhere near it. */
 .kill {
-  flex: none; visibility: hidden; padding: 0 3px; cursor: pointer;
+  flex: none; visibility: hidden; padding: 0 3px; cursor: default;
   background: none; border: none; color: var(--dim); font: inherit; font-size: 13px;
 }
 .kill:hover { color: var(--bad); }
 .sitem:hover .kill, .gline:hover .kill { visibility: visible; }
-/* Live rows drag into a collection; the target lights up so the drop is obvious. */
-.row[draggable="true"] { cursor: grab; }
-.row.dragging { opacity: .55; }
+/* Live rows drag into a collection via pointer drag (not HTML5 DnD: that
+   forces a system grab hand we cannot style away). Arrow cursor throughout. */
+.row.dragging, .durl.dragging { opacity: .55; pointer-events: none; }
+body.row-dragging, body.row-dragging * { cursor: default !important; }
+body.row-dragging { user-select: none; -webkit-user-select: none; }
 .group.drop-over > .gline,
-#saved.drop-over > .shelf {
+#saved.drop-over > .shelf,
+.live-drop.drop-over > .gline,
+.live-drop.drop-over.shelf {
   background: var(--pick);
   box-shadow: inset 2px 0 0 var(--accent);
 }
@@ -689,7 +693,7 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 .gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
 .twist {
   flex: none; width: 1.2rem; color: var(--dim); text-align: center;
-  cursor: pointer; line-height: 1.4;
+  cursor: default; line-height: 1.4;
 }
 .gname {
   flex: 1; min-width: 0;
@@ -706,7 +710,7 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
   color: var(--dim); font-size: 12px; border-bottom: 1px solid var(--line);
 }
 #scope button {
-  background: none; border: none; padding: 0; margin: 0; cursor: pointer;
+  background: none; border: none; padding: 0; margin: 0; cursor: default;
   color: var(--accent); font: inherit;
 }
 #scope.idle { display: none; }
@@ -714,7 +718,7 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 .hint { color: var(--dim); }
 .dhead { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .icon {
-  flex: none; width: 26px; height: 26px; padding: 0; cursor: pointer;
+  flex: none; width: 26px; height: 26px; padding: 0; cursor: default;
   display: inline-flex; align-items: center; justify-content: center;
   background: var(--btn); color: var(--dim); border: 1px solid var(--btn-line);
   border-radius: 7px; font: inherit; font-size: 14px; line-height: 1;
@@ -750,7 +754,7 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
   background: var(--card); border: 1px solid var(--line); border-radius: 9px;
 }
 .mitem {
-  padding: 5px 9px; text-align: left; white-space: nowrap; cursor: pointer;
+  padding: 5px 9px; text-align: left; white-space: nowrap; cursor: default;
   background: none; border: none; border-radius: 6px; color: var(--ink); font: inherit;
 }
 .mitem:hover { background: var(--hover); }
@@ -774,7 +778,7 @@ body.tree-sizing { cursor: col-resize; user-select: none; -webkit-user-select: n
    multiplex session (H2 TLS or H3 QUIC). Same shape for both protocols. */
 button.flink {
   display: inline; margin: 0; padding: 0; border: 0; background: transparent;
-  color: var(--accent); cursor: pointer; text-align: left;
+  color: var(--accent); cursor: default; text-align: left;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; word-break: break-all;
 }
@@ -817,7 +821,7 @@ pre.body, pre.copy {
    a mode of its own rather than a second click every time. */
 .tabs { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .tab {
-  height: 26px; padding: 0 10px; background: none; cursor: pointer;
+  height: 26px; padding: 0 10px; background: none; cursor: default;
   border: 1px solid transparent; border-radius: 7px; color: var(--dim); font: inherit;
 }
 .tab:hover { background: var(--hover); color: var(--ink); }
@@ -893,7 +897,8 @@ const SCRIPT: &str = r#"
   var RETRY_MIN = 400;
   var RETRY_MAX = 4000;
   // Drag payload and clipboard envelope for live → saved request.
-  var FLOW_DRAG_TYPE = 'application/x-proxima-flow-id';
+  // Live → collection drag uses pointer events (see wireLiveDragSource), not
+  // HTML5 dataTransfer: the system grab cursor cannot be restyled.
   var SAVED_CLIP_TYPE = 'application/x-proxima-saved-request+json';
   var SAVED_CLIP_PREFIX = 'proxima-saved-request:';
 
@@ -1029,20 +1034,12 @@ const SCRIPT: &str = r#"
     // value ever needs quoting.
     row.flowId = flow.id;
     row.hidden = true;
-    // Drag onto a collection to save. The payload is the flow id; the drop
-    // side rebuilds a SendSpec so the body is taken at drop time, not at grab.
-    row.draggable = true;
-    row.addEventListener('dragstart', function (event) {
-      row.classList.add('dragging');
-      event.dataTransfer.effectAllowed = 'copy';
-      event.dataTransfer.setData(FLOW_DRAG_TYPE, row.flowId);
-      event.dataTransfer.setData('text/plain', row.flowId);
+    // Drag onto a collection to save (pointer drag; not HTML5, no grab hand).
+    wireLiveDragSource(row, function () { return row.flowId; });
+    row.addEventListener('click', function () {
+      if (liveDragSuppressClick) { return; }
+      select(row.flowId);
     });
-    row.addEventListener('dragend', function () {
-      row.classList.remove('dragging');
-      clearDropMarks();
-    });
-    row.addEventListener('click', function () { select(row.flowId); });
     row.appendChild(el('span', 'method'));
     var host = el('span', 'host');
     host.appendChild(el('span', 'hostname'));
@@ -1802,13 +1799,8 @@ const SCRIPT: &str = r#"
     var durl = el('span', 'durl mono', str(request.url));
     // Same drag source as list rows: pull the detail URL onto a collection.
     if (flow.id && request.url) {
-      durl.draggable = true;
       durl.title = 'Drag onto a collection to save';
-      durl.addEventListener('dragstart', function (event) {
-        event.dataTransfer.effectAllowed = 'copy';
-        event.dataTransfer.setData(FLOW_DRAG_TYPE, flow.id);
-        event.dataTransfer.setData('text/plain', flow.id);
-      });
+      wireLiveDragSource(durl, function () { return flow.id; });
     }
     head.appendChild(durl);
     detailEl.appendChild(head);
@@ -2486,7 +2478,29 @@ const SCRIPT: &str = r#"
     line.appendChild(el('span', 'meta', meta));
     // Search raw text via matchesFrame; paint pretty JSON when it applies.
     var shown = displayText(message);
-    if (typeof shown === 'string') { line.appendChild(el('span', 'text', shown)); }
+    if (typeof shown === 'string') {
+      line.appendChild(el('span', 'text', shown));
+    } else if (message.bodyId && !gap) {
+      // Large/binary frames store payload under bodyId; load on demand.
+      var bodyEl = el('span', 'text body-pending', 'loading body…');
+      line.appendChild(bodyEl);
+      fetch('/api/bodies/' + encodeURIComponent(message.bodyId) + '?pretty=1')
+        .then(function (res) {
+          if (!res.ok) { throw new Error(res.status === 404 ? 'body gone' : res.statusText); }
+          return res.json();
+        })
+        .then(function (view) {
+          bodyEl.className = 'text';
+          bodyEl.textContent = (view && view.text) ? String(view.text) : '(empty)';
+          if (view && view.kind) {
+            bodyEl.title = 'soft view: ' + view.kind + (view.note ? ' — ' + view.note : '');
+          }
+        })
+        .catch(function (err) {
+          bodyEl.className = 'text muted';
+          bodyEl.textContent = 'body unavailable (' + (err && err.message ? err.message : 'error') + ')';
+        });
+    }
     // Single-frame replay onto the same live flow. Gaps and non-injectable
     // opcodes stay off the button: the server would refuse them closed.
     if (!gap && isInjectableOpcode(message.opcode) && typeof absoluteIndex === 'number') {
@@ -4747,45 +4761,110 @@ const SCRIPT: &str = r#"
     }
   }
 
-  function isLiveDrag(event) {
-    if (!event.dataTransfer) { return false; }
-    var types = event.dataTransfer.types;
-    if (!types) { return false; }
-    for (var i = 0; i < types.length; i++) {
-      if (types[i] === FLOW_DRAG_TYPE || types[i] === 'text/plain') { return true; }
+  /* Pointer-based live → collection drag.
+     HTML5 draggable forces a system grab hand; CSS cannot override it. */
+  var liveDrag = null;
+  var liveDragSuppressClick = false;
+  var LIVE_DRAG_THRESHOLD = 6;
+
+  function clearLiveDrag() {
+    if (liveDrag && liveDrag.source) {
+      liveDrag.source.classList.remove('dragging');
     }
-    return false;
+    liveDrag = null;
+    document.body.classList.remove('row-dragging');
+    clearDropMarks();
+  }
+
+  function liveDropAt(x, y) {
+    var el = document.elementFromPoint(x, y);
+    while (el) {
+      if (el.classList && el.classList.contains('live-drop')) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function markLiveDrop(target) {
+    clearDropMarks();
+    if (target) { target.classList.add('drop-over'); }
+  }
+
+  function finishLiveDrop(flowId, target) {
+    if (!flowId || !target || typeof target._bookOf !== 'function') { return; }
+    var book = target._bookOf();
+    saveFlowToCollection(flowId, book).catch(function (error) {
+      noBooksEl.hidden = false;
+      noBooksEl.textContent = 'Could not save that: ' + error.message;
+    });
+  }
+
+  function wireLiveDragSource(el, getFlowId) {
+    el.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) { return; }
+      // Kill / star / other controls keep their own clicks.
+      if (event.target && event.target !== el) {
+        var t = event.target;
+        if (t.closest && (t.closest('.kill') || t.closest('.star') || t.closest('button'))) {
+          return;
+        }
+      }
+      var flowId = getFlowId();
+      if (!flowId) { return; }
+      liveDrag = {
+        flowId: flowId,
+        source: el,
+        x: event.clientX,
+        y: event.clientY,
+        active: false,
+        pointerId: event.pointerId
+      };
+      function onMove(move) {
+        if (!liveDrag || liveDrag.pointerId !== move.pointerId) { return; }
+        var dx = move.clientX - liveDrag.x;
+        var dy = move.clientY - liveDrag.y;
+        if (!liveDrag.active) {
+          if ((dx * dx + dy * dy) < LIVE_DRAG_THRESHOLD * LIVE_DRAG_THRESHOLD) {
+            return;
+          }
+          liveDrag.active = true;
+          liveDragSuppressClick = true;
+          liveDrag.source.classList.add('dragging');
+          document.body.classList.add('row-dragging');
+          try { liveDrag.source.setPointerCapture(move.pointerId); } catch (err) { /* ok */ }
+        }
+        move.preventDefault();
+        markLiveDrop(liveDropAt(move.clientX, move.clientY));
+      }
+      function onUp(up) {
+        if (!liveDrag || liveDrag.pointerId !== up.pointerId) { return; }
+        document.removeEventListener('pointermove', onMove, true);
+        document.removeEventListener('pointerup', onUp, true);
+        document.removeEventListener('pointercancel', onUp, true);
+        var wasActive = liveDrag.active;
+        var id = liveDrag.flowId;
+        var drop = wasActive ? liveDropAt(up.clientX, up.clientY) : null;
+        try { liveDrag.source.releasePointerCapture(up.pointerId); } catch (err) { /* ok */ }
+        clearLiveDrag();
+        if (wasActive && drop) {
+          finishLiveDrop(id, drop);
+        }
+        // Suppress the click that follows a completed drag.
+        if (wasActive) {
+          setTimeout(function () { liveDragSuppressClick = false; }, 0);
+        }
+      }
+      document.addEventListener('pointermove', onMove, true);
+      document.addEventListener('pointerup', onUp, true);
+      document.addEventListener('pointercancel', onUp, true);
+    });
   }
 
   function acceptLiveDrop(node, bookOf) {
-    node.addEventListener('dragenter', function (event) {
-      if (!isLiveDrag(event)) { return; }
-      event.preventDefault();
-      node.classList.add('drop-over');
-    });
-    node.addEventListener('dragover', function (event) {
-      if (!isLiveDrag(event)) { return; }
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'copy';
-      node.classList.add('drop-over');
-    });
-    node.addEventListener('dragleave', function (event) {
-      if (event.relatedTarget && node.contains(event.relatedTarget)) { return; }
-      node.classList.remove('drop-over');
-    });
-    node.addEventListener('drop', function (event) {
-      event.preventDefault();
-      event.stopPropagation();
-      node.classList.remove('drop-over');
-      clearDropMarks();
-      var flowId = event.dataTransfer.getData(FLOW_DRAG_TYPE)
-        || event.dataTransfer.getData('text/plain');
-      if (!flowId) { return; }
-      saveFlowToCollection(flowId, bookOf()).catch(function (error) {
-        noBooksEl.hidden = false;
-        noBooksEl.textContent = 'Could not save that: ' + error.message;
-      });
-    });
+    node.classList.add('live-drop');
+    node._bookOf = bookOf;
   }
 
   // The whole Saved panel accepts a drop when there is no specific collection
@@ -5325,10 +5404,11 @@ mod tests {
     /// the prefixes: `/curl` and `/body/` are the halves that decide which route
     /// a request lands on, and checking only the `/api` prefix would let a
     /// rename of either go unnoticed.
-    const KNOWN_PATHS: [&str; 21] = [
+    const KNOWN_PATHS: [&str; 22] = [
         "/api/flows",
         "/api/flows?",
         "/api/flows/",
+        "/api/bodies/",
         "/api/stream",
         "/api/send",
         "/api/collections",
@@ -5378,6 +5458,10 @@ mod tests {
             (
                 "'/api/flows/' + encodeURIComponent(id) + '/body/' + which",
                 "/api/flows/{id}/body/{which}",
+            ),
+            (
+                "'/api/bodies/' + encodeURIComponent(message.bodyId) + '?pretty=1'",
+                "/api/bodies/{id}",
             ),
             (
                 "'/api/flows/' + encodeURIComponent(id) + '/curl'",
@@ -6133,24 +6217,38 @@ mod tests {
     #[test]
     fn live_requests_can_be_saved_by_drag_and_by_copy() {
         for needle in [
-            "var FLOW_DRAG_TYPE = 'application/x-proxima-flow-id';",
             "var SAVED_CLIP_PREFIX = 'proxima-saved-request:';",
             "function flowToSaved(id)",
             "function saveFlowToCollection(flowId, book)",
             "function acceptLiveDrop(node, bookOf)",
+            "function wireLiveDragSource(el, getFlowId)",
             "function copyFlowAsSaved(id)",
             "item('Copy as saved request'",
             "Save to collection",
-            "row.draggable = true",
+            "live-drop",
+            "row-dragging",
         ] {
             assert!(
-                SCRIPT.contains(needle),
+                SCRIPT.contains(needle) || CSS.contains(needle),
                 "live → saved must stay wired: missing {needle}"
             );
         }
+        // No HTML5 draggable: the system grab hand cannot be styled away.
         assert!(
-            CSS.contains(".group.drop-over > .gline") || CSS.contains("drop-over"),
+            !SCRIPT.contains("row.draggable = true")
+                && !SCRIPT.contains(".draggable = true")
+                && !SCRIPT.contains("dragstart"),
+            "live drag must use pointer events, not HTML5 draggable"
+        );
+        assert!(
+            CSS.contains("drop-over"),
             "drop targets need a visible drag-over state"
+        );
+        assert!(
+            !CSS.contains("cursor: grab")
+                && !CSS.contains("cursor: pointer")
+                && !CSS.contains("cursor: col-resize"),
+            "no hand/grab/col-resize cursors"
         );
     }
 
@@ -6217,8 +6315,10 @@ mod tests {
             "the tree width has to be a thing the page can change"
         );
         assert!(
-            CSS.contains("cursor: col-resize"),
-            "the edge has to look like something that moves a column"
+            !CSS.contains("cursor: col-resize")
+                && !CSS.contains("cursor: grab")
+                && !CSS.contains("cursor: pointer"),
+            "no hand, grab, or col-resize cursors in the inspector"
         );
         assert!(
             SCRIPT.contains("localStorage.setItem('proxima.tree-w'"),

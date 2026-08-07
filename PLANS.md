@@ -51,10 +51,12 @@ chat logs.
 
 ## Next
 
-The ordered product track above is cleared. Remaining work is the protocol
-coverage backlog (WS compose replay, retention, H2 fallback, WG/TUN crypto),
-independent items (throttling, body decoders, HAR import, archive reload), and
-Debts (archive rotation, scoped rewrite CLI/API polish).
+The ordered product track above is cleared. Recently landed from the top-5
+backlog: WS compose replay, configurable WS retention + `GET /api/bodies/{id}`,
+TCP H2 fallback for reverse H3, soft body decoders (protobuf/gRPC/JWT), and
+WireGuard Noise_IK + device-join keys. Remaining: TUN real device open, WG TCP
+reassembly / QUIC dual-feature adapter, independent items (throttling, HAR
+import, archive reload), and Debts (archive rotation, scoped rewrite CLI/API).
 
 ## Protocol coverage (product requirement)
 
@@ -94,28 +96,24 @@ zero-latency byte-copy path. `GET|PUT /api/ws-rewrite` and the inspector
 CLI flags for seeding rules from the command line are still optional.
 
 Shipped for inject/replay API docs (README): `POST .../ws/send` and
-`.../ws/replay` camelCase bodies, payload priority, 200/400/404/409 shapes,
+`.../ws/replay` camelCase bodies, payload priority, 200/400/404/409/502 shapes,
 fail-closed limits (drop markers, continuations, truncated/missing body,
-deflate uncompressed replay), compose not implemented. Implementation lives in
-`api/routes.rs` (`WsSendRequest`) and `replay/ws.rs` (`WsReplayRequest`).
+deflate uncompressed replay). Compose mode (`mode: "compose"`) dials a new
+HTTP/1.1 WebSocket, records `replay_of`, injects planned frames. Implementation
+lives in `api/routes.rs` and `replay/ws.rs`.
 
 Still missing for parity with Proxyman / Burp / mitmproxy:
 
-1. **HTTP request/response breakpoints** (same pause protocol, new kind body).
+1. **HTTP request/response breakpoints** (shipped earlier; listed for history).
 2. **permessage-deflate (MVP landed):** parse `Sec-WebSocket-Extensions` on the
    101, raw-copy the pipe, inflate a copy for capture (`WsMessage.compressed`).
    Under deflate, rewrite/breakpoint re-encode is disabled so RSV1 is not
-   stripped. Inject stays uncompressed. Multi-frame messages keep inflater
-   continuity; full decoded display attaches on FIN. Inspector Frames and the
-   egui GUI mark compressed frames (size labeled as wire length); REST and
-   `ws:message` events expose `compressed` when true; HAR uses `_compressed`.
-   Remaining: optional rewrite after inflate (explicit out of scope).
-3. **Larger WS frame retention and bodyId load-on-demand** (filter/search/pretty
-   on the Frames tab is shipped; caps and on-demand body fetch still open).
-4. **Replay of a single frame or recorded sequence:** live mode shipped
-   (`POST /api/flows/{id}/ws/replay` onto the same or another live upgrade;
-   Frames tab has history replay plus per-frame ↻). Compose mode (dial a new
-   socket with `replay_of`) still open.
+   stripped. Inject stays uncompressed. Remaining: optional rewrite after
+   inflate (explicit out of scope).
+3. **Larger WS frame retention and bodyId load-on-demand (landed):**
+   `Config.max_ws_messages` / `--max-ws-messages`, `GET /api/bodies/{id}`
+   (`?pretty=1` soft view), inspector Frames load bodyId on demand.
+4. **Replay of a single frame or recorded sequence (landed):** live + compose.
 5. **CLI flags** to seed WS rewrite rules at startup (API/inspector already live).
 
 Natural home for remaining WS work: `proxy/websocket.rs` + event socket +
@@ -151,8 +149,8 @@ off by default like `gui` and `archive`. Default binary does not link quinn.
 | README reverse usage + Chrome user-CA note | **Landed** |
 | Full localhost reverse e2e (client POST matches origin + Complete Http3 flow) | **Landed** (`tests/quic_reverse_e2e.rs`; accept-only 501 path too) |
 | Typed error taxonomy (`quic_cert_reject` / `quic_alpn` / `quic_upstream` / `h3` / `h3_abandoned`) | **Landed** (handshake fail Flow + classifiers; shared tls_alert still open) |
-| TCP H2 origin fallback when upstream has no h3 | **Open** |
-| WireGuard / TUN / transparent UDP (phone path) | **Scaffold (P9 WG / P10 TUN)** / capture open |
+| TCP H2 origin fallback when upstream has no h3 | **Landed** (per client connection; response version honest; rewrite note) |
+| WireGuard / TUN / transparent UDP (phone path) | **WG crypto landed** / TUN scaffold / TCP reassembly open |
 | qlog, 0-RTT, DATAGRAM, QPACK wire capture, SO_REUSEPORT multi-worker | **Non-goals** for this ship |
 
 Modules live under `src/quic/` (not under `src/proxy/`). Regular CONNECT proxy
@@ -173,7 +171,7 @@ requesting a WG listener fails with rebuild guidance.
 | Runtime spawn on shared shutdown; port-0 rewrite | **Landed** (`runtime.rs`) |
 | Status honesty (scaffold only; Wi-Fi proxy does not feed WG) | **Landed** |
 | Reject reverse-h3 + wireguard co-enable | **Landed** |
-| Noise_IK / real device join / key material | **Open** |
+| Noise_IK / real device join / key material | **Landed** (`WgDevice`, join card keys; TCP reassembly still open) |
 | Dual-feature `UdpIngress` adapter into H3 | **Open** (trait + NullUdpIngress ready) |
 
 Device-join intent: phone joins a WG tunnel Proxima terminates in userspace so
@@ -247,9 +245,8 @@ keep new stream UI from forking the existing inspector event protocol.
 Independent of the above, in no particular order:
 
 - **Throttling.** Emulate 3G, EDGE and packet loss. Touches nothing else.
-- **Body decoders.** protobuf and gRPC, msgpack, and JWT in an `Authorization`
-  header. protobuf is common in iOS traffic and is unreadable in the inspector
-  today.
+- **Body decoders (MVP landed).** Soft protobuf/gRPC (`?pretty=1`) and JWT
+  Bearer soft-view. msgpack still open; soft views are display-only.
 - **HAR import.** Export exists; the other direction does not.
 - **Reloading the archive into the inspector.** A restart currently starts with
   an empty list. Metadata survives in the archive but bodies do not, so a

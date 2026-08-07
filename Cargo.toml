@@ -102,6 +102,13 @@ h3-quinn = { version = "0.0.10", optional = true }
 # quinn/tokio; listed so src/quic/udp.rs does not rely on a transitive dep.
 socket2 = { version = "0.6", optional = true }
 
+# WireGuard crypto (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s). Optional so the
+# default binary stays free of Noise deps; enabled with --features wireguard.
+x25519-dalek = { version = "2", optional = true, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", optional = true }
+blake2 = { version = "0.10", optional = true, features = ["std"] }
+subtle = { version = "2", optional = true }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -120,9 +127,10 @@ default = []
 gui = ["dep:eframe"]
 archive = ["dep:duckdb"]
 quic = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:socket2"]
-# WireGuard userspace scaffold (device-join path). Empty: no crypto crate yet.
-# Config/CLI/status fields are always compiled; the listen module is cfg-gated.
-wireguard = []
+# WireGuard userspace device-join path. Pulls x25519 + chacha20poly1305 for
+# Noise_IK handshake and transport. Config/CLI/status are always compiled;
+# crypto listen path is cfg-gated behind this feature.
+wireguard = ["dep:x25519-dalek", "dep:chacha20poly1305", "dep:blake2", "dep:subtle"]
 # Local TUN / packet-capture scaffold. Empty: no tun/pcap crate yet.
 # Config/CLI/status fields are always compiled; the serve module is cfg-gated.
 tun = []

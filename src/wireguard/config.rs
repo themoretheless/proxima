@@ -1,7 +1,4 @@
-//! WireGuard scaffold bind knobs and the listen task.
-//!
-//! Binding is separate from serve so port 0 can be rewritten into status before
-//! the task is spawned (same pattern as the QUIC listener).
+//! WireGuard bind knobs and the listen task.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,14 +10,12 @@ use tracing::{debug, info, warn};
 
 use crate::capture::FlowStore;
 
-use super::demux::{NullUdpIngress, UdpIngress};
+use super::crypto::{PeerConfig, WgDevice, WgKeypair};
+use super::demux::{demux_ip_packet, DemuxedPacket, NullUdpIngress, UdpIngress};
+use super::device::DeviceJoinInfo;
 use super::tunnel::{NotImplementedTunnel, WireGuardTunnel};
 
-/// Bind address for the WireGuard userspace scaffold.
-///
-/// Built by runtime/CLI from `Config.wg_*`. Binding itself is not done here so
-/// port 0 can be resolved and written back into status before
-/// [`WgServer::serve`] starts.
+/// Bind address for the WireGuard UDP listener.
 #[derive(Debug, Clone)]
 pub struct WgConfig {
     /// UDP address to bind (host may be `0.0.0.0` / `::`; port may be `0`).
@@ -35,33 +30,53 @@ impl WgConfig {
     }
 }
 
-/// Shared dependencies for the WireGuard scaffold.
-///
-/// Parallel to proxy/QUIC deps: the flow store is process-shared. The
-/// [`UdpIngress`] hook is where a later dual-feature adapter would hand
-/// demuxed UDP datagrams to the QUIC/H3 path; P9 defaults to
-/// [`NullUdpIngress`].
+/// Shared dependencies for the WireGuard path.
 #[derive(Clone)]
 pub struct WgDeps {
     pub store: Arc<FlowStore>,
     pub udp_ingress: Arc<dyn UdpIngress>,
+    /// Live crypto device when keys were generated. Scaffold builds leave this empty.
+    pub device: Option<Arc<WgDevice>>,
+    /// Join card for status/setup (keys when device is present).
+    pub join_info: Option<DeviceJoinInfo>,
 }
 
 impl WgDeps {
-    /// Scaffold defaults: shared store, no-op UDP ingress.
+    /// Defaults: shared store, no-op UDP ingress, generated one-peer device.
     pub fn new(store: Arc<FlowStore>) -> Self {
+        let server = WgKeypair::generate();
+        let client = WgKeypair::generate();
+        let peer = PeerConfig {
+            public: client.public,
+            allowed_ips_note: "10.0.0.2/32".into(),
+            psk: [0u8; 32],
+        };
+        let device = Arc::new(WgDevice::new(server.clone(), vec![peer]));
+        // Endpoint filled in after bind (port 0 rewrite). Placeholder host.
+        let join_info = DeviceJoinInfo::with_keys(
+            "0.0.0.0:0",
+            server.public_base64(),
+            client.secret_base64(),
+            client.public_base64(),
+        );
         Self {
             store,
             udp_ingress: Arc::new(NullUdpIngress),
+            device: Some(device),
+            join_info: Some(join_info),
         }
+    }
+
+    /// Rewrite join card endpoint after the real listen address is known.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        if let Some(info) = self.join_info.as_mut() {
+            info.endpoint = endpoint.into();
+        }
+        self
     }
 }
 
-/// UDP WireGuard scaffold listener, parallel to the QUIC accept task.
-///
-/// Does not run Noise/WG crypto. It binds, waits for shutdown, and drops any
-/// unexpected datagrams with a debug log so a real client cannot be mistaken
-/// for a working tunnel.
+/// UDP WireGuard listener with Noise_IK crypto.
 pub struct WgServer;
 
 impl WgServer {
@@ -73,7 +88,7 @@ impl WgServer {
     ) -> Result<()> {
         let sock = UdpSocket::bind(config.bind)
             .await
-            .with_context(|| format!("binding WireGuard scaffold UDP on {}", config.bind))?;
+            .with_context(|| format!("binding WireGuard UDP on {}", config.bind))?;
         let local = sock.local_addr().with_context(|| {
             format!(
                 "reading WireGuard listen address after bind on {}",
@@ -82,16 +97,18 @@ impl WgServer {
         })?;
         info!(
             %local,
-            "WireGuard UDP scaffold listening (no crypto; not a device tunnel)"
+            server_public = deps
+                .device
+                .as_ref()
+                .map(|d| d.server_public_base64())
+                .unwrap_or_else(|| "unavailable".into()),
+            "WireGuard UDP listening (Noise_IK enabled)"
         );
-        Self::serve(config.with_bind(local), deps, sock, shutdown).await
+        Self::serve(config.with_bind(local), deps.with_endpoint(local.to_string()), sock, shutdown)
+            .await
     }
 
     /// Runs until `shutdown` flips to true.
-    ///
-    /// On each datagram: log at debug that crypto is not implemented and drop
-    /// the bytes. Never invents HTTP/3 or CONNECT flows. Never logs payload
-    /// bytes (key material must not appear in logs even when crypto is absent).
     pub async fn serve(
         config: WgConfig,
         deps: WgDeps,
@@ -99,14 +116,24 @@ impl WgServer {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let local = sock.local_addr().unwrap_or(config.bind);
-        info!(
-            %local,
-            store_len = deps.store.len(),
-            "WireGuard scaffold ready (bind only; Noise/WG not implemented)"
-        );
+        if let Some(info) = &deps.join_info {
+            info!(
+                %local,
+                endpoint = %info.endpoint,
+                server_public = info.server_public_key.as_deref().unwrap_or("-"),
+                client_public = info.client_public_key.as_deref().unwrap_or("-"),
+                "WireGuard ready (device-join keys generated; TCP reassembly not shipped)"
+            );
+        } else {
+            info!(
+                %local,
+                store_len = deps.store.len(),
+                "WireGuard listening without device keys"
+            );
+        }
 
         if *shutdown.borrow() {
-            debug!("WireGuard scaffold already shut down before accept");
+            debug!("WireGuard already shut down before accept");
             return Ok(());
         }
 
@@ -116,33 +143,57 @@ impl WgServer {
                 biased;
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        debug!(%local, "WireGuard scaffold shutting down");
+                        debug!(%local, "WireGuard shutting down");
                         return Ok(());
                     }
                 }
                 recv = sock.recv_from(&mut buf) => {
                     match recv {
                         Ok((n, peer)) => {
-                            // Length and peer only: never dump bytes (could be
-                            // handshake material once crypto exists).
-                            warn!(
-                                %peer,
-                                bytes = n,
-                                "WireGuard scaffold received UDP but crypto is not implemented; \
-                                 dropping (not a working tunnel)"
-                            );
-                            // Trait surface is live so a later crypto impl can
-                            // replace NotImplementedTunnel without rewiring serve.
-                            // Outer frames stay opaque: do not demux or invent flows.
-                            let tunnel = NotImplementedTunnel;
-                            let _ = tunnel.open_packet(&buf[..n]);
-                            let _ = &deps.udp_ingress;
+                            let packet = &buf[..n];
+                            if let Some(device) = &deps.device {
+                                match device.handle_datagram(peer, packet) {
+                                    Ok(inner_packets) => {
+                                        for outbound in device.take_outbound() {
+                                            if let Err(err) = sock.send_to(&outbound.1, outbound.0).await {
+                                                warn!(error = %err, "WireGuard reply send failed");
+                                            }
+                                        }
+                                        for ip in inner_packets {
+                                            match demux_ip_packet(&ip) {
+                                                DemuxedPacket::Udp { src, dst, payload } => {
+                                                    if let Err(err) = deps.udp_ingress.push_udp(src, dst, &payload).await {
+                                                        debug!(error = %err, "UdpIngress push failed");
+                                                    }
+                                                }
+                                                DemuxedPacket::Tcp { src, dst, .. } => {
+                                                    debug!(%src, %dst, "WireGuard inner TCP (reassembly not shipped)");
+                                                }
+                                                DemuxedPacket::Other { protocol, .. } => {
+                                                    debug!(?protocol, "WireGuard inner non-TCP/UDP");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        debug!(%peer, error = %err, "WireGuard datagram rejected");
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    %peer,
+                                    bytes = n,
+                                    "WireGuard received UDP but no device keys; dropping"
+                                );
+                                let tunnel = NotImplementedTunnel;
+                                let _ = tunnel.open_packet(packet);
+                            }
                         }
                         Err(err) => {
                             if *shutdown.borrow() {
                                 return Ok(());
                             }
-                            return Err(err).context("WireGuard scaffold UDP recv_from failed");
+                            return Err(err).context("WireGuard UDP recv_from failed");
                         }
                     }
                 }

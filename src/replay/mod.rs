@@ -48,8 +48,8 @@ pub use collections::{Collection, CollectionStore, Environment, SavedRequest};
 pub use curl::to_curl;
 pub use ws::{
     execute_live, inject_error_message, is_injectable_opcode, plan_frames, parse_directions,
-    replay_live, resolve_payload, PlanError, PlannedFrame, WsReplayRequest, WsReplayResult,
-    DEFAULT_MAX_FRAMES,
+    replay_compose, replay_live, resolve_payload, ComposeDeps, ComposeError, PlanError,
+    PlannedFrame, WsReplayRequest, WsReplayResult, DEFAULT_MAX_FRAMES,
 };
 
 /// True for a header that describes one connection rather than the request, and
@@ -148,6 +148,11 @@ impl ReplayEngine {
 
     pub fn collections(&self) -> &CollectionStore {
         &self.collections
+    }
+
+    /// Upstream TLS settings used for compose WebSocket dials (HTTP/1.1 only).
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
     }
 
     /// Composes and sends a request that was never captured.
