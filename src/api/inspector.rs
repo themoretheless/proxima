@@ -134,7 +134,9 @@ const BODY: &str = r#"<header>
       <input id="live-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
              placeholder="Host or path" aria-label="Search hosts and paths" hidden>
       <div id="devices" role="group" aria-label="Devices"></div>
-      <div id="hosts" role="tree" aria-label="Hosts and paths"></div>
+      <div class="tree-scroll">
+        <div id="hosts" role="tree" aria-label="Hosts and paths"></div>
+      </div>
     </div>
     <div id="saved" class="part">
       <div class="shelf" data-part="saved">
@@ -147,7 +149,9 @@ const BODY: &str = r#"<header>
       </div>
       <input id="saved-hunt" class="hunt" type="search" autocomplete="off" spellcheck="false"
              placeholder="Name or URL" aria-label="Search saved requests" hidden>
-      <div id="books" role="tree" aria-label="Saved requests"></div>
+      <div class="tree-scroll">
+        <div id="books" role="tree" aria-label="Saved requests"></div>
+      </div>
       <p id="no-books" class="pad hint">Nothing saved yet. Drag a live request here, copy one into a collection, or compose and save.</p>
     </div>
     <div id="tree-grip" role="separator" aria-orientation="vertical" aria-label="Resize tree" title="Drag to resize"></div>
@@ -820,17 +824,39 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
    keeps only its bar, and the space it was using goes to the other. */
 .part { display: flex; flex-direction: column; min-height: 0; }
 .part.shut > *:not(.shelf) { display: none; }
-/* The hosts take the height they need and no more, so the bar under them sits
-   right below the last one rather than at some share of the column decided in
-   advance. Past two thirds they stop growing and scroll instead, or a busy
-   capture would push the saved requests off the bottom. */
-#live { flex: 0 1 auto; max-height: 66%; }
-#saved { flex: 1 1 auto; border-top: 1px solid var(--line); }
+/* Vertical scroll on the half. Horizontal scroll is on .tree-scroll; #hosts /
+   #books inside are as wide as the longest name so every row shares one right
+   edge for sticky counts (not a scrollport per row). */
+#live {
+  flex: 0 1 auto; max-height: 66%; min-height: 0;
+  overflow-x: hidden; overflow-y: auto;
+}
+#saved {
+  flex: 1 1 0%; min-height: 0;
+  overflow-x: hidden; overflow-y: auto;
+  border-top: 1px solid var(--line);
+}
+.tree-scroll {
+  flex: none;
+  width: 100%; max-width: 100%;
+  overflow-x: auto; overflow-y: hidden;
+  box-sizing: border-box;
+}
 /* Written against the ids on purpose: the shares above are set that way too,
    and a class alone loses to them, which leaves a folded half still holding
    the room it was given. Folded halves stack at the top instead. */
-#live.shut, #saved.shut { flex: none; }
-#hosts { flex: 0 1 auto; min-height: 0; overflow: auto; padding: 4px 0 12px; }
+#live.shut, #saved.shut { flex: none; max-height: none; overflow: hidden; }
+/* When the other half is folded, the open one may use the whole column. */
+#tree:has(> #saved.shut) > #live:not(.shut) {
+  flex: 1 1 0%; max-height: none;
+}
+#tree:has(> #live.shut) > #saved:not(.shut) { flex: 1 1 0%; }
+/* Wide content box: min-width fills the scrollport; width grows with names. */
+#hosts {
+  padding: 4px 0 12px;
+  width: max-content; min-width: 100%;
+  box-sizing: border-box;
+}
 /* Devices sit above the hosts because they are the coarser cut: which machine,
    then which of its hosts. One device is the usual case, and one chip that
    says so is small enough to leave alone. */
@@ -847,15 +873,28 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 .chip:hover { background: var(--hover); color: var(--ink); }
 .chip.on { background: var(--pick); border-color: var(--accent); color: var(--accent); }
 .star {
+  position: sticky; right: 0; z-index: 2;
   flex: none; visibility: hidden; padding: 0 2px; cursor: default;
-  background: none; border: none; color: var(--dim); font: inherit; font-size: 11px;
+  background: var(--bg); border: none; color: var(--dim); font: inherit; font-size: 11px;
 }
 .star.on { visibility: visible; color: var(--accent); }
 .gline:hover .star { visibility: visible; }
-#books { flex: 1; min-height: 0; overflow: auto; padding: 2px 0 12px; }
+.gline:hover > .star { background: var(--hover); }
+.gline.picked > .star { background: var(--pick); }
+#books {
+  padding: 2px 0 12px;
+  width: max-content; min-width: 100%;
+  box-sizing: border-box;
+}
 .shelf {
+  position: sticky; top: 0; left: 0; z-index: 1;
   flex: none; display: flex; align-items: center; gap: 6px; cursor: default;
   padding: 4px 6px 4px 8px; border-bottom: 1px solid var(--rule);
+  background: var(--bg);
+  /* Stay at least as wide as the half while rows grow past it. */
+  width: 100%;
+  min-width: 100%;
+  box-sizing: border-box;
 }
 .shelf:hover { background: var(--hover); }
 .shelf > .twist { font-size: 10px; }
@@ -874,13 +913,14 @@ body.tree-sizing { cursor: default; user-select: none; -webkit-user-select: none
 .sitem {
   position: relative; display: flex; gap: 6px; align-items: baseline;
   padding: 3px 8px 3px 12px; cursor: default; font-size: 12px;
+  width: max-content; min-width: 100%; box-sizing: border-box;
 }
 .sitem:hover { background: var(--hover); }
 .smethod {
   flex: none; width: 3.2rem; color: var(--dim);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px;
 }
-.sname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sname { flex: none; white-space: nowrap; }
 /* Delete sits on top of the trailing text so rows do not reserve a kill column.
    Hidden with opacity (not visibility) so the layout never pays for the control. */
 .kill {
@@ -910,9 +950,12 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
   background: var(--pick);
   box-shadow: inset 2px 0 0 var(--accent);
 }
+/* As wide as the name (grows #hosts) and at least the full content width so
+   short rows still park their count on the shared right edge. */
 .gline {
   position: relative; display: flex; gap: 6px; align-items: baseline;
-  padding: 3px 10px 3px 4px; cursor: default; border-radius: 0 6px 6px 0;
+  padding: 3px 8px 3px 4px; cursor: default; border-radius: 0 6px 6px 0;
+  width: max-content; min-width: 100%; box-sizing: border-box;
 }
 .gline:hover { background: var(--hover); }
 .gline.picked { background: var(--pick); box-shadow: inset 2px 0 0 var(--accent); }
@@ -921,12 +964,29 @@ body.row-dragging { user-select: none; -webkit-user-select: none; }
   cursor: default; line-height: 1.4;
 }
 .gname {
-  flex: 1; min-width: 0;
+  flex: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
-  color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dim); white-space: nowrap;
 }
 .group.host > .gline > .gname { color: var(--ink); }
-.gcount { flex: none; color: var(--dim); font-size: 11px; }
+.gcount {
+  position: sticky; right: 0; z-index: 1;
+  flex: none; margin-left: auto;
+  padding: 0 6px 0 10px;
+  color: var(--dim); font-size: 11px;
+  white-space: nowrap;
+  background: var(--bg);
+  box-shadow: -10px 0 8px -2px var(--bg);
+}
+.gline:has(> .star) > .gcount { right: 1.25rem; }
+.gline:hover > .gcount {
+  background: var(--hover);
+  box-shadow: -10px 0 8px -2px var(--hover);
+}
+.gline.picked > .gcount {
+  background: var(--pick);
+  box-shadow: -10px 0 8px -2px var(--pick);
+}
 .gline.picked > .gname, .gline.picked > .gcount { color: var(--accent); }
 .gbody { margin-left: 11px; border-left: 1px solid var(--rule); }
 .group.shut > .gbody { display: none; }
@@ -6788,8 +6848,32 @@ mod tests {
         // as well. A class alone loses, and the folded half goes on holding the
         // room it was given, which is a bar with a hole under it.
         assert!(
-            CSS.contains("#live.shut, #saved.shut { flex: none; }"),
+            CSS.contains("#live.shut, #saved.shut { flex: none;"),
             "a folded half must give its share of the column back"
+        );
+        // Shared horizontal scroll on .tree-scroll; wide #hosts so every row
+        // shares one right edge for sticky counts.
+        assert!(
+            CSS.contains(".tree-scroll {\n  flex: none;\n  width: 100%; max-width: 100%;\n  overflow-x: auto; overflow-y: hidden;"),
+            "hosts and books share one horizontal scroll each, not one per row"
+        );
+        assert!(
+            BODY.contains("class=\"tree-scroll\"")
+                && BODY.contains("id=\"hosts\"")
+                && BODY.contains("id=\"books\""),
+            "the wide tree content sits inside a scroll shell"
+        );
+        assert!(
+            CSS.contains(".gcount {\n  position: sticky; right: 0; z-index: 1;"),
+            "counts stick to the right of the shared scrollport"
+        );
+        assert!(
+            !SCRIPT.contains("el('span', 'gmain')") && !CSS.contains(".gmain {"),
+            "per-row gmain scroll panes must stay gone"
+        );
+        assert!(
+            CSS.contains("position: sticky; top: 0; left: 0;"),
+            "shelf bars stay put while their half scrolls"
         );
         assert!(
             SCRIPT.contains("localStorage.setItem('proxima.shut', JSON.stringify(shutParts));"),
